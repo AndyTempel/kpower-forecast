@@ -1,15 +1,24 @@
 import logging
-from typing import Literal
+from typing import List, Literal
 
 import pandas as pd
 from prophet import Prophet
+from prophet.diagnostics import cross_validation, performance_metrics
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .storage import ModelStorage
-from .utils import calculate_solar_elevation
+from .utils import calculate_solar_elevation, get_clear_sky_ghi
 from .weather_client import WeatherClient
 
 logger = logging.getLogger(__name__)
+
+class PredictionInterval(BaseModel):
+    timestamp: pd.Timestamp
+    expected_kwh: float
+    lower_bound_kwh: float # P10
+    upper_bound_kwh: float # P90
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 class KPowerConfig(BaseModel):
     model_id: str
@@ -19,6 +28,8 @@ class KPowerConfig(BaseModel):
     interval_minutes: int = Field(15)
     forecast_type: Literal["solar", "consumption"] = "solar"
     heat_pump_mode: bool = False
+    changepoint_prior_scale: float = 0.05
+    seasonality_prior_scale: float = 10.0
 
     @field_validator("interval_minutes")
     @classmethod
@@ -55,6 +66,33 @@ class KPowerForecast:
         )
         self.storage = ModelStorage(storage_path=self.config.storage_path)
 
+    def _prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add physics-informed features and rolling windows.
+        """
+        df = df.copy()
+        df["ds"] = pd.to_datetime(df["ds"], utc=True)
+        
+        # 1. Physics: Clear Sky GHI
+        logger.info("Calculating physics-informed Clear Sky GHI...")
+        # Ensure index is DatetimeIndex for pvlib
+        temp_df = df.set_index("ds")
+        df["clear_sky_ghi"] = get_clear_sky_ghi(
+            self.config.latitude, self.config.longitude, temp_df.index
+        ).values
+        
+        # 2. Rolling Cloud Cover (3-hour window)
+        # 3 hours = 180 minutes. Window depends on interval_minutes.
+        window_size = 180 // self.config.interval_minutes
+        logger.info(f"Adding rolling cloud cover (window={window_size})...")
+        df["rolling_cloud_cover"] = (
+            df["cloud_cover"]
+            .rolling(window=window_size, min_periods=1)
+            .mean()
+        )
+        
+        return df
+
     def train(self, history_df: pd.DataFrame, force: bool = False):
         """
         Trains the Prophet model using the provided history.
@@ -89,12 +127,21 @@ class KPowerForecast:
         if df[weather_cols].isnull().any().any():
             df = df.dropna(subset=weather_cols)
 
-        m = Prophet()
+        # Feature Engineering
+        df = self._prepare_features(df)
+
+        # Initialize Prophet with tuned hyperparameters
+        m = Prophet(
+            changepoint_prior_scale=self.config.changepoint_prior_scale,
+            seasonality_prior_scale=self.config.seasonality_prior_scale,
+            interval_width=0.8, # Used for P10/P90 (80% interval)
+        )
         
         if self.config.forecast_type == "solar":
             m.add_regressor("temperature_2m")
-            m.add_regressor("cloud_cover")
+            m.add_regressor("rolling_cloud_cover")
             m.add_regressor("shortwave_radiation")
+            m.add_regressor("clear_sky_ghi")
         elif self.config.forecast_type == "consumption":
             if self.config.heat_pump_mode:
                 m.add_regressor("temperature_2m")
@@ -103,6 +150,71 @@ class KPowerForecast:
         m.fit(df)
         
         self.storage.save_model(m, self.config.model_id)
+
+    def tune_model(self, history_df: pd.DataFrame, days: int = 30):
+        """
+        Find optimal hyperparameters using cross-validation.
+        """
+        logger.info(f"Tuning model hyperparameters using {days} days of history...")
+        
+        # We need to prepare data first as cross_validation needs the regressors
+        # This is a bit complex as we need weather data for history_df
+        # For simplicity, we assume train() logic but without fitting.
+        
+        # Prepare data (duplicated logic from train, could be refactored)
+        df = history_df.copy()
+        df["ds"] = pd.to_datetime(df["ds"], utc=True)
+        start_date = df["ds"].min().date()
+        end_date = df["ds"].max().date()
+        weather_df = self.weather_client.fetch_historical(start_date, end_date)
+        weather_df = self.weather_client.resample_weather(
+            weather_df, self.config.interval_minutes
+        )
+        df = pd.merge(df, weather_df, on="ds", how="left")
+        weather_cols = ["temperature_2m", "cloud_cover", "shortwave_radiation"]
+        df[weather_cols] = df[weather_cols].interpolate(method="linear").bfill().ffill()
+        df = self._prepare_features(df.dropna(subset=weather_cols))
+
+        param_grid = {
+            'changepoint_prior_scale': [0.001, 0.05, 0.5],
+            'seasonality_prior_scale': [0.01, 1.0, 10.0],
+        }
+
+        # Simplified tuning loop
+        best_params = {}
+        min_rmse = float('inf')
+
+        for cps in param_grid['changepoint_prior_scale']:
+            for sps in param_grid['seasonality_prior_scale']:
+                m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps)
+                if self.config.forecast_type == "solar":
+                    m.add_regressor("temperature_2m")
+                    m.add_regressor("rolling_cloud_cover")
+                    m.add_regressor("shortwave_radiation")
+                    m.add_regressor("clear_sky_ghi")
+                elif (
+                    self.config.forecast_type == "consumption"
+                    and self.config.heat_pump_mode
+                ):
+                    m.add_regressor("temperature_2m")
+                
+                m.fit(df)
+                
+                # Cross-validation
+                # initial should be at least 3x horizon
+                df_cv = cross_validation(
+                    m, initial=f'{days//2} days', period='5 days', horizon='5 days'
+                )
+                df_p = performance_metrics(df_cv, rolling_window=1)
+                rmse = df_p['rmse'].values[0]
+
+                if rmse < min_rmse:
+                    min_rmse = rmse
+                    best_params = {'cps': cps, 'sps': sps}
+
+        logger.info(f"Best params found: {best_params} with RMSE {min_rmse}")
+        self.config.changepoint_prior_scale = best_params['cps']
+        self.config.seasonality_prior_scale = best_params['sps']
 
     def predict(self, days: int = 7) -> pd.DataFrame:
         """
@@ -127,16 +239,60 @@ class KPowerForecast:
             future[weather_cols].interpolate(method="linear").bfill().ffill()
         )
         
-        forecast = m.predict(future)
-        result = forecast[["ds", "yhat"]].copy()
+        # Feature Engineering
+        future = self._prepare_features(future)
         
+        forecast = m.predict(future)
+        
+        # Night Mask & Clipping
         if self.config.forecast_type == "solar":
             logger.info("Applying night mask for solar forecast...")
             elevations = calculate_solar_elevation(
-                self.config.latitude, self.config.longitude, result["ds"]
+                self.config.latitude, self.config.longitude, forecast["ds"]
             )
-            result.loc[elevations < 0, "yhat"] = 0
+            forecast.loc[elevations < 0, ["yhat", "yhat_lower", "yhat_upper"]] = 0
         
-        result["yhat"] = result["yhat"].clip(lower=0)
+        for col in ["yhat", "yhat_lower", "yhat_upper"]:
+            forecast[col] = forecast[col].clip(lower=0)
+            
+        return forecast
+
+    def get_prediction_intervals(self, days: int = 7) -> List[PredictionInterval]:
+        """
+        Returns prediction intervals for EMS.
+        """
+        forecast = self.predict(days=days)
         
-        return result
+        intervals = []
+        for _, row in forecast.iterrows():
+            intervals.append(PredictionInterval(
+                timestamp=row["ds"],
+                expected_kwh=row["yhat"],
+                lower_bound_kwh=row["yhat_lower"],
+                upper_bound_kwh=row["yhat_upper"]
+            ))
+        return intervals
+
+    def get_surplus_probability(
+        self, threshold_kwh: float, days: int = 7
+    ) -> pd.DataFrame:
+        """
+        Returns probability of exceeding threshold_kwh.
+        Prophet doesn't provide direct probabilities, but we can estimate 
+        from the uncertainty interval (yhat_upper - yhat_lower) 
+        assuming normal distribution.
+        """
+        forecast = self.predict(days=days)
+        
+        # Estimate sigma from 80% interval (approx 1.28 * sigma)
+        sigma = (forecast["yhat_upper"] - forecast["yhat_lower"]) / (2 * 1.28)
+        sigma = sigma.replace(0, 1e-9) # Avoid div by zero
+        
+        from scipy.stats import norm
+        z_score = (threshold_kwh - forecast["yhat"]) / sigma
+        prob_exceed = 1 - norm.cdf(z_score)
+        
+        return pd.DataFrame({
+            "ds": forecast["ds"],
+            "surplus_prob": prob_exceed
+        })

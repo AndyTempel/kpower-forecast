@@ -81,6 +81,21 @@ kp_cons = KPowerForecast(
 
 ---
 
+## 🔢 Versioning
+
+This project follows a custom **Date-Based Versioning** scheme:
+`YYYY.MM.Patch` (e.g., `2026.2.1`)
+
+- **YYYY**: Year of release.
+- **MM**: Month of release (no leading zero, 1-12).
+- **Patch**: Incremental counter for releases within the same month.
+
+### Enforcement
+- **CI Validation**: Every Pull Request is checked against `scripts/validate_version.py` to ensure adherence.
+- **Consistency**: Both `pyproject.toml` and `src/kpower_forecast/__init__.py` must match exactly.
+
+---
+
 ## 🧪 Development & Testing
 
 We use [uv](https://github.com/astral-sh/uv) for lightning-fast dependency management.

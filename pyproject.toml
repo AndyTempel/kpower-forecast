@@ -1,6 +1,6 @@
 [project]
 name = "kpower-forecast"
-version = "2026.2.0"
+version = "2026.2.1"
 description = "Solar production and power consumption forecasting package."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -25,6 +25,7 @@ dependencies = [
     "requests>=2.31.0",
     "cmdstanpy>=1.2.0",
     "pytz>=2024.1",
+    "pvlib>=0.11.0",
 ]
 
 [project.optional-dependencies]
