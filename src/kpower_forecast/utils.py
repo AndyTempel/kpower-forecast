@@ -1,5 +1,5 @@
 import datetime
-from typing import List, Union
+from typing import List, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -37,9 +37,7 @@ def calculate_solar_elevation(
     return np.array(elevations)
 
 
-def get_clear_sky_ghi(
-    lat: float, lon: float, times: pd.DatetimeIndex
-) -> pd.Series:
+def get_clear_sky_ghi(lat: float, lon: float, times: pd.DatetimeIndex) -> pd.Series:
     """
     Calculate Theoretical Clear Sky GHI (Global Horizontal Irradiance)
     using pvlib.
@@ -56,4 +54,4 @@ def get_clear_sky_ghi(
     # get_clearsky returns GHI, DNI, DHI. We only need GHI.
     # Ineichen is the default model.
     clearsky = location.get_clearsky(times)
-    return clearsky["ghi"]
+    return cast(pd.Series, clearsky["ghi"])

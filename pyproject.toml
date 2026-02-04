@@ -35,7 +35,25 @@ dev = [
     "mypy>=1.8.0",
     "types-requests",
     "types-pytz",
+    "pre-commit",
+    "scipy",
+    "pandas-stubs",
+    "scipy-stubs",
 ]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "prophet.*",
+    "pvlib.*",
+    "pysolar.*",
+]
+ignore_missing_imports = true
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

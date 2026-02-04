@@ -8,6 +8,7 @@ from prophet.serialize import model_from_json, model_to_json
 
 logger = logging.getLogger(__name__)
 
+
 class ModelStorage:
     def __init__(self, storage_path: str):
         self.storage_path = Path(storage_path)
@@ -50,8 +51,8 @@ class ModelStorage:
                 return model_from_json(json.load(f))
         except Exception as e:
             logger.error(f"Failed to load model {model_id}: {e}")
-            # If load fails, we might want to return None to trigger retraining, 
-            # or raise to alert the user. 
+            # If load fails, we might want to return None to trigger retraining,
+            # or raise to alert the user.
             # Given "production-grade", maybe explicit failure is safer
             # than silent fallback?
             # But the prompt says "If a model exists, load it...
