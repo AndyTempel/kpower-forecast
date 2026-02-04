@@ -1,12 +1,12 @@
 [project]
 name = "kpower-forecast"
-version = "2026.2.1"
+version = "2026.2.2"
 description = "Solar production and power consumption forecasting package."
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "AGPL-3.0" }
 authors = [
-    { name = "KPower Team", email = "info@kpower.example" }
+    { name = "KSoft.TECH OSS", email = "oss@ksoft.tech" }
 ]
 keywords = ["solar", "energy", "forecast", "prophet", "weather"]
 classifiers = [
