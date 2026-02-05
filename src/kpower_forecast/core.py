@@ -97,17 +97,11 @@ class KPowerForecast:
 
         return df
 
-    def train(self, history_df: pd.DataFrame, force: bool = False):
+    def _prepare_training_data(self, history_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Trains the Prophet model using the provided history.
+        Prepares data for training or tuning by merging with weather data
+        and adding features.
         """
-        if not force and self.storage.exists(self.config.model_id):
-            logger.info(
-                f"Model {self.config.model_id} already exists. "
-                "Use force=True to retrain."
-            )
-            return
-
         df = history_df.copy()
         if "ds" not in df.columns or "y" not in df.columns:
             raise ValueError("history_df must contain 'ds' and 'y' columns")
@@ -132,7 +126,20 @@ class KPowerForecast:
             df = df.dropna(subset=weather_cols)
 
         # Feature Engineering
-        df = self._prepare_features(df)
+        return self._prepare_features(df)
+
+    def train(self, history_df: pd.DataFrame, force: bool = False):
+        """
+        Trains the Prophet model using the provided history.
+        """
+        if not force and self.storage.exists(self.config.model_id):
+            logger.info(
+                f"Model {self.config.model_id} already exists. "
+                "Use force=True to retrain."
+            )
+            return
+
+        df = self._prepare_training_data(history_df)
 
         # Initialize Prophet with tuned hyperparameters
         m = Prophet(
@@ -162,22 +169,7 @@ class KPowerForecast:
         logger.info(f"Tuning model hyperparameters using {days} days of history...")
 
         # We need to prepare data first as cross_validation needs the regressors
-        # This is a bit complex as we need weather data for history_df
-        # For simplicity, we assume train() logic but without fitting.
-
-        # Prepare data (duplicated logic from train, could be refactored)
-        df = history_df.copy()
-        df["ds"] = pd.to_datetime(df["ds"], utc=True)
-        start_date = df["ds"].min().date()
-        end_date = df["ds"].max().date()
-        weather_df = self.weather_client.fetch_historical(start_date, end_date)
-        weather_df = self.weather_client.resample_weather(
-            weather_df, self.config.interval_minutes
-        )
-        df = pd.merge(df, weather_df, on="ds", how="left")
-        weather_cols = ["temperature_2m", "cloud_cover", "shortwave_radiation"]
-        df[weather_cols] = df[weather_cols].interpolate(method="linear").bfill().ffill()
-        df = self._prepare_features(df.dropna(subset=weather_cols))
+        df = self._prepare_training_data(history_df)
 
         param_grid = {
             "changepoint_prior_scale": [0.001, 0.05, 0.5],
