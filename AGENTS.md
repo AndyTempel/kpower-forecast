@@ -85,6 +85,12 @@ You are a **Senior Python Software Engineer** and **Systems Architect**. You val
 * **Paths:** Use `pathlib.Path` objects, never string manipulation for paths.
 
 
+4. **CLI Development:**
+* **Framework:** Use `typer` for CLI structure and `Annotated` for argument definitions.
+* **Formatting:** Use `rich` for tables, progress bars, and logging.
+* **Visualization:** Use `plotext` for terminal-based graphs.
+* **Extras:** CLI-specific dependencies MUST be placed in the `[cli]` optional dependency group in `pyproject.toml`.
+
 
 ## VI. Tooling Configuration
 

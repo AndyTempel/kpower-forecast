@@ -1,4 +1,5 @@
 import logging
+from enum import Enum
 from typing import List, Literal, cast
 
 import pandas as pd
@@ -11,6 +12,19 @@ from .utils import calculate_solar_elevation, get_clear_sky_ghi
 from .weather_client import WeatherClient
 
 logger = logging.getLogger(__name__)
+
+
+class MeasurementUnit(str, Enum):
+    KWH = "kWh"
+    WH = "Wh"
+    KW = "kW"
+    W = "W"
+
+
+class DataCategory(str, Enum):
+    INSTANT_ENERGY = "instant_energy"  # Energy per interval (kWh/Wh)
+    CUMULATIVE_ENERGY = "cumulative_energy"  # Meter reading (kWh/Wh)
+    POWER = "power"  # Instantaneous power (kW/W)
 
 
 class PredictionInterval(BaseModel):
@@ -29,6 +43,8 @@ class KPowerConfig(BaseModel):
     storage_path: str = "./data"
     interval_minutes: int = Field(15)
     forecast_type: Literal["solar", "consumption"] = "solar"
+    data_category: DataCategory = DataCategory.INSTANT_ENERGY
+    unit: MeasurementUnit = MeasurementUnit.KWH
     heat_pump_mode: bool = False
     changepoint_prior_scale: float = 0.05
     seasonality_prior_scale: float = 10.0
@@ -52,6 +68,8 @@ class KPowerForecast:
         storage_path: str = "./data",
         interval_minutes: int = 15,
         forecast_type: Literal["solar", "consumption"] = "solar",
+        data_category: DataCategory = DataCategory.INSTANT_ENERGY,
+        unit: MeasurementUnit = MeasurementUnit.KWH,
         heat_pump_mode: bool = False,
     ):
         self.config = KPowerConfig(
@@ -61,6 +79,8 @@ class KPowerForecast:
             storage_path=storage_path,
             interval_minutes=interval_minutes,
             forecast_type=forecast_type,
+            data_category=data_category,
+            unit=unit,
             heat_pump_mode=heat_pump_mode,
         )
 
@@ -150,6 +170,16 @@ class KPowerForecast:
                 self._model = loaded_model
                 return
 
+        # Normalize data based on category and unit
+        from .utils import normalize_to_instant_kwh
+
+        history_df = normalize_to_instant_kwh(
+            history_df,
+            category=self.config.data_category.value,
+            unit=self.config.unit.value,
+            target_interval_min=self.config.interval_minutes,
+        )
+
         df = self._prepare_training_data(history_df)
 
         # Initialize Prophet with tuned hyperparameters
@@ -157,6 +187,9 @@ class KPowerForecast:
             changepoint_prior_scale=self.config.changepoint_prior_scale,
             seasonality_prior_scale=self.config.seasonality_prior_scale,
             interval_width=0.8,  # Used for P10/P90 (80% interval)
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            daily_seasonality=True,
         )
 
         if self.config.forecast_type == "solar":
@@ -197,7 +230,13 @@ class KPowerForecast:
 
         for cps in param_grid["changepoint_prior_scale"]:
             for sps in param_grid["seasonality_prior_scale"]:
-                m = Prophet(changepoint_prior_scale=cps, seasonality_prior_scale=sps)
+                m = Prophet(
+                    changepoint_prior_scale=cps,
+                    seasonality_prior_scale=sps,
+                    yearly_seasonality=False,
+                    weekly_seasonality=True,
+                    daily_seasonality=True,
+                )
                 if self.config.forecast_type == "solar":
                     m.add_regressor("temperature_2m")
                     m.add_regressor("rolling_cloud_cover")

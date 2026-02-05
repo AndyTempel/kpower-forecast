@@ -28,21 +28,49 @@ Built with [Facebook Prophet](https://facebook.github.io/prophet/) and powered b
 ### Installation
 
 ```bash
+# Core package
 pip install kpower-forecast
+
+# With CLI support (recommended for interactive use)
+pip install "kpower-forecast[cli]"
 ```
 
-### ☀️ Solar Production Forecast
+### 🖥️ CLI Usage
+
+KPower Forecast comes with a powerful CLI for interactive forecasting and visualization.
+
+```bash
+# Forecast solar production using Home Assistant CSV export
+# Supports different data categories: instant_energy, cumulative_energy, power
+# Supports different units: kWh, Wh, kW, W
+kpower-forecast solar rooftop-1 46.05 14.50 -i history.csv --category power --unit W --horizon 7
+
+# Forecast power consumption
+kpower-forecast consumption main-meter 46.05 14.50 -i history.csv --category cumulative_energy --unit kWh --horizon 3
+```
+
+**CLI Features:**
+- **Automatic HA Parsing**: Heuristic detection of `last_changed` and `state` columns.
+- **Smart Data Normalization**: Handles meter readings (cumulative), power (kW/W), and instant energy.
+- **Inconsistent Intervals**: Robustly handles measurements with non-uniform time gaps.
+- **Rich Tables**: Beautiful daily summary tables in your terminal.
+- **Terminal Graphs**: Instant visualization of forecasts and confidence intervals via `plotext`.
+
+### ☀️ Solar Production Forecast (API)
 
 ```python
 from kpower_forecast import KPowerForecast
+from kpower_forecast.core import DataCategory, MeasurementUnit
 import pandas as pd
 
-# 1. Initialize for your location
+# 1. Initialize for your location with specific data types
 kp = KPowerForecast(
     model_id="rooftop_solar",
     latitude=46.0569,
     longitude=14.5058,
-    forecast_type="solar"
+    forecast_type="solar",
+    data_category=DataCategory.POWER,
+    unit=MeasurementUnit.W
 )
 
 # 2. Train with your history

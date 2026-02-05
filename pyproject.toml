@@ -40,6 +40,15 @@ dev = [
     "pandas-stubs",
     "scipy-stubs",
 ]
+cli = [
+    "typer[all]>=0.12.0",
+    "rich>=13.7.0",
+    "plotext>=5.2.8",
+    "plotly>=6.3.0",
+]
+
+[project.scripts]
+kpower-forecast = "kpower_forecast.cli:app"
 
 [tool.mypy]
 python_version = "3.13"
