@@ -13,6 +13,7 @@ logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 logging.getLogger("kpower_forecast").setLevel(logging.WARNING)
 logging.getLogger("prophet").setLevel(logging.WARNING)
 
+
 def benchmark():
     print("Setting up benchmark...")
 
@@ -27,10 +28,9 @@ def benchmark():
 
     # Train a simple model
     print("Training a simple Prophet model to save...")
-    df = pd.DataFrame({
-        "ds": pd.date_range("2023-01-01", periods=100, freq="D"),
-        "y": range(100)
-    })
+    df = pd.DataFrame(
+        {"ds": pd.date_range("2023-01-01", periods=100, freq="D"), "y": range(100)}
+    )
     m = Prophet()
     m.fit(df)
 
@@ -62,14 +62,14 @@ def benchmark():
 
     start_time = time.time()
     for _ in range(iterations):
-        if hasattr(storage, 'exists'):
+        if hasattr(storage, "exists"):
             exists = storage.exists(model_id)
         else:
             # Simulation of what exists() will do
             exists = model_path.exists()
 
         if not exists:
-             raise Exception("Model file should exist")
+            raise Exception("Model file should exist")
 
     end_time = time.time()
     opt_duration = end_time - start_time
@@ -86,6 +86,7 @@ def benchmark():
 
     # Cleanup
     shutil.rmtree(storage_path)
+
 
 if __name__ == "__main__":
     benchmark()
