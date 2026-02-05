@@ -68,6 +68,7 @@ class KPowerForecast:
             lat=self.config.latitude, lon=self.config.longitude
         )
         self.storage = ModelStorage(storage_path=self.config.storage_path)
+        self._model = None
 
     def _prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -132,12 +133,22 @@ class KPowerForecast:
         """
         Trains the Prophet model using the provided history.
         """
-        if not force and self.storage.exists(self.config.model_id):
-            logger.info(
-                f"Model {self.config.model_id} already exists. "
-                "Use force=True to retrain."
-            )
-            return
+        if not force:
+            if self._model:
+                logger.info(
+                    f"Model {self.config.model_id} already exists (cached). "
+                    "Use force=True to retrain."
+                )
+                return
+
+            loaded_model = self.storage.load_model(self.config.model_id)
+            if loaded_model:
+                logger.info(
+                    f"Model {self.config.model_id} already exists. "
+                    "Use force=True to retrain."
+                )
+                self._model = loaded_model
+                return
 
         df = self._prepare_training_data(history_df)
 
@@ -158,9 +169,13 @@ class KPowerForecast:
                 m.add_regressor("temperature_2m")
 
         logger.info(f"Training Prophet model for {self.config.forecast_type}...")
-        m.fit(df)
+        # Prophet requires tz-naive datetimes
+        df_prophet = df.copy()
+        df_prophet["ds"] = df_prophet["ds"].dt.tz_localize(None)
+        m.fit(df_prophet)
 
         self.storage.save_model(m, self.config.model_id)
+        self._model = m
 
     def tune_model(self, history_df: pd.DataFrame, days: int = 30):
         """
@@ -194,7 +209,10 @@ class KPowerForecast:
                 ):
                     m.add_regressor("temperature_2m")
 
-                m.fit(df)
+                # Prophet requires tz-naive datetimes
+                df_prophet = df.copy()
+                df_prophet["ds"] = df_prophet["ds"].dt.tz_localize(None)
+                m.fit(df_prophet)
 
                 # Cross-validation
                 # initial should be at least 3x horizon
@@ -216,7 +234,10 @@ class KPowerForecast:
         """
         Generates forecast for the next 'days' days.
         """
-        m = self.storage.load_model(self.config.model_id)
+        if self._model is None:
+            self._model = self.storage.load_model(self.config.model_id)
+
+        m = self._model
         if m is None:
             raise RuntimeError(
                 f"Model {self.config.model_id} not found. Please run train() first."
@@ -238,7 +259,11 @@ class KPowerForecast:
         # Feature Engineering
         future = self._prepare_features(future)
 
-        forecast = m.predict(future)
+        # Prophet requires tz-naive datetimes
+        future_prophet = future.copy()
+        future_prophet["ds"] = future_prophet["ds"].dt.tz_localize(None)
+
+        forecast = m.predict(future_prophet)
 
         # Night Mask & Clipping
         if self.config.forecast_type == "solar":
