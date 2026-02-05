@@ -132,7 +132,7 @@ class KPowerForecast:
         """
         Trains the Prophet model using the provided history.
         """
-        if not force and self.storage.exists(self.config.model_id):
+        if not force and self.storage.load_model(self.config.model_id):
             logger.info(
                 f"Model {self.config.model_id} already exists. "
                 "Use force=True to retrain."
