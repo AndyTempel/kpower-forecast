@@ -71,7 +71,7 @@ def test_train(mock_weather_client, mock_storage, mock_prophet):
         }
     )
 
-    mock_storage.load_model.return_value = None  # No existing model
+    mock_storage.exists.return_value = False  # No existing model
 
     kp.train(history)
 
@@ -105,7 +105,7 @@ def test_consumption_forecast(mock_weather_client, mock_storage, mock_prophet):
         }
     )
 
-    mock_storage.load_model.return_value = None
+    mock_storage.exists.return_value = False
     kp.train(history)
 
     # Verify add_regressor was called for temperature
