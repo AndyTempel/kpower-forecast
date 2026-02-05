@@ -44,7 +44,9 @@ def mock_weather_client():
 @pytest.fixture
 def mock_storage():
     with patch("kpower_forecast.core.ModelStorage") as mock:
-        yield mock.return_value
+        storage_instance = mock.return_value
+        storage_instance.load_model.return_value = None
+        yield storage_instance
 
 
 @pytest.fixture
@@ -78,6 +80,16 @@ def test_train(mock_weather_client, mock_storage, mock_prophet):
     assert mock_weather_client.fetch_historical.called
     assert mock_prophet.fit.called
     assert mock_storage.save_model.called
+
+    # Verify solar regressors
+    expected_regressors = [
+        "temperature_2m",
+        "rolling_cloud_cover",
+        "shortwave_radiation",
+        "clear_sky_ghi",
+    ]
+    for reg in expected_regressors:
+        mock_prophet.add_regressor.assert_any_call(reg)
 
 
 def test_predict(mock_weather_client, mock_storage, mock_prophet):
@@ -153,3 +165,33 @@ def test_tune_model(
     # Check if config was updated (simplistic check, assumes mock returns improved rmse)
     # The loop runs multiple times, so fit should be called multiple times.
     assert mock_prophet.fit.call_count >= 1
+
+
+def test_consumption_forecast_no_heat_pump(
+    mock_weather_client, mock_storage, mock_prophet
+):
+    kp = KPowerForecast(
+        "test_consumption_no_hp",
+        0,
+        0,
+        forecast_type="consumption",
+        heat_pump_mode=False,
+    )
+
+    history = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
+            "y": [200] * 24,
+        }
+    )
+
+    kp.train(history)
+
+    # Verify NO regressors were added
+    assert not mock_prophet.add_regressor.called
+    assert mock_prophet.fit.called
+
+
+def test_invalid_interval():
+    with pytest.raises(ValueError, match="interval_minutes must be 15 or 60"):
+        KPowerForecast("test", 0, 0, interval_minutes=30)
