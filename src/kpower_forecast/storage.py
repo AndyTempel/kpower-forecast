@@ -22,6 +22,12 @@ class ModelStorage:
     def _get_model_path(self, model_id: str) -> Path:
         return self.storage_path / f"{model_id}.json"
 
+    def exists(self, model_id: str) -> bool:
+        """
+        Checks if a model with the given ID exists in storage.
+        """
+        return self._get_model_path(model_id).exists()
+
     def save_model(self, model: Prophet, model_id: str):
         """
         Serializes and saves the Prophet model to disk.
