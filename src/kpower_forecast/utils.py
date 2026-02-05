@@ -13,15 +13,6 @@ def calculate_solar_elevation(
     """
     Calculate solar elevation angles (altitude) for a list of times
     at a specific location.
-
-    Args:
-        lat: Latitude in decimal degrees.
-        lon: Longitude in decimal degrees.
-        times: List of datetime objects or pandas DatetimeIndex.
-               Must be timezone-aware or UTC.
-
-    Returns:
-        Numpy array of elevation angles in degrees.
     """
     elevations = []
     for t in times:
@@ -53,7 +44,6 @@ def convert_units(
     if from_unit == to_unit:
         return df
 
-    # Conversion factors to base units (kW or kWh)
     factors = {
         "W": 0.001,
         "kW": 1.0,
@@ -64,9 +54,7 @@ def convert_units(
     if from_unit not in factors or to_unit not in factors:
         raise ValueError(f"Unsupported unit conversion: {from_unit} to {to_unit}")
 
-    # Convert to kW/kWh first
     df["y"] = df["y"] * factors[from_unit]
-    # Convert to target unit
     df["y"] = df["y"] / factors[to_unit]
 
     return df
@@ -80,63 +68,54 @@ def normalize_to_instant_kwh(
 ) -> pd.DataFrame:
     """
     Normalizes input data to 'instant_energy' in 'kWh' with consistent intervals.
-    Handles 'cumulative_energy' and 'power' by calculating derivatives/integrals.
-
-    Args:
-        df: DataFrame with 'ds' (datetime) and 'y' (value).
-        category: 'instant_energy', 'cumulative_energy', or 'power'.
-        unit: 'W', 'kW', 'Wh', or 'kWh'.
-        target_interval_min: The target resolution for Prophet.
-
-    Returns:
-        pd.DataFrame: Normalized DataFrame with 'ds' and 'y' (instant kWh).
+    Uses Index Union + Reindexing for mathematically correct cumulative interpolation.
+    This prevents energy aliasing/spikes regardless of input irregularity.
     """
     df = df.copy()
     df["ds"] = pd.to_datetime(df["ds"], utc=True)
-    df = df.sort_values("ds")
+    df = df.sort_values("ds").drop_duplicates(subset=["ds"], keep="last")
 
-    # 1. Convert units to kW/kWh base
-    # For power it's kW, for energy it's kWh
+    # 1. Convert units to kWh base (kW for power)
     df = convert_units(df, from_unit=unit, to_unit="kWh")
 
-    # 2. Handle different categories
-    if category == "cumulative_energy":
-        # Energy between measurements
-        df["y"] = df["y"].diff()
-        df = df.dropna(subset=["y"])
-
-        # Filter massive outliers (e.g. meter resets or glitches)
-        # We use a simple but robust check: values > 10x the 99th percentile
-        # or simply absurdly high values for a single interval.
-        # For a home, > 100kWh in one interval is almost certainly a glitch.
-        if not df.empty:
-            q99 = df["y"].quantile(0.99)
-            # If q99 is 0 (all zeros), we don't want to filter everything.
-            limit = max(q99 * 10, 100.0)
-            mask = df["y"] > limit
-            outliers = mask.sum()
-            if outliers > 0:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    f"Filtered {outliers} cumulative energy outliers > {limit} kWh"
-                )
-                df.loc[mask, "y"] = 0  # Set to 0 to avoid breaking resampling sums
-
-        df.loc[df["y"] < 0, "y"] = 0
-
+    # 2. Construct Continuous Cumulative Series
+    if category == "instant_energy":
+        df["y"] = df["y"].fillna(0).cumsum()
     elif category == "power":
-        # Average power between measurements * time delta
-        # Energy(i) = (Power(i-1) + Power(i)) / 2 * (Time(i) - Time(i-1))
-        # This is more accurate for power sensors.
-        deltas = df["ds"].diff().dt.total_seconds() / 3600.0  # hours
-        avg_power = (df["y"] + df["y"].shift(1)) / 2.0
-        df["y"] = avg_power * deltas
-        df = df.dropna(subset=["y"])
+        # Integrate Power (kW) -> Energy (kWh)
+        seconds = df["ds"].diff().dt.total_seconds().fillna(0)
+        hours = seconds / 3600.0
+        # Rectangular integration (previous power * duration)
+        energy_step = df["y"].shift(1).fillna(0) * hours
+        df["y"] = energy_step.cumsum()
+    elif category == "cumulative_energy":
+        # Ensure monotonic (handle resets by keeping relative growth)
+        diffs = df["y"].diff().fillna(0)
+        diffs[diffs < 0] = 0
+        df["y"] = diffs.cumsum()
 
-    # 3. Resample to target interval
+    # 3. Robust Interpolation using Index Union
+    # Create target fixed-frequency index
+    start = df["ds"].min().floor(f"{target_interval_min}min")
+    end = df["ds"].max().ceil(f"{target_interval_min}min")
+    target_index = pd.date_range(
+        start=start, end=end, freq=f"{target_interval_min}min", tz="UTC"
+    )
+
+    # Combine indices to preserve actual measurement points for slope calculation
     df = df.set_index("ds")
-    df = df.resample(f"{target_interval_min}min").sum()
-    df = df.reset_index()
+    combined_index = df.index.union(target_index)
 
-    return df
+    # Reindex to combined points, interpolate, then downsample to target grid
+    df_normalized = (
+        df.reindex(combined_index).interpolate(method="time").reindex(target_index)
+    )
+
+    # 4. Differentiate to get Instant Energy per Interval
+    df_final = df_normalized.diff().fillna(0)
+    df_final = df_final.reset_index().rename(columns={"index": "ds"})
+
+    # 5. Safety: Clip negative values
+    df_final.loc[df_final["y"] < 0, "y"] = 0
+
+    return df_final

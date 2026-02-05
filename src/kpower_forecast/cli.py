@@ -131,6 +131,15 @@ def forecast(
     storage_path: Annotated[
         str, typer.Option("--storage", help="Path to store models")
     ] = "./data",
+    cloud_impact: Annotated[
+        float, typer.Option("--cloud-impact", help="Max cloud damping impact (0.0-1.0)")
+    ] = 0.35,
+    heat_pump: Annotated[
+        bool,
+        typer.Option(
+            "--heatpump", help="Enable heat pump mode (temperature correlation)"
+        ),
+    ] = False,
 ):
     """
     Run forecast for solar production or power consumption.
@@ -162,6 +171,8 @@ def forecast(
         forecast_type=forecast_type.value,
         data_category=category,
         unit=unit,
+        cloud_impact=cloud_impact,
+        heat_pump_mode=heat_pump,
     )
 
     # 1. Check Model / Training
@@ -201,12 +212,9 @@ def forecast(
         .reset_index()
     )
 
-    # Scale by interval to get energy (kWh)
-    # Prophet yhat is kWh per interval_minutes
-    scale = interval_min / 60.0
-    daily["total_kwh"] *= scale
-    daily["lower_kwh"] *= scale
-    daily["upper_kwh"] *= scale
+    # Convert peak energy-per-interval to peak power (kW)
+    # P (kW) = E (kWh) / Time (h)
+    daily["peak_kw"] = daily["peak_kw"] * (60.0 / interval_min)
 
     table = Table(title=f"Forecast Summary: {forecast_type.value} ({model_id})")
     table.add_column("Date", style="cyan")

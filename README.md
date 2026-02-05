@@ -43,15 +43,17 @@ KPower Forecast comes with a powerful CLI for interactive forecasting and visual
 # Forecast solar production using Home Assistant CSV export
 # Supports different data categories: instant_energy, cumulative_energy, power
 # Supports different units: kWh, Wh, kW, W
-kpower-forecast solar rooftop-1 46.05 14.50 -i history.csv --category power --unit W --horizon 7
+# Supports tuning cloud damping: --cloud-impact (default 0.35)
+kpower-forecast solar rooftop-1 46.05 14.50 -i history.csv --category power --unit W --cloud-impact 0.3 --horizon 7
 
 # Forecast power consumption
-kpower-forecast consumption main-meter 46.05 14.50 -i history.csv --category cumulative_energy --unit kWh --horizon 3
+kpower-forecast consumption main-meter 46.05 14.50 -i history.csv --category cumulative_energy --unit kWh --horizon 3 --heatpump
 ```
 
 **CLI Features:**
 - **Automatic HA Parsing**: Heuristic detection of `last_changed` and `state` columns.
 - **Smart Data Normalization**: Handles meter readings (cumulative), power (kW/W), and instant energy.
+- **Heat Pump Mode**: Enable `--heatpump` to correlate consumption with outdoor temperature.
 - **Inconsistent Intervals**: Robustly handles measurements with non-uniform time gaps.
 - **Rich Tables**: Beautiful daily summary tables in your terminal.
 - **Terminal Graphs**: Instant visualization of forecasts and confidence intervals via `plotext`.

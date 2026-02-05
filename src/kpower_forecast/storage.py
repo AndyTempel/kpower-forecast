@@ -1,7 +1,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 from prophet import Prophet
 from prophet.serialize import model_from_json, model_to_json
@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 
 
 class ModelStorage:
+    """
+    Handles persistence of Prophet models and associated metadata.
+    """
+
     def __init__(self, storage_path: str):
         self.storage_path = Path(storage_path)
         self._ensure_storage()
@@ -28,23 +32,29 @@ class ModelStorage:
         """
         return self._get_model_path(model_id).exists()
 
-    def save_model(self, model: Prophet, model_id: str):
+    def save_model(
+        self, model: Prophet, model_id: str, metadata: Optional[Dict[str, Any]] = None
+    ):
         """
-        Serializes and saves the Prophet model to disk.
+        Serializes and saves the Prophet model and metadata to disk.
         """
         file_path = self._get_model_path(model_id)
         try:
             logger.info(f"Saving model {model_id} to {file_path}")
+            data = {
+                "model": model_to_json(model),
+                "metadata": metadata or {},
+            }
             with open(file_path, "w") as f:
-                json.dump(model_to_json(model), f)
+                json.dump(data, f)
         except Exception as e:
             logger.error(f"Failed to save model {model_id}: {e}")
             raise
 
-    def load_model(self, model_id: str) -> Optional[Prophet]:
+    def load_model(self, model_id: str) -> Optional[Tuple[Prophet, Dict[str, Any]]]:
         """
-        Loads the Prophet model from disk if it exists.
-        Returns None if not found.
+        Loads the Prophet model and metadata from disk.
+        Returns (Prophet, metadata) or None if not found.
         """
         file_path = self._get_model_path(model_id)
         if not file_path.exists():
@@ -54,14 +64,15 @@ class ModelStorage:
         try:
             logger.info(f"Loading model {model_id} from {file_path}")
             with open(file_path, "r") as f:
-                return model_from_json(json.load(f))
+                data = json.load(f)
+
+            # Backwards compatibility for models saved without metadata wrapper
+            if "model" in data and "metadata" in data:
+                return model_from_json(data["model"]), data["metadata"]
+            else:
+                # Old format: the whole file is the model JSON
+                return model_from_json(data), {}
+
         except Exception as e:
             logger.error(f"Failed to load model {model_id}: {e}")
-            # If load fails, we might want to return None to trigger retraining,
-            # or raise to alert the user.
-            # Given "production-grade", maybe explicit failure is safer
-            # than silent fallback?
-            # But the prompt says "If a model exists, load it...
-            # If no model exists ... train".
-            # If it exists but is corrupt, maybe we should raise.
             raise

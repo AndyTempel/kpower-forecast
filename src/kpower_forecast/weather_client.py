@@ -11,13 +11,6 @@ logger = logging.getLogger(__name__)
 
 class WeatherConfig(BaseModel):
     base_url: str = "https://api.open-meteo.com/v1/forecast"
-    # Historical API is different, usually:
-    # https://archive-api.open-meteo.com/v1/archive
-    # But for "forecast" usage we might use the forecast API
-    # which also has some past days.
-    # The prompt implies "predict" (future) and "train" (history).
-    # We might need two URLs or logic to switch.
-    # For simplicity, let's allow passing the base_url.
     archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
 
 
@@ -38,7 +31,13 @@ class WeatherClient:
             "longitude": self.lon,
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
-            "hourly": ["temperature_2m", "cloud_cover", "shortwave_radiation"],
+            "hourly": [
+                "temperature_2m",
+                "cloud_cover",
+                "shortwave_radiation",
+                "snow_depth",
+                "snowfall",
+            ],
             "timezone": "UTC",
         }
 
@@ -59,7 +58,13 @@ class WeatherClient:
         params: dict[str, str | float | int | list[str]] = {
             "latitude": self.lat,
             "longitude": self.lon,
-            "hourly": ["temperature_2m", "cloud_cover", "shortwave_radiation"],
+            "hourly": [
+                "temperature_2m",
+                "cloud_cover",
+                "shortwave_radiation",
+                "snow_depth",
+                "snowfall",
+            ],
             "forecast_days": days,
             "timezone": "UTC",
         }
@@ -79,14 +84,22 @@ class WeatherClient:
         if not hourly:
             raise ValueError("No hourly data in response")
 
-        df = pd.DataFrame(
-            {
-                "ds": pd.to_datetime(hourly["time"], utc=True),
-                "temperature_2m": hourly["temperature_2m"],
-                "cloud_cover": hourly["cloud_cover"],
-                "shortwave_radiation": hourly["shortwave_radiation"],
-            }
-        )
+        # Required columns for core logic
+        cols = {
+            "ds": pd.to_datetime(hourly["time"], utc=True),
+            "temperature_2m": hourly.get("temperature_2m"),
+            "cloud_cover": hourly.get("cloud_cover"),
+            "shortwave_radiation": hourly.get("shortwave_radiation"),
+            "snow_depth": hourly.get("snow_depth"),
+            "snowfall": hourly.get("snowfall"),
+        }
+
+        df = pd.DataFrame(cols)
+
+        # Fill missing snow data with 0 (essential for constraints)
+        for snow_col in ["snow_depth", "snowfall"]:
+            if snow_col in df.columns:
+                df[snow_col] = df[snow_col].fillna(0)
 
         # Open-Meteo returns nulls sometimes, fill or drop?
         # Linear interpolation is usually safe for weather gaps
@@ -116,6 +129,8 @@ class WeatherClient:
 
         # Resample and interpolate
         # Cubic is good for temperature/radiation curves
+        # Note: Snow depth/fall might be better with linear or ffill,
+        # but cubic handles radiation/temp beautifully.
         df_resampled = df.resample(target_freq).interpolate(method="cubic")
 
         # Reset index to get 'ds' column back

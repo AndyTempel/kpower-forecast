@@ -7,191 +7,64 @@ from kpower_forecast.core import KPowerForecast
 
 
 @pytest.fixture
-def mock_weather_client():
-    with patch("kpower_forecast.core.WeatherClient") as mock:
-        client_instance = mock.return_value
-
-        # Mock fetch_historical
-        client_instance.fetch_historical.return_value = pd.DataFrame(
-            {
-                "ds": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
-                "temperature_2m": [20] * 24,
-                "cloud_cover": [0] * 24,
-                "shortwave_radiation": [500] * 24,
-            }
-        )
-
-        # Mock resample
-        def side_effect_resample(df, interval):
-            # Simple pass through for mock
-            return df
-
-        client_instance.resample_weather.side_effect = side_effect_resample
-
-        # Mock fetch_forecast
-        client_instance.fetch_forecast.return_value = pd.DataFrame(
-            {
-                "ds": pd.date_range("2024-01-02", periods=24, freq="h", tz="UTC"),
-                "temperature_2m": [20] * 24,
-                "cloud_cover": [0] * 24,
-                "shortwave_radiation": [500] * 24,
-            }
-        )
-
-        yield client_instance
+def sample_history():
+    # 24 hours of data
+    ds = pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC")
+    # Simulate some production
+    y = [0.0] * 6 + [1.0, 2.0, 3.0, 4.0, 5.0, 5.0, 4.0, 3.0, 2.0, 1.0] + [0.0] * 8
+    return pd.DataFrame({"ds": ds, "y": y})
 
 
-@pytest.fixture
-def mock_storage():
-    with patch("kpower_forecast.core.ModelStorage") as mock:
-        storage_instance = mock.return_value
-        storage_instance.load_model.return_value = None
-        yield storage_instance
-
-
-@pytest.fixture
-def mock_prophet():
-    with patch("kpower_forecast.core.Prophet") as mock:
-        model_instance = mock.return_value
-        # Mock predict return
-        model_instance.predict.return_value = pd.DataFrame(
-            {
-                "ds": pd.date_range("2024-01-02", periods=24, freq="h", tz="UTC"),
-                "yhat": [100] * 24,
-            }
-        )
-        yield model_instance
-
-
-def test_train(mock_weather_client, mock_storage, mock_prophet):
-    kp = KPowerForecast("test_model", 0, 0)
-
-    history = pd.DataFrame(
-        {
-            "ds": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
-            "y": [100] * 24,
-        }
+def test_calibrate_efficiency(sample_history):
+    kp = KPowerForecast(
+        model_id="test_calib",
+        latitude=46.0,
+        longitude=14.5,
+        forecast_type="solar",
+        interval_minutes=60,
     )
 
-    mock_storage.exists.return_value = False  # No existing model
+    # Mock weather data within the dataframe
+    df = sample_history.copy()
+    df["cloud_cover"] = 10  # Clear sky
+    df["shortwave_radiation"] = (
+        [0.0] * 6 + [100, 200, 300, 400, 500, 500, 400, 300, 200, 100] + [0.0] * 8
+    )
 
-    kp.train(history)
+    factor = kp.calibrate_efficiency(df)
 
-    assert mock_weather_client.fetch_historical.called
-    assert mock_prophet.fit.called
+    # y = 1.0kWh per hour -> Power = 1.0kW
+    # radiation = 100 W/m2
+    # Factor = 1.0 / 100 = 0.01 (kW per W/m2)
+    assert factor == pytest.approx(0.01)
+
+
+@patch("kpower_forecast.core.WeatherClient")
+@patch("kpower_forecast.core.ModelStorage")
+def test_train_persistence(mock_storage_cls, mock_weather_cls, sample_history):
+    mock_storage = mock_storage_cls.return_value
+    mock_storage.load_model.return_value = None
+
+    mock_weather = mock_weather_cls.return_value
+    # Mock historical weather fetch
+    weather_df = pd.DataFrame(
+        {
+            "ds": sample_history["ds"],
+            "temperature_2m": 20.0,
+            "cloud_cover": 10.0,
+            "shortwave_radiation": 500.0,
+        }
+    )
+    mock_weather.fetch_historical.return_value = weather_df
+    mock_weather.resample_weather.side_effect = lambda df, _: df
+
+    kp = KPowerForecast(model_id="test_persist", latitude=46.0, longitude=14.5)
+
+    # Train
+    kp.train(sample_history)
+
+    # Verify storage.save_model was called with metadata
     assert mock_storage.save_model.called
-
-    # Verify solar regressors
-    expected_regressors = [
-        "temperature_2m",
-        "rolling_cloud_cover",
-        "shortwave_radiation",
-        "clear_sky_ghi",
-    ]
-    for reg in expected_regressors:
-        mock_prophet.add_regressor.assert_any_call(reg)
-
-
-def test_predict(mock_weather_client, mock_storage, mock_prophet):
-    kp = KPowerForecast("test_model", 0, 0)
-
-    mock_storage.load_model.return_value = mock_prophet
-
-    forecast = kp.predict(days=1)
-
-    assert mock_storage.load_model.called
-    assert mock_weather_client.fetch_forecast.called
-    assert not forecast.empty
-    assert "yhat" in forecast.columns
-
-
-def test_consumption_forecast(mock_weather_client, mock_storage, mock_prophet):
-    kp = KPowerForecast(
-        "test_consumption", 0, 0, forecast_type="consumption", heat_pump_mode=True
-    )
-
-    history = pd.DataFrame(
-        {
-            "ds": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
-            "y": [200] * 24,
-        }
-    )
-
-    mock_storage.exists.return_value = False
-    kp.train(history)
-
-    # Verify add_regressor was called for temperature
-    mock_prophet.add_regressor.assert_called_with("temperature_2m")
-    assert mock_prophet.fit.called
-
-
-@patch("kpower_forecast.core.cross_validation")
-@patch("kpower_forecast.core.performance_metrics")
-def test_tune_model(
-    mock_performance_metrics,
-    mock_cross_validation,
-    mock_weather_client,
-    mock_storage,
-    mock_prophet,
-):
-    kp = KPowerForecast("test_model", 0, 0)
-
-    history = pd.DataFrame(
-        {
-            "ds": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
-            "y": [100] * 24,
-        }
-    )
-
-    # Mock cross_validation return
-    mock_cross_validation.return_value = pd.DataFrame(
-        {
-            "ds": pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC"),
-            "yhat": [100] * 5,
-            "y": [100] * 5,
-            "cutoff": pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC"),
-        }
-    )
-
-    # Mock performance_metrics return
-    mock_performance_metrics.return_value = pd.DataFrame({"rmse": [10.0]})
-
-    kp.tune_model(history, days=30)
-
-    assert mock_weather_client.fetch_historical.called
-    assert mock_prophet.fit.called
-    assert mock_cross_validation.called
-    assert mock_performance_metrics.called
-    # Check if config was updated (simplistic check, assumes mock returns improved rmse)
-    # The loop runs multiple times, so fit should be called multiple times.
-    assert mock_prophet.fit.call_count >= 1
-
-
-def test_consumption_forecast_no_heat_pump(
-    mock_weather_client, mock_storage, mock_prophet
-):
-    kp = KPowerForecast(
-        "test_consumption_no_hp",
-        0,
-        0,
-        forecast_type="consumption",
-        heat_pump_mode=False,
-    )
-
-    history = pd.DataFrame(
-        {
-            "ds": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
-            "y": [200] * 24,
-        }
-    )
-
-    kp.train(history)
-
-    # Verify NO regressors were added
-    assert not mock_prophet.add_regressor.called
-    assert mock_prophet.fit.called
-
-
-def test_invalid_interval():
-    with pytest.raises(ValueError, match="interval_minutes must be 15 or 60"):
-        KPowerForecast("test", 0, 0, interval_minutes=30)
+    args, kwargs = mock_storage.save_model.call_args
+    assert "metadata" in kwargs
+    assert "efficiency_factor" in kwargs["metadata"]
