@@ -411,13 +411,13 @@ class KPowerForecast:
         """
         forecast = self.predict(days=days)
         intervals = []
-        for _, row in forecast.iterrows():
+        for row in forecast.itertuples(index=False):
             intervals.append(
                 PredictionInterval(
-                    timestamp=row["ds"],
-                    expected_kwh=row["yhat"],
-                    lower_bound_kwh=row["yhat_lower"],
-                    upper_bound_kwh=row["yhat_upper"],
+                    timestamp=row.ds,
+                    expected_kwh=row.yhat,
+                    lower_bound_kwh=row.yhat_lower,
+                    upper_bound_kwh=row.yhat_upper,
                 )
             )
         return intervals
