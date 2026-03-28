@@ -36,6 +36,10 @@ class ModelStorage:
         """
         return self._get_model_path(model_id).exists()
 
+    def has_training_data(self, model_id: str) -> bool:
+        """Returns True if a training data parquet exists for the given model_id."""
+        return self._get_data_path(model_id).exists()
+
     def save_model(
         self, model: Prophet, model_id: str, metadata: Optional[Dict[str, Any]] = None
     ):
