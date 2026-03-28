@@ -1,6 +1,6 @@
 import logging
 from enum import Enum
-from typing import List, Literal, Optional, cast
+from typing import Any, List, Literal, Optional, cast
 
 import pandas as pd
 from prophet import Prophet
@@ -261,6 +261,7 @@ class KPowerForecast:
 
         metadata = {"efficiency_factor": self.config.efficiency_factor}
         self.storage.save_model(m, self.config.model_id, metadata=metadata)
+        self.storage.save_training_data(self.config.model_id, df)
         self._model = m
 
     def tune_model(self, history_df: pd.DataFrame, days: int = 30):
@@ -315,6 +316,124 @@ class KPowerForecast:
         logger.info(f"Best params found: {best_params} with RMSE {min_rmse}")
         self.config.changepoint_prior_scale = best_params["cps"]
         self.config.seasonality_prior_scale = best_params["sps"]
+
+    def _extract_stan_init(self, model: Prophet) -> dict[str, Any]:
+        """Extract Stan parameter initialisation from a fitted Prophet model for warm start."""
+        import numpy as np  # noqa: F401 — used implicitly by Prophet params arrays
+
+        init: dict[str, Any] = {
+            "k": float(model.params["k"][0]),
+            "m": float(model.params["m"][0]),
+            "sigma_obs": float(model.params["sigma_obs"][0]),
+            "delta": model.params["delta"][0],
+        }
+        if "beta" in model.params and len(model.params["beta"][0]) > 0:
+            init["beta"] = model.params["beta"][0]
+        return init
+
+    def update(
+        self,
+        new_data_df: pd.DataFrame,
+        max_history_days: Optional[int] = None,
+    ) -> None:
+        """
+        Incrementally updates the model with new observations.
+
+        Loads the stored cumulative training data, appends the new data
+        (normalized + weather-merged), optionally trims to a rolling window,
+        recalibrates efficiency, and retrains Prophet with a warm start from
+        the previous model parameters.
+
+        If no prior training data exists on disk, falls back to a full
+        train() on new_data_df.
+
+        Args:
+            new_data_df: New observations in the same format accepted by train().
+            max_history_days: If set, trim the accumulated dataset to the most
+                recent N days before retraining (rolling window).
+        """
+        from .utils import normalize_to_instant_kwh
+
+        # Normalize and prepare new data (fetches weather only for new date range)
+        new_norm = normalize_to_instant_kwh(
+            new_data_df,
+            category=self.config.data_category.value,
+            unit=self.config.unit.value,
+            target_interval_min=self.config.interval_minutes,
+        )
+        new_prepared = self._prepare_training_data(new_norm)
+
+        # Load existing cumulative prepared data
+        existing = self.storage.load_training_data(self.config.model_id)
+
+        if existing is None:
+            logger.info(
+                f"No prior training data for {self.config.model_id} — "
+                "running full initial train."
+            )
+            self.train(new_data_df, force=True)
+            return
+
+        # Merge: existing + new, deduplicate on ds (new data wins)
+        existing["ds"] = pd.to_datetime(existing["ds"], utc=True)
+        new_prepared["ds"] = pd.to_datetime(new_prepared["ds"], utc=True)
+
+        combined = (
+            pd.concat([existing, new_prepared], ignore_index=True)
+            .drop_duplicates(subset=["ds"], keep="last")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+
+        if max_history_days is not None:
+            cutoff = combined["ds"].max() - pd.Timedelta(days=max_history_days)
+            combined = combined[combined["ds"] >= cutoff].reset_index(drop=True)
+
+        # Recalibrate efficiency on full accumulated dataset
+        self.config.efficiency_factor = self.calibrate_efficiency(combined)
+
+        # Resolve prior model for warm start
+        prior_model = self._model
+        if prior_model is None:
+            loaded = self.storage.load_model(self.config.model_id)
+            if loaded:
+                prior_model, _ = loaded
+
+        stan_init: dict[str, Any] | str = (
+            self._extract_stan_init(prior_model) if prior_model is not None else "random"
+        )
+
+        # Build and fit Prophet
+        m = Prophet(
+            changepoint_prior_scale=self.config.changepoint_prior_scale,
+            seasonality_prior_scale=self.config.seasonality_prior_scale,
+            interval_width=0.8,
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            daily_seasonality=True,
+        )
+
+        if self.config.forecast_type == "solar":
+            m.add_regressor("temperature_2m")
+            m.add_regressor("rolling_cloud_cover")
+            m.add_regressor("shortwave_radiation")
+            m.add_regressor("clear_sky_ghi")
+        elif self.config.forecast_type == "consumption" and self.config.heat_pump_mode:
+            m.add_regressor("temperature_2m")
+
+        df_prophet = combined.copy()
+        df_prophet["ds"] = df_prophet["ds"].dt.tz_localize(None)
+
+        logger.info(
+            f"Incremental retraining {self.config.model_id} on "
+            f"{len(combined)} rows (warm_start={prior_model is not None})..."
+        )
+        m.fit(df_prophet, init=stan_init)
+
+        metadata = {"efficiency_factor": self.config.efficiency_factor}
+        self.storage.save_model(m, self.config.model_id, metadata=metadata)
+        self.storage.save_training_data(self.config.model_id, combined)
+        self._model = m
 
     def predict(self, days: int = 7) -> pd.DataFrame:
         """

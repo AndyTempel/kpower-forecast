@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import pandas as pd
 from prophet import Prophet
 from prophet.serialize import model_from_json, model_to_json
 
@@ -25,6 +26,9 @@ class ModelStorage:
 
     def _get_model_path(self, model_id: str) -> Path:
         return self.storage_path / f"{model_id}.json"
+
+    def _get_data_path(self, model_id: str) -> Path:
+        return self.storage_path / f"{model_id}_data.parquet"
 
     def exists(self, model_id: str) -> bool:
         """
@@ -76,3 +80,32 @@ class ModelStorage:
         except Exception as e:
             logger.error(f"Failed to load model {model_id}: {e}")
             raise
+
+    def save_training_data(self, model_id: str, df: pd.DataFrame) -> None:
+        """Saves the prepared training DataFrame (with weather cols) as parquet."""
+        path = self._get_data_path(model_id)
+        try:
+            df.to_parquet(path, index=False)
+            logger.info(f"Saved training data for {model_id} to {path}")
+        except Exception as e:
+            logger.error(f"Failed to save training data for {model_id}: {e}")
+            raise
+
+    def load_training_data(self, model_id: str) -> Optional[pd.DataFrame]:
+        """Loads the prepared training DataFrame from parquet. Returns None if not found."""
+        path = self._get_data_path(model_id)
+        if not path.exists():
+            return None
+        try:
+            logger.info(f"Loading training data for {model_id} from {path}")
+            return pd.read_parquet(path)
+        except Exception as e:
+            logger.error(f"Failed to load training data for {model_id}: {e}")
+            raise
+
+    def delete_model(self, model_id: str) -> None:
+        """Removes the model JSON and training data parquet for a given model_id."""
+        for path in [self._get_model_path(model_id), self._get_data_path(model_id)]:
+            if path.exists():
+                path.unlink()
+                logger.info(f"Deleted {path}")
