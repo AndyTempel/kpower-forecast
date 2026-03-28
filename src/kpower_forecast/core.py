@@ -318,7 +318,7 @@ class KPowerForecast:
         self.config.seasonality_prior_scale = best_params["sps"]
 
     def _extract_stan_init(self, model: Prophet) -> dict[str, Any]:
-        """Extract Stan parameter initialisation from a fitted Prophet model for warm start."""
+        """Extract Stan params from a fitted Prophet model for warm start."""
         import numpy as np  # noqa: F401 — used implicitly by Prophet params arrays
 
         init: dict[str, Any] = {
@@ -400,7 +400,9 @@ class KPowerForecast:
                 prior_model, _ = loaded
 
         stan_init: dict[str, Any] | str = (
-            self._extract_stan_init(prior_model) if prior_model is not None else "random"
+            self._extract_stan_init(prior_model)
+            if prior_model is not None
+            else "random"
         )
 
         # Build and fit Prophet

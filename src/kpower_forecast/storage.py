@@ -92,7 +92,10 @@ class ModelStorage:
             raise
 
     def load_training_data(self, model_id: str) -> Optional[pd.DataFrame]:
-        """Loads the prepared training DataFrame from parquet. Returns None if not found."""
+        """Loads the prepared training DataFrame from parquet.
+
+        Returns None if not found.
+        """
         path = self._get_data_path(model_id)
         if not path.exists():
             return None
