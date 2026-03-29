@@ -319,16 +319,21 @@ class KPowerForecast:
 
     def _extract_stan_init(self, model: Prophet) -> dict[str, Any]:
         """Extract Stan params from a fitted Prophet model for warm start."""
-        import numpy as np  # noqa: F401 — used implicitly by Prophet params arrays
+        import numpy as np
+
+        def _scalar(arr: Any) -> float:
+            # Prophet/cmdstanpy may return 1-D or 2-D arrays depending on version.
+            # Flatten to 1-D and take the first element before converting to float.
+            return float(np.asarray(arr).ravel()[0])
 
         init: dict[str, Any] = {
-            "k": float(model.params["k"][0]),
-            "m": float(model.params["m"][0]),
-            "sigma_obs": float(model.params["sigma_obs"][0]),
-            "delta": model.params["delta"][0],
+            "k": _scalar(model.params["k"]),
+            "m": _scalar(model.params["m"]),
+            "sigma_obs": _scalar(model.params["sigma_obs"]),
+            "delta": np.asarray(model.params["delta"]).ravel(),
         }
-        if "beta" in model.params and len(model.params["beta"][0]) > 0:
-            init["beta"] = model.params["beta"][0]
+        if "beta" in model.params and np.asarray(model.params["beta"]).size > 0:
+            init["beta"] = np.asarray(model.params["beta"]).ravel()
         return init
 
     def update(
