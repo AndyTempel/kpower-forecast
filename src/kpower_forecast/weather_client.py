@@ -96,10 +96,16 @@ class WeatherClient:
 
         df = pd.DataFrame(cols)
 
+        # Coerce all numeric columns to float64 — Open-Meteo may return
+        # all-null lists (e.g. snow_depth on reduced datasets) which pandas
+        # stores as object dtype; interpolate() refuses object columns.
+        numeric_cols = [c for c in df.columns if c != "ds"]
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+
         # Fill missing snow data with 0 (essential for constraints)
         for snow_col in ["snow_depth", "snowfall"]:
             if snow_col in df.columns:
-                df[snow_col] = df[snow_col].fillna(0)
+                df[snow_col] = df[snow_col].fillna(0.0)
 
         # Open-Meteo returns nulls sometimes, fill or drop?
         # Linear interpolation is usually safe for weather gaps
