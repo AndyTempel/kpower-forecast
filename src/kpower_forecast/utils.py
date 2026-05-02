@@ -85,8 +85,8 @@ def normalize_to_instant_kwh(
         # Integrate Power (kW) -> Energy (kWh)
         seconds = df["ds"].diff().dt.total_seconds().fillna(0)
         hours = seconds / 3600.0
-        # Rectangular integration (previous power * duration)
-        energy_step = df["y"].shift(1).fillna(0) * hours
+        # Use the current sample so interval energy stays aligned with its label.
+        energy_step = df["y"].fillna(0) * hours
         df["y"] = energy_step.cumsum()
     elif category == "cumulative_energy":
         # Ensure monotonic (handle resets by keeping relative growth)

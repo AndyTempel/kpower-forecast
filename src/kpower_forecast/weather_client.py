@@ -1,6 +1,7 @@
 import datetime
 import logging
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import requests
@@ -79,6 +80,61 @@ class WeatherClient:
             logger.error(f"Failed to fetch weather forecast: {e}")
             raise
 
+    def _get_response_timezone(self, data: dict) -> datetime.tzinfo:
+        """Resolve the timezone metadata returned by Open-Meteo-compatible APIs.
+
+        Args:
+            data: Raw JSON payload from the weather API.
+
+        Returns:
+            Timezone used by naive hourly timestamp strings.
+        """
+        timezone_name = data.get("timezone")
+        if isinstance(timezone_name, str):
+            if timezone_name.upper() in {"GMT", "UTC"}:
+                return datetime.timezone.utc
+            try:
+                return ZoneInfo(timezone_name)
+            except ZoneInfoNotFoundError:
+                pass
+
+        offset_seconds = int(data.get("utc_offset_seconds") or 0)
+        return datetime.timezone(datetime.timedelta(seconds=offset_seconds))
+
+    def _parse_hourly_times(self, data: dict) -> pd.Series:
+        """Parse hourly timestamps and normalize them to UTC.
+
+        Args:
+            data: Raw JSON payload from the weather API.
+
+        Returns:
+            Series of UTC-aware timestamps.
+
+        Raises:
+            ValueError: If the response does not contain hourly timestamps.
+        """
+        hourly = data.get("hourly", {})
+        if not isinstance(hourly, dict) or "time" not in hourly:
+            raise ValueError("No hourly time data in response")
+
+        raw_times = hourly["time"]
+        if not isinstance(raw_times, list):
+            raise ValueError("Hourly time data must be a list")
+
+        time_series = pd.to_datetime(
+            pd.Series(raw_times, dtype="object"), errors="raise"
+        )
+        if time_series.dt.tz is not None:
+            return time_series.dt.tz_convert("UTC")
+
+        response_tz = self._get_response_timezone(data)
+        if response_tz != datetime.timezone.utc:
+            logger.warning(
+                "Weather response timestamps are %s; converting them to UTC.",
+                data.get("timezone", response_tz),
+            )
+        return time_series.dt.tz_localize(response_tz).dt.tz_convert("UTC")
+
     def _process_response(self, data: dict) -> pd.DataFrame:
         hourly = data.get("hourly", {})
         if not hourly:
@@ -86,7 +142,7 @@ class WeatherClient:
 
         # Required columns for core logic
         cols = {
-            "ds": pd.to_datetime(hourly["time"], utc=True),
+            "ds": self._parse_hourly_times(data),
             "temperature_2m": hourly.get("temperature_2m"),
             "cloud_cover": hourly.get("cloud_cover"),
             "shortwave_radiation": hourly.get("shortwave_radiation"),

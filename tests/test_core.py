@@ -1,7 +1,9 @@
+from typing import cast
 from unittest.mock import patch
 
 import pandas as pd
 import pytest
+from prophet import Prophet
 
 from kpower_forecast.core import KPowerForecast
 
@@ -39,6 +41,64 @@ def test_calibrate_efficiency(sample_history):
     assert factor == pytest.approx(0.01)
 
 
+def test_calibrate_efficiency_does_not_apply_default_home_system_cap():
+    kp = KPowerForecast(
+        model_id="test_calib_no_default_cap",
+        latitude=46.0,
+        longitude=14.5,
+        forecast_type="solar",
+        interval_minutes=60,
+    )
+
+    df = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-06-01 08:00", periods=12, freq="h", tz="UTC"),
+            "y": [150.0] * 12,
+            "cloud_cover": [0.0] * 12,
+            "shortwave_radiation": [100.0] * 12,
+        }
+    )
+
+    assert kp.calibrate_efficiency(df) == pytest.approx(1.5)
+
+
+def test_calibrate_efficiency_profile_learns_morning_envelope():
+    kp = KPowerForecast(
+        model_id="test_profile",
+        latitude=46.0,
+        longitude=14.5,
+        forecast_type="solar",
+        interval_minutes=15,
+    )
+
+    timestamps = []
+    production = []
+    interval_hours = 0.25
+    for day in pd.date_range("2024-06-01", periods=20, freq="D", tz="UTC"):
+        for minute_of_day in range(5 * 60, 21 * 60, 15):
+            timestamp = day + pd.Timedelta(minutes=minute_of_day)
+            efficiency = 0.06 if minute_of_day == 6 * 60 else 0.02
+            timestamps.append(timestamp)
+            production.append(efficiency * 100.0 * interval_hours)
+
+    df = pd.DataFrame(
+        {
+            "ds": timestamps,
+            "y": production,
+            "cloud_cover": [0.0] * len(timestamps),
+            "shortwave_radiation": [100.0] * len(timestamps),
+            "snow_depth": [0.0] * len(timestamps),
+        }
+    )
+
+    kp.config.efficiency_factor = kp.calibrate_efficiency(df)
+    profile = kp.calibrate_efficiency_profile(df)
+
+    assert profile is not None
+    assert kp.config.efficiency_factor == pytest.approx(0.02)
+    assert profile[6 * 60] == pytest.approx(0.06)
+
+
 @patch("kpower_forecast.core.WeatherClient")
 @patch("kpower_forecast.core.ModelStorage")
 def test_train_persistence(mock_storage_cls, mock_weather_cls, sample_history):
@@ -68,3 +128,53 @@ def test_train_persistence(mock_storage_cls, mock_weather_cls, sample_history):
     args, kwargs = mock_storage.save_model.call_args
     assert "metadata" in kwargs
     assert "efficiency_factor" in kwargs["metadata"]
+    assert "efficiency_profile" in kwargs["metadata"]
+
+
+class DummyForecastModel:
+    """Minimal Prophet-like model for post-processing tests."""
+
+    def predict(self, future: pd.DataFrame) -> pd.DataFrame:
+        """Return deliberately high values so physical caps are observable."""
+        return pd.DataFrame(
+            {
+                "ds": future["ds"],
+                "yhat": [10.0] * len(future),
+                "yhat_lower": [10.0] * len(future),
+                "yhat_upper": [10.0] * len(future),
+            }
+        )
+
+
+def test_predict_uses_efficiency_profile_for_cap(monkeypatch, tmp_path):
+    kp = KPowerForecast(
+        model_id="test_profile_cap",
+        latitude=46.0,
+        longitude=14.5,
+        storage_path=str(tmp_path),
+        forecast_type="solar",
+        interval_minutes=15,
+    )
+    kp._model = cast(Prophet, DummyForecastModel())
+    kp.config.efficiency_factor = 0.02
+    kp.config.efficiency_profile = {6 * 60: 0.05}
+
+    weather_df = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(["2024-06-01 06:00", "2024-06-01 12:00"], utc=True),
+            "temperature_2m": [20.0, 25.0],
+            "cloud_cover": [0.0, 0.0],
+            "shortwave_radiation": [100.0, 100.0],
+            "snow_depth": [0.0, 0.0],
+            "snowfall": [0.0, 0.0],
+        }
+    )
+    monkeypatch.setattr(kp.weather_client, "fetch_forecast", lambda days: weather_df)
+    monkeypatch.setattr(
+        kp.weather_client, "resample_weather", lambda df, interval_minutes: df
+    )
+
+    forecast = kp.predict(days=1)
+
+    assert forecast.loc[0, "yhat"] == pytest.approx(1.4375)
+    assert forecast.loc[1, "yhat"] == pytest.approx(0.575)

@@ -49,7 +49,9 @@ class KPowerConfig(BaseModel):
     changepoint_prior_scale: float = 0.05
     seasonality_prior_scale: float = 10.0
     efficiency_factor: Optional[float] = None  # Learned ratio: kW / (W/m2)
-    max_efficiency_factor: float = 0.025  # Safety cap (approx 25kWp system)
+    efficiency_profile: Optional[dict[int, float]] = None
+    max_efficiency_factor: Optional[float] = None
+    efficiency_cap_headroom: float = Field(default=1.15, gt=0)
     cloud_impact: float = 0.35  # Linear damping at 100% cloud cover
 
     @field_validator("interval_minutes")
@@ -94,6 +96,60 @@ class KPowerForecast:
         )
         self.storage = ModelStorage(storage_path=self.config.storage_path)
         self._model: Optional[Prophet] = None
+
+    def _apply_model_metadata(self, metadata: dict[str, Any]) -> None:
+        """Apply persisted model metadata to the runtime configuration.
+
+        Args:
+            metadata: Metadata dictionary loaded from model storage.
+
+        Returns:
+            None.
+        """
+        self.config.efficiency_factor = metadata.get("efficiency_factor")
+        self.config.efficiency_profile = self._normalize_efficiency_profile(
+            metadata.get("efficiency_profile")
+        )
+
+    def _build_model_metadata(self) -> dict[str, Any]:
+        """Build JSON-serializable metadata for model persistence.
+
+        Returns:
+            Dictionary containing learned solar calibration metadata.
+        """
+        return {
+            "efficiency_factor": self.config.efficiency_factor,
+            "efficiency_profile": self.config.efficiency_profile,
+        }
+
+    def _normalize_efficiency_profile(self, profile: Any) -> Optional[dict[int, float]]:
+        """Normalize persisted efficiency profile keys and values.
+
+        Args:
+            profile: Raw profile object loaded from storage.
+
+        Returns:
+            Efficiency profile keyed by minute of day, or None when invalid.
+
+        Raises:
+            ValueError: If the stored profile contains invalid keys or values.
+        """
+        if profile is None:
+            return None
+        if not isinstance(profile, dict):
+            raise ValueError("efficiency_profile metadata must be a dictionary")
+
+        normalized: dict[int, float] = {}
+        for raw_key, raw_value in profile.items():
+            minute_of_day = int(raw_key)
+            factor = float(raw_value)
+            if minute_of_day < 0 or minute_of_day >= 1440:
+                raise ValueError("efficiency_profile keys must be minutes of day")
+            if factor <= 0:
+                raise ValueError("efficiency_profile values must be positive")
+            normalized[minute_of_day] = factor
+
+        return normalized or None
 
     def _prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -172,9 +228,9 @@ class KPowerForecast:
         if self.config.forecast_type != "solar":
             return None
 
-        # Filter for clear sky (<15% cloud cover) and non-zero irradiance
+        # Filter for clear sky (<25% cloud cover) and non-zero irradiance
         # NEW: Filter out snowy days (snow_depth > 0.01m)
-        mask = (df["cloud_cover"] < 15) & (df["shortwave_radiation"] > 50)
+        mask = (df["cloud_cover"] < 25) & (df["shortwave_radiation"] > 50)
         if "snow_depth" in df.columns:
             mask &= df["snow_depth"] <= 0.01
 
@@ -197,8 +253,12 @@ class KPowerForecast:
         # 95th percentile finds peak performance while ignoring sensor noise
         factor = float(clear_sky_df["eff"].quantile(0.95))
 
-        # Hard safety cap
-        if factor > self.config.max_efficiency_factor:
+        # Optional safety cap. Defaults to None because PV fleet sizes can range
+        # from home systems to multi-megawatt industrial installations.
+        if (
+            self.config.max_efficiency_factor is not None
+            and factor > self.config.max_efficiency_factor
+        ):
             logger.warning(
                 f"Calibrated factor {factor:.6f} exceeds safety limit "
                 f"{self.config.max_efficiency_factor}. Clamping."
@@ -207,6 +267,77 @@ class KPowerForecast:
 
         logger.info(f"Calibrated efficiency factor: {factor:.6f} kW per W/m2")
         return factor
+
+    def calibrate_efficiency_profile(
+        self, df: pd.DataFrame
+    ) -> Optional[dict[int, float]]:
+        """Learns a time-of-day solar efficiency envelope from history.
+
+        The global efficiency factor is a useful fallback, but asymmetric arrays
+        can produce much more power per horizontal irradiance in the morning than
+        in the afternoon. This profile learns that envelope directly from clear
+        historical production without requiring panel azimuth or tilt.
+
+        Args:
+            df: Prepared training dataframe with production and weather columns.
+
+        Returns:
+            Dictionary keyed by UTC minute of day with kW per W/m2 factors, or
+            None when calibration data is insufficient.
+        """
+        if self.config.forecast_type != "solar":
+            return None
+
+        required_columns = {"ds", "y", "cloud_cover", "shortwave_radiation"}
+        missing_columns = required_columns.difference(df.columns)
+        if missing_columns:
+            raise ValueError(
+                "df is missing required columns for efficiency profile: "
+                f"{sorted(missing_columns)}"
+            )
+
+        mask = (df["cloud_cover"] < 25) & (df["shortwave_radiation"] > 50)
+        if "snow_depth" in df.columns:
+            mask &= df["snow_depth"] <= 0.01
+
+        clear_sky_df = df[mask].copy()
+        if clear_sky_df.empty or len(clear_sky_df) < 10:
+            logger.warning("Insufficient clear sky data for efficiency profile.")
+            return None
+
+        clear_sky_df["ds"] = pd.to_datetime(clear_sky_df["ds"], utc=True)
+        interval_hours = self.config.interval_minutes / 60.0
+        power_kw = clear_sky_df["y"] / interval_hours
+        clear_sky_df["eff"] = power_kw / clear_sky_df["shortwave_radiation"]
+        clear_sky_df = clear_sky_df[clear_sky_df["eff"] > 0]
+
+        if clear_sky_df.empty:
+            return None
+
+        global_factor = self.config.efficiency_factor
+        if global_factor is None:
+            global_factor = float(clear_sky_df["eff"].quantile(0.95))
+
+        clear_sky_df["minute_of_day"] = (
+            clear_sky_df["ds"].dt.hour * 60 + clear_sky_df["ds"].dt.minute
+        )
+        grouped = clear_sky_df.groupby("minute_of_day")["eff"].quantile(0.95)
+        slots = pd.Index(range(0, 1440, self.config.interval_minutes))
+        profile = grouped.reindex(slots).interpolate(limit_direction="both")
+        profile = profile.fillna(global_factor)
+        profile = profile.clip(lower=global_factor)
+        profile = profile.rolling(window=3, center=True, min_periods=1).max()
+
+        if self.config.max_efficiency_factor is not None:
+            profile = profile.clip(upper=self.config.max_efficiency_factor)
+
+        learned_profile: dict[int, float] = {}
+        for slot, value in profile.items():
+            learned_profile[int(cast(int, slot))] = float(value)
+        logger.info(
+            "Calibrated efficiency profile with %s slots.", len(learned_profile)
+        )
+        return learned_profile
 
     def train(self, history_df: pd.DataFrame, force: bool = False):
         """
@@ -219,7 +350,7 @@ class KPowerForecast:
             loaded = self.storage.load_model(self.config.model_id)
             if loaded:
                 self._model, metadata = loaded
-                self.config.efficiency_factor = metadata.get("efficiency_factor")
+                self._apply_model_metadata(metadata)
                 logger.info(f"Loaded existing model {self.config.model_id}")
                 return
 
@@ -236,6 +367,7 @@ class KPowerForecast:
 
         # Calibrate physics-informed efficiency limit
         self.config.efficiency_factor = self.calibrate_efficiency(df)
+        self.config.efficiency_profile = self.calibrate_efficiency_profile(df)
 
         m = Prophet(
             changepoint_prior_scale=self.config.changepoint_prior_scale,
@@ -259,8 +391,9 @@ class KPowerForecast:
         df_prophet["ds"] = df_prophet["ds"].dt.tz_localize(None)
         m.fit(df_prophet)
 
-        metadata = {"efficiency_factor": self.config.efficiency_factor}
-        self.storage.save_model(m, self.config.model_id, metadata=metadata)
+        self.storage.save_model(
+            m, self.config.model_id, metadata=self._build_model_metadata()
+        )
         self.storage.save_training_data(self.config.model_id, df)
         self._model = m
 
@@ -396,6 +529,7 @@ class KPowerForecast:
 
         # Recalibrate efficiency on full accumulated dataset
         self.config.efficiency_factor = self.calibrate_efficiency(combined)
+        self.config.efficiency_profile = self.calibrate_efficiency_profile(combined)
 
         # Resolve prior model for warm start
         prior_model = self._model
@@ -437,8 +571,9 @@ class KPowerForecast:
         )
         m.fit(df_prophet, init=stan_init)
 
-        metadata = {"efficiency_factor": self.config.efficiency_factor}
-        self.storage.save_model(m, self.config.model_id, metadata=metadata)
+        self.storage.save_model(
+            m, self.config.model_id, metadata=self._build_model_metadata()
+        )
         self.storage.save_training_data(self.config.model_id, combined)
         self._model = m
 
@@ -451,7 +586,7 @@ class KPowerForecast:
             if not loaded:
                 raise RuntimeError(f"Model {self.config.model_id} not found.")
             self._model, metadata = loaded
-            self.config.efficiency_factor = metadata.get("efficiency_factor")
+            self._apply_model_metadata(metadata)
 
         m = self._model
         weather_forecast = self.weather_client.fetch_forecast(days=days)
@@ -507,9 +642,23 @@ class KPowerForecast:
                 forecast.loc[snow_mask_hard.values, col] = 0.0
 
             # C. Efficiency Cap
-            if self.config.efficiency_factor:
-                power_limit = (
-                    future["shortwave_radiation"] * self.config.efficiency_factor
+            base_efficiency_factor = self.config.efficiency_factor
+            if base_efficiency_factor is not None:
+                minute_of_day = future["ds"].dt.hour * 60 + future["ds"].dt.minute
+                efficiency_profile = self.config.efficiency_profile
+                if efficiency_profile:
+                    efficiency_factor = minute_of_day.map(
+                        lambda minute: efficiency_profile.get(
+                            int(minute), base_efficiency_factor
+                        )
+                    )
+                else:
+                    efficiency_factor = pd.Series(
+                        base_efficiency_factor, index=future.index
+                    )
+
+                power_limit = future["shortwave_radiation"] * (
+                    efficiency_factor * self.config.efficiency_cap_headroom
                 )
                 interval_hours = self.config.interval_minutes / 60.0
                 energy_limit = power_limit * interval_hours
