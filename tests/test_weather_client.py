@@ -3,6 +3,42 @@ import pandas as pd
 from kpower_forecast.weather_client import WeatherClient
 
 
+def test_fetch_forecast_requests_ecmwf_ifs_model(monkeypatch) -> None:
+    client = WeatherClient(lat=46.0, lon=14.0)
+    observed_params: dict[str, object] = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "timezone": "UTC",
+                "utc_offset_seconds": 0,
+                "hourly": {
+                    "time": ["2026-05-01T00:00", "2026-05-01T01:00"],
+                    "temperature_2m": [10.0, 11.0],
+                    "cloud_cover": [20.0, 25.0],
+                    "shortwave_radiation": [0.0, 50.0],
+                    "snow_depth": [None, None],
+                    "snowfall": [None, None],
+                },
+            }
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        observed_params.update(params)
+        assert url == "https://api.open-meteo.com/v1/forecast"
+        assert timeout == 10
+        return Response()
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+
+    client.fetch_forecast(days=5)
+
+    assert observed_params["models"] == "ecmwf_ifs"
+    assert observed_params["forecast_days"] == 5
+
+
 def test_process_response_converts_naive_local_times_to_utc():
     client = WeatherClient(lat=46.0, lon=14.0)
     data = {

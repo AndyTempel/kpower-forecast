@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 class WeatherConfig(BaseModel):
     base_url: str = "https://api.open-meteo.com/v1/forecast"
     archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
+    forecast_model: Optional[str] = "ecmwf_ifs"
 
 
 class WeatherClient:
@@ -69,6 +70,8 @@ class WeatherClient:
             "forecast_days": days,
             "timezone": "UTC",
         }
+        if self.config.forecast_model:
+            params["models"] = self.config.forecast_model
 
         try:
             logger.info(f"Fetching forecast weather from {self.config.base_url}")
