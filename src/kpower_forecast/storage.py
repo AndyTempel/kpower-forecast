@@ -1,7 +1,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, cast
 
 import pandas as pd
 from prophet import Prophet
@@ -29,6 +29,14 @@ class ModelStorage:
 
     def _get_data_path(self, model_id: str) -> Path:
         return self.storage_path / f"{model_id}_data.parquet"
+
+    def _get_forecast_archive_path(self, model_id: str, forecast_model: str) -> Path:
+        safe_forecast_model = forecast_model.replace("/", "_")
+        return self.storage_path / f"{model_id}_{safe_forecast_model}_forecast.parquet"
+
+    def _get_weather_calibration_path(self, model_id: str, forecast_model: str) -> Path:
+        safe_forecast_model = forecast_model.replace("/", "_")
+        return self.storage_path / f"{model_id}_{safe_forecast_model}_weather.json"
 
     def exists(self, model_id: str) -> bool:
         """
@@ -109,6 +117,102 @@ class ModelStorage:
         except Exception as e:
             logger.error(f"Failed to load training data for {model_id}: {e}")
             raise
+
+    def save_forecast_archive(
+        self, model_id: str, forecast_model: str, df: pd.DataFrame
+    ) -> None:
+        """Merge and persist timestamped forecast archive rows.
+
+        Args:
+            model_id: Unique model identifier.
+            forecast_model: Weather model identifier.
+            df: Forecast archive dataframe containing at least ``ds``.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If ``df`` is missing the ``ds`` column.
+        """
+        if "ds" not in df.columns:
+            raise ValueError("forecast archive must contain a 'ds' column")
+
+        path = self._get_forecast_archive_path(model_id, forecast_model)
+        archive = df.copy()
+        archive["ds"] = pd.to_datetime(archive["ds"], utc=True)
+
+        if path.exists():
+            existing = pd.read_parquet(path)
+            existing["ds"] = pd.to_datetime(existing["ds"], utc=True)
+            archive = pd.concat([existing, archive], ignore_index=True)
+
+        archive = (
+            archive.drop_duplicates(subset=["ds"], keep="last")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+        archive.to_parquet(path, index=False)
+        logger.info("Saved forecast archive for %s to %s", model_id, path)
+
+    def load_forecast_archive(
+        self, model_id: str, forecast_model: str
+    ) -> Optional[pd.DataFrame]:
+        """Load forecast archive rows for a model and weather model.
+
+        Args:
+            model_id: Unique model identifier.
+            forecast_model: Weather model identifier.
+
+        Returns:
+            DataFrame of forecast archive rows, or None when unavailable.
+        """
+        path = self._get_forecast_archive_path(model_id, forecast_model)
+        if not path.exists():
+            return None
+        archive = pd.read_parquet(path)
+        archive["ds"] = pd.to_datetime(archive["ds"], utc=True)
+        return archive
+
+    def save_weather_calibration(
+        self, model_id: str, forecast_model: str, metadata: Dict[str, Any]
+    ) -> None:
+        """Persist adaptive weather calibration metadata as JSON.
+
+        Args:
+            model_id: Unique model identifier.
+            forecast_model: Weather model identifier.
+            metadata: JSON-serializable calibration metadata.
+
+        Returns:
+            None.
+        """
+        path = self._get_weather_calibration_path(model_id, forecast_model)
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(metadata, file)
+        logger.info("Saved weather calibration for %s to %s", model_id, path)
+
+    def load_weather_calibration(
+        self, model_id: str, forecast_model: str
+    ) -> Optional[Dict[str, Any]]:
+        """Load adaptive weather calibration metadata.
+
+        Args:
+            model_id: Unique model identifier.
+            forecast_model: Weather model identifier.
+
+        Returns:
+            Calibration metadata, or None when unavailable.
+        """
+        path = self._get_weather_calibration_path(model_id, forecast_model)
+        if not path.exists():
+            return None
+        with open(path, encoding="utf-8") as file:
+            payload = json.load(file)
+
+        if not isinstance(payload, dict):
+            raise ValueError("Weather calibration payload must be a JSON object.")
+
+        return cast(Dict[str, Any], payload)
 
     def delete_model(self, model_id: str) -> None:
         """Removes the model JSON and training data parquet for a given model_id."""

@@ -178,3 +178,106 @@ def test_predict_uses_efficiency_profile_for_cap(monkeypatch, tmp_path):
 
     assert forecast.loc[0, "yhat"] == pytest.approx(1.4375)
     assert forecast.loc[1, "yhat"] == pytest.approx(0.575)
+
+
+def test_predict_does_not_apply_fixed_cloud_damping(monkeypatch, tmp_path) -> None:
+    kp = KPowerForecast(
+        model_id="test_no_cloud_damping",
+        latitude=46.0,
+        longitude=14.5,
+        storage_path=str(tmp_path),
+        forecast_type="solar",
+        interval_minutes=15,
+    )
+    kp._model = cast(Prophet, DummyForecastModel())
+
+    weather_df = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(["2024-06-01 12:00"], utc=True),
+            "temperature_2m": [20.0],
+            "cloud_cover": [100.0],
+            "shortwave_radiation": [700.0],
+            "snow_depth": [0.0],
+            "snowfall": [0.0],
+        }
+    )
+    monkeypatch.setattr(kp.weather_client, "fetch_forecast", lambda days: weather_df)
+    monkeypatch.setattr(
+        kp.weather_client, "resample_weather", lambda df, interval_minutes: df
+    )
+
+    forecast = kp.predict(days=1)
+
+    assert forecast.loc[0, "pre_weather_correction_yhat"] == pytest.approx(10.0)
+    assert forecast.loc[0, "weather_correction_multiplier"] == pytest.approx(1.0)
+    assert forecast.loc[0, "yhat"] == pytest.approx(10.0)
+
+
+def test_calibrate_weather_correction_uses_archive_weather_fallback(tmp_path) -> None:
+    kp = KPowerForecast(
+        model_id="test_weather_fallback",
+        latitude=46.0,
+        longitude=14.5,
+        storage_path=str(tmp_path),
+        forecast_type="solar",
+        interval_minutes=15,
+    )
+    kp.config.efficiency_factor = 0.02
+
+    timestamps = pd.date_range("2024-06-01 08:00", periods=12, freq="15min", tz="UTC")
+    baseline_kwh = 100.0 * 0.02 * kp.config.efficiency_cap_headroom * 0.25
+    df = pd.DataFrame(
+        {
+            "ds": timestamps,
+            "y": [baseline_kwh * 1.2] * len(timestamps),
+            "temperature_2m": [20.0] * len(timestamps),
+            "cloud_cover": [90.0] * len(timestamps),
+            "shortwave_radiation": [100.0] * len(timestamps),
+            "snow_depth": [0.0] * len(timestamps),
+            "snowfall": [0.0] * len(timestamps),
+            "direct_radiation": [20.0] * len(timestamps),
+            "diffuse_radiation": [80.0] * len(timestamps),
+        }
+    )
+
+    correction = kp._calibrate_weather_correction(df)
+
+    assert correction is not None
+    assert correction["source"] == "historical_archive_weather"
+    assert correction["default_multiplier"] == pytest.approx(1.2)
+
+
+def test_predict_applies_optional_static_curtailment(monkeypatch, tmp_path) -> None:
+    kp = KPowerForecast(
+        model_id="test_curtailment",
+        latitude=46.0,
+        longitude=14.5,
+        storage_path=str(tmp_path),
+        forecast_type="solar",
+        interval_minutes=15,
+        inverter_ac_limit_kw=5.0,
+    )
+    kp._model = cast(Prophet, DummyForecastModel())
+
+    weather_df = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(["2024-06-01 12:00"], utc=True),
+            "temperature_2m": [20.0],
+            "cloud_cover": [0.0],
+            "shortwave_radiation": [700.0],
+            "snow_depth": [0.0],
+            "snowfall": [0.0],
+        }
+    )
+    monkeypatch.setattr(kp.weather_client, "fetch_forecast", lambda days: weather_df)
+    monkeypatch.setattr(
+        kp.weather_client, "resample_weather", lambda df, interval_minutes: df
+    )
+
+    forecast = kp.predict(days=1)
+
+    assert forecast.loc[0, "pre_curtailment_yhat"] == pytest.approx(10.0)
+    assert forecast.loc[0, "applied_curtailment_limit_kwh"] == pytest.approx(1.25)
+    assert forecast.loc[0, "curtailed_kwh"] == pytest.approx(8.75)
+    assert forecast.loc[0, "curtailment_active"]
+    assert forecast.loc[0, "yhat"] == pytest.approx(1.25)

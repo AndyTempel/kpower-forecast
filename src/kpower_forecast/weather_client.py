@@ -5,18 +5,69 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
 
 class WeatherConfig(BaseModel):
+    """Configuration for Open-Meteo-compatible weather requests.
+
+    Args:
+        base_url: Forecast API URL.
+        archive_url: Historical archive API URL.
+        forecast_model: Optional forecast model identifier passed to Open-Meteo.
+        required_hourly_variables: Variables required by the forecasting core.
+        optional_hourly_variables: Extra variables requested when the provider
+            supports them.
+    """
+
     base_url: str = "https://api.open-meteo.com/v1/forecast"
     archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
     forecast_model: Optional[str] = "ecmwf_ifs"
+    required_hourly_variables: list[str] = Field(
+        default_factory=lambda: [
+            "temperature_2m",
+            "cloud_cover",
+            "shortwave_radiation",
+            "snow_depth",
+            "snowfall",
+        ]
+    )
+    optional_hourly_variables: list[str] = Field(
+        default_factory=lambda: [
+            "precipitation",
+            "direct_radiation",
+            "diffuse_radiation",
+            "wind_u_component_10m",
+            "wind_v_component_10m",
+            "wind_gusts_10m",
+            "rain",
+            "showers",
+            "weather_code",
+            "snowfall_convective_water_equivalent",
+            "snowfall_water_equivalent",
+            "snowfall_height",
+        ]
+    )
+
+    @property
+    def hourly_variables(self) -> list[str]:
+        """Return de-duplicated hourly variables for API requests.
+
+        Returns:
+            List of hourly variable names.
+        """
+        return list(
+            dict.fromkeys(
+                self.required_hourly_variables + self.optional_hourly_variables
+            )
+        )
 
 
 class WeatherClient:
+    """Client for Open-Meteo-compatible weather APIs."""
+
     def __init__(self, lat: float, lon: float, config: Optional[WeatherConfig] = None):
         self.lat = lat
         self.lon = lon
@@ -33,13 +84,7 @@ class WeatherClient:
             "longitude": self.lon,
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
-            "hourly": [
-                "temperature_2m",
-                "cloud_cover",
-                "shortwave_radiation",
-                "snow_depth",
-                "snowfall",
-            ],
+            "hourly": self.config.hourly_variables,
             "timezone": "UTC",
         }
 
@@ -60,13 +105,7 @@ class WeatherClient:
         params: dict[str, str | float | int | list[str]] = {
             "latitude": self.lat,
             "longitude": self.lon,
-            "hourly": [
-                "temperature_2m",
-                "cloud_cover",
-                "shortwave_radiation",
-                "snow_depth",
-                "snowfall",
-            ],
+            "hourly": self.config.hourly_variables,
             "forecast_days": days,
             "timezone": "UTC",
         }
@@ -139,19 +178,30 @@ class WeatherClient:
         return time_series.dt.tz_localize(response_tz).dt.tz_convert("UTC")
 
     def _process_response(self, data: dict) -> pd.DataFrame:
+        """Convert an Open-Meteo response into a weather dataframe.
+
+        Args:
+            data: Raw JSON payload from the weather API.
+
+        Returns:
+            DataFrame with UTC timestamps and numeric weather columns.
+
+        Raises:
+            ValueError: If the response does not contain hourly data.
+        """
         hourly = data.get("hourly", {})
         if not hourly:
             raise ValueError("No hourly data in response")
 
-        # Required columns for core logic
-        cols = {
-            "ds": self._parse_hourly_times(data),
-            "temperature_2m": hourly.get("temperature_2m"),
-            "cloud_cover": hourly.get("cloud_cover"),
-            "shortwave_radiation": hourly.get("shortwave_radiation"),
-            "snow_depth": hourly.get("snow_depth"),
-            "snowfall": hourly.get("snowfall"),
-        }
+        timestamps = self._parse_hourly_times(data)
+        cols: dict[str, object] = {"ds": timestamps}
+        for variable in self.config.required_hourly_variables:
+            values = hourly.get(variable)
+            cols[variable] = values if values is not None else [None] * len(timestamps)
+
+        for variable in self.config.optional_hourly_variables:
+            if variable in hourly:
+                cols[variable] = hourly[variable]
 
         df = pd.DataFrame(cols)
 

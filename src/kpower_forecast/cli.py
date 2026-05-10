@@ -131,9 +131,14 @@ def forecast(
     storage_path: Annotated[
         str, typer.Option("--storage", help="Path to store models")
     ] = "./data",
-    cloud_impact: Annotated[
-        float, typer.Option("--cloud-impact", help="Max cloud damping impact (0.0-1.0)")
-    ] = 0.35,
+    inverter_ac_limit_kw: Annotated[
+        Optional[float],
+        typer.Option("--inverter-limit", help="Optional inverter AC limit in kW"),
+    ] = None,
+    grid_export_limit_kw: Annotated[
+        Optional[float],
+        typer.Option("--export-limit", help="Optional grid export limit in kW"),
+    ] = None,
     heat_pump: Annotated[
         bool,
         typer.Option(
@@ -171,8 +176,9 @@ def forecast(
         forecast_type=forecast_type.value,
         data_category=category,
         unit=unit,
-        cloud_impact=cloud_impact,
         heat_pump_mode=heat_pump,
+        inverter_ac_limit_kw=inverter_ac_limit_kw,
+        grid_export_limit_kw=grid_export_limit_kw,
     )
 
     # 1. Check Model / Training

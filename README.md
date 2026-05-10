@@ -17,6 +17,8 @@ Built with [Facebook Prophet](https://facebook.github.io/prophet/) and powered b
 - 🔋 **Dual Mode**: Specialized logic for both **Solar Production** and **Energy Consumption**.
 - 🌓 **Night Masking**: Physics-informed clamping using solar elevation to eliminate "ghost production" at night.
 - 🌡️ **Weather Integration**: Automatic fetching and resampling of temperature, cloud cover, and radiation.
+- 🌦️ **Adaptive Weather Correction**: Learns location/model-specific weather bias as forecast history accumulates.
+- ⚡ **Optional Curtailment Limits**: Clips delivered solar forecasts to inverter or export limits when configured.
 - 🤖 **Prophet Optimized**: Pre-configured regressors for maximum accuracy.
 - 💾 **Smart Persistence**: Automatic serialization of models to skip retraining when possible.
 - ❄️ **Heat Pump Mode**: Optional temperature correlation for energy consumption models.
@@ -43,8 +45,8 @@ KPower Forecast comes with a powerful CLI for interactive forecasting and visual
 # Forecast solar production using Home Assistant CSV export
 # Supports different data categories: instant_energy, cumulative_energy, power
 # Supports different units: kWh, Wh, kW, W
-# Supports tuning cloud damping: --cloud-impact (default 0.35)
-kpower-forecast solar rooftop-1 46.05 14.50 -i history.csv --category power --unit W --cloud-impact 0.3 --horizon 7
+# Optional delivered-energy curtailment limits can be supplied in kW
+kpower-forecast solar rooftop-1 46.05 14.50 -i history.csv --category power --unit W --inverter-limit 10 --export-limit 7 --horizon 7
 
 # Forecast power consumption
 kpower-forecast consumption main-meter 46.05 14.50 -i history.csv --category cumulative_energy --unit kWh --horizon 3 --heatpump
@@ -72,7 +74,9 @@ kp = KPowerForecast(
     longitude=14.5058,
     forecast_type="solar",
     data_category=DataCategory.POWER,
-    unit=MeasurementUnit.W
+    unit=MeasurementUnit.W,
+    inverter_ac_limit_kw=10.0,
+    grid_export_limit_kw=7.0,
 )
 
 # 2. Train with your history
@@ -108,6 +112,11 @@ kp_cons = KPowerForecast(
 | `interval_minutes`| `int" | `15` | Data resolution (15 or 60) |
 | `storage_path` | `str` | `"./data"` | Directory for saved models |
 | `heat_pump_mode` | `bool` | `False` | Enable temperature regressor for consumption |
+| `adaptive_weather_correction` | `bool` | `True` | Learn weather correction from archived forecasts, with historical weather fallback |
+| `inverter_ac_limit_kw` | `float \| None` | `None` | Optional inverter AC output limit in kW |
+| `grid_export_limit_kw` | `float \| None` | `None` | Optional grid export limit in kW |
+
+Adaptive weather correction is conservative on new sites. Initial training works without historical forecast snapshots by falling back to archive weather, then improves as generated forecasts are archived and later matched with actual production.
 
 ---
 

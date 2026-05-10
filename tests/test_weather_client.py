@@ -1,6 +1,6 @@
 import pandas as pd
 
-from kpower_forecast.weather_client import WeatherClient
+from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
 
 def test_fetch_forecast_requests_ecmwf_ifs_model(monkeypatch) -> None:
@@ -37,6 +37,58 @@ def test_fetch_forecast_requests_ecmwf_ifs_model(monkeypatch) -> None:
 
     assert observed_params["models"] == "ecmwf_ifs"
     assert observed_params["forecast_days"] == 5
+    hourly_variables = observed_params["hourly"]
+    assert isinstance(hourly_variables, list)
+    assert "direct_radiation" in hourly_variables
+
+
+def test_process_response_includes_available_optional_fields() -> None:
+    client = WeatherClient(lat=46.0, lon=14.0)
+    data = {
+        "timezone": "UTC",
+        "utc_offset_seconds": 0,
+        "hourly": {
+            "time": ["2024-06-01T00:00", "2024-06-01T01:00"],
+            "temperature_2m": [20.0, 21.0],
+            "cloud_cover": [100.0, 90.0],
+            "shortwave_radiation": [0.0, 10.0],
+            "snow_depth": [None, None],
+            "snowfall": [None, None],
+            "direct_radiation": [0.0, 2.0],
+            "diffuse_radiation": [0.0, 8.0],
+            "rain": [0.0, 1.0],
+        },
+    }
+
+    df = client._process_response(data)
+
+    assert df["direct_radiation"].tolist() == [0.0, 2.0]
+    assert df["diffuse_radiation"].tolist() == [0.0, 8.0]
+    assert df["rain"].tolist() == [0.0, 1.0]
+
+
+def test_process_response_omits_unavailable_optional_fields() -> None:
+    client = WeatherClient(
+        lat=46.0,
+        lon=14.0,
+        config=WeatherConfig(optional_hourly_variables=["direct_radiation"]),
+    )
+    data = {
+        "timezone": "UTC",
+        "utc_offset_seconds": 0,
+        "hourly": {
+            "time": ["2024-06-01T00:00", "2024-06-01T01:00"],
+            "temperature_2m": [20.0, 21.0],
+            "cloud_cover": [0.0, 0.0],
+            "shortwave_radiation": [0.0, 10.0],
+            "snow_depth": [None, None],
+            "snowfall": [None, None],
+        },
+    }
+
+    df = client._process_response(data)
+
+    assert "direct_radiation" not in df.columns
 
 
 def test_process_response_converts_naive_local_times_to_utc():

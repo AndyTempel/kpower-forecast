@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .storage import ModelStorage
 from .utils import calculate_solar_elevation, get_clear_sky_ghi
-from .weather_client import WeatherClient
+from .weather_client import WeatherClient, WeatherConfig
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,8 @@ class PredictionInterval(BaseModel):
 
 
 class KPowerConfig(BaseModel):
+    """Runtime configuration for a forecasting model."""
+
     model_id: str
     latitude: float = Field(..., ge=-90, le=90)
     longitude: float = Field(..., ge=-180, le=180)
@@ -52,7 +54,13 @@ class KPowerConfig(BaseModel):
     efficiency_profile: Optional[dict[int, float]] = None
     max_efficiency_factor: Optional[float] = None
     efficiency_cap_headroom: float = Field(default=1.15, gt=0)
-    cloud_impact: float = 0.35  # Linear damping at 100% cloud cover
+    adaptive_weather_correction: bool = True
+    weather_correction: Optional[dict[str, Any]] = None
+    min_weather_correction_samples: int = Field(default=8, gt=0)
+    min_weather_correction_multiplier: float = Field(default=0.65, gt=0)
+    max_weather_correction_multiplier: float = Field(default=1.35, gt=0)
+    inverter_ac_limit_kw: Optional[float] = Field(default=None, gt=0)
+    grid_export_limit_kw: Optional[float] = Field(default=None, gt=0)
 
     @field_validator("interval_minutes")
     @classmethod
@@ -65,6 +73,8 @@ class KPowerConfig(BaseModel):
 
 
 class KPowerForecast:
+    """Train and serve solar production or consumption forecasts."""
+
     def __init__(
         self,
         model_id: str,
@@ -76,7 +86,10 @@ class KPowerForecast:
         data_category: DataCategory = DataCategory.INSTANT_ENERGY,
         unit: MeasurementUnit = MeasurementUnit.KWH,
         heat_pump_mode: bool = False,
-        cloud_impact: float = 0.35,
+        adaptive_weather_correction: bool = True,
+        inverter_ac_limit_kw: Optional[float] = None,
+        grid_export_limit_kw: Optional[float] = None,
+        weather_config: Optional[WeatherConfig] = None,
     ):
         self.config = KPowerConfig(
             model_id=model_id,
@@ -88,11 +101,15 @@ class KPowerForecast:
             data_category=data_category,
             unit=unit,
             heat_pump_mode=heat_pump_mode,
-            cloud_impact=cloud_impact,
+            adaptive_weather_correction=adaptive_weather_correction,
+            inverter_ac_limit_kw=inverter_ac_limit_kw,
+            grid_export_limit_kw=grid_export_limit_kw,
         )
 
         self.weather_client = WeatherClient(
-            lat=self.config.latitude, lon=self.config.longitude
+            lat=self.config.latitude,
+            lon=self.config.longitude,
+            config=weather_config,
         )
         self.storage = ModelStorage(storage_path=self.config.storage_path)
         self._model: Optional[Prophet] = None
@@ -110,6 +127,7 @@ class KPowerForecast:
         self.config.efficiency_profile = self._normalize_efficiency_profile(
             metadata.get("efficiency_profile")
         )
+        self.config.weather_correction = metadata.get("weather_correction")
 
     def _build_model_metadata(self) -> dict[str, Any]:
         """Build JSON-serializable metadata for model persistence.
@@ -120,7 +138,17 @@ class KPowerForecast:
         return {
             "efficiency_factor": self.config.efficiency_factor,
             "efficiency_profile": self.config.efficiency_profile,
+            "weather_correction": self.config.weather_correction,
+            "forecast_model": self._forecast_model_id(),
         }
+
+    def _forecast_model_id(self) -> str:
+        """Return a stable weather model identifier for metadata and storage.
+
+        Returns:
+            Weather model identifier, or ``default`` when unspecified.
+        """
+        return self.weather_client.config.forecast_model or "default"
 
     def _normalize_efficiency_profile(self, profile: Any) -> Optional[dict[int, float]]:
         """Normalize persisted efficiency profile keys and values.
@@ -339,6 +367,351 @@ class KPowerForecast:
         )
         return learned_profile
 
+    def _weather_bucket_series(self, df: pd.DataFrame) -> pd.Series:
+        """Build coarse weather-condition buckets for adaptive correction.
+
+        Args:
+            df: Dataframe containing weather columns.
+
+        Returns:
+            Series of string bucket labels aligned with ``df``.
+        """
+        cloud_cover = df.get("cloud_cover", pd.Series(0.0, index=df.index)).fillna(0.0)
+        cloud_bucket = pd.cut(
+            cloud_cover,
+            bins=[-0.1, 25.0, 60.0, 85.0, 100.0],
+            labels=["clear", "mixed", "cloudy", "overcast"],
+        ).astype("string")
+
+        wet_columns = ["precipitation", "rain", "showers"]
+        wet_signal = pd.Series(0.0, index=df.index)
+        for column in wet_columns:
+            if column in df.columns:
+                wet_signal = wet_signal.add(df[column].fillna(0.0), fill_value=0.0)
+
+        snow_signal = pd.Series(0.0, index=df.index)
+        for column in ["snow_depth", "snowfall", "snowfall_height"]:
+            if column in df.columns:
+                snow_signal = snow_signal.add(df[column].fillna(0.0), fill_value=0.0)
+
+        weather_state = pd.Series("dry", index=df.index, dtype="string")
+        weather_state = weather_state.mask(wet_signal > 0.1, "wet")
+        weather_state = weather_state.mask(snow_signal > 0.01, "snow")
+
+        if {"direct_radiation", "diffuse_radiation"}.issubset(df.columns):
+            direct = df["direct_radiation"].fillna(0.0).clip(lower=0.0)
+            diffuse = df["diffuse_radiation"].fillna(0.0).clip(lower=0.0)
+            ratio = direct / (direct + diffuse).replace(0.0, pd.NA)
+            radiation_bucket = pd.Series("unknown", index=df.index, dtype="string")
+            radiation_bucket = radiation_bucket.mask(ratio < 0.35, "diffuse")
+            radiation_bucket = radiation_bucket.mask(
+                (ratio >= 0.35) & (ratio < 0.7), "mixed"
+            )
+            radiation_bucket = radiation_bucket.mask(ratio >= 0.7, "direct")
+        else:
+            radiation_bucket = pd.Series("unknown", index=df.index, dtype="string")
+
+        return cloud_bucket + "|" + weather_state + "|" + radiation_bucket
+
+    def _energy_limit_from_efficiency(
+        self, future: pd.DataFrame
+    ) -> Optional[pd.Series]:
+        """Calculate interval energy limit from learned PV efficiency.
+
+        Args:
+            future: Weather dataframe aligned with forecast rows.
+
+        Returns:
+            Energy limit per interval, or None when efficiency is unavailable.
+        """
+        base_efficiency_factor = self.config.efficiency_factor
+        if base_efficiency_factor is None:
+            return None
+
+        minute_of_day = future["ds"].dt.hour * 60 + future["ds"].dt.minute
+        efficiency_profile = self.config.efficiency_profile
+        if efficiency_profile:
+            efficiency_factor = minute_of_day.map(
+                lambda minute: efficiency_profile.get(
+                    int(minute), base_efficiency_factor
+                )
+            )
+        else:
+            efficiency_factor = pd.Series(base_efficiency_factor, index=future.index)
+
+        power_limit = future["shortwave_radiation"] * (
+            efficiency_factor * self.config.efficiency_cap_headroom
+        )
+        interval_hours = self.config.interval_minutes / 60.0
+        return cast(pd.Series, power_limit * interval_hours)
+
+    def _curtailment_limit_series(
+        self,
+        future: pd.DataFrame,
+        dynamic_export_limits: Optional[pd.DataFrame] = None,
+    ) -> pd.Series:
+        """Build per-interval optional curtailment limit in kWh.
+
+        Args:
+            future: Forecast weather dataframe with ``ds`` timestamps.
+            dynamic_export_limits: Optional timestamped export limits with ``ds``
+                and either ``export_limit_kw`` or ``limit_kw``.
+
+        Returns:
+            Series containing interval kWh limits, or infinity when unrestricted.
+
+        Raises:
+            ValueError: If dynamic limits are missing required columns.
+        """
+        limit_kw = pd.Series(float("inf"), index=future.index)
+        static_limits = [
+            value
+            for value in [
+                self.config.inverter_ac_limit_kw,
+                self.config.grid_export_limit_kw,
+            ]
+            if value is not None
+        ]
+        if static_limits:
+            limit_kw = pd.Series(min(static_limits), index=future.index)
+
+        if dynamic_export_limits is not None:
+            dynamic = dynamic_export_limits.copy()
+            limit_column = (
+                "export_limit_kw"
+                if "export_limit_kw" in dynamic.columns
+                else "limit_kw"
+            )
+            if "ds" not in dynamic.columns or limit_column not in dynamic.columns:
+                raise ValueError(
+                    "dynamic_export_limits must contain 'ds' and "
+                    "'export_limit_kw' or 'limit_kw' columns"
+                )
+
+            dynamic["ds"] = pd.to_datetime(dynamic["ds"], utc=True)
+            dynamic = dynamic.sort_values("ds")[["ds", limit_column]]
+            aligned = pd.merge_asof(
+                future[["ds"]].sort_values("ds"),
+                dynamic,
+                on="ds",
+                direction="backward",
+            ).sort_index()
+            dynamic_kw = aligned[limit_column].reindex(future.index)
+            dynamic_kw = pd.to_numeric(dynamic_kw, errors="coerce")
+            limit_kw = pd.concat([limit_kw, dynamic_kw], axis=1).min(axis=1)
+
+        interval_hours = self.config.interval_minutes / 60.0
+        return limit_kw * interval_hours
+
+    def _calibrate_weather_correction(
+        self, prepared_df: pd.DataFrame
+    ) -> Optional[dict[str, Any]]:
+        """Learn conservative weather correction metadata.
+
+        Training is allowed without archived production forecasts. When forecast
+        archive rows exist, calibration compares those forecast snapshots with
+        later actual production. Otherwise it falls back to historical/archive
+        weather and a learned efficiency baseline.
+
+        Args:
+            prepared_df: Prepared training dataframe with actual production and
+                weather columns.
+
+        Returns:
+            Calibration metadata, or None when insufficient data is available.
+        """
+        if not self.config.adaptive_weather_correction:
+            return None
+        if self.config.forecast_type != "solar":
+            return None
+
+        actual = prepared_df.copy()
+        actual["ds"] = pd.to_datetime(actual["ds"], utc=True)
+        forecast_model = self._forecast_model_id()
+        archive = self.storage.load_forecast_archive(
+            self.config.model_id, forecast_model
+        )
+
+        if archive is not None and "pre_weather_correction_yhat" in archive.columns:
+            archive["ds"] = pd.to_datetime(archive["ds"], utc=True)
+            calibration_df = pd.merge(
+                actual[["ds", "y"]],
+                archive,
+                on="ds",
+                how="inner",
+                suffixes=("_actual", ""),
+            )
+            baseline = calibration_df["pre_weather_correction_yhat"]
+            source = "forecast_archive"
+        else:
+            energy_limit = self._energy_limit_from_efficiency(actual)
+            if energy_limit is None:
+                return None
+            calibration_df = actual.copy()
+            baseline = energy_limit.reindex(calibration_df.index)
+            source = "historical_archive_weather"
+
+        ratio = calibration_df["y"] / baseline.replace(0.0, pd.NA)
+        ratio = pd.to_numeric(ratio, errors="coerce")
+        calibration_df = calibration_df.assign(weather_ratio=ratio)
+        calibration_df = calibration_df[
+            (calibration_df["weather_ratio"] > 0)
+            & calibration_df["weather_ratio"].notna()
+            & (baseline > 0.01)
+        ].copy()
+
+        if "applied_curtailment_limit_kwh" in calibration_df.columns:
+            limit = calibration_df["applied_curtailment_limit_kwh"]
+            calibration_df = calibration_df[
+                limit.isna() | (calibration_df["y"] < limit * 0.98)
+            ]
+
+        if len(calibration_df) < self.config.min_weather_correction_samples:
+            return None
+
+        lower = self.config.min_weather_correction_multiplier
+        upper = self.config.max_weather_correction_multiplier
+        global_multiplier = float(calibration_df["weather_ratio"].median())
+        global_multiplier = min(max(global_multiplier, lower), upper)
+
+        calibration_df["weather_bucket"] = self._weather_bucket_series(calibration_df)
+        buckets: dict[str, dict[str, float | int]] = {}
+        min_samples = self.config.min_weather_correction_samples
+        for bucket, group in calibration_df.groupby("weather_bucket", dropna=True):
+            sample_count = int(len(group))
+            bucket_multiplier = float(group["weather_ratio"].median())
+            bucket_multiplier = min(max(bucket_multiplier, lower), upper)
+            confidence = min(1.0, sample_count / (min_samples * 4.0))
+            shrunk_multiplier = 1.0 + confidence * (bucket_multiplier - 1.0)
+            buckets[str(bucket)] = {
+                "multiplier": float(shrunk_multiplier),
+                "samples": sample_count,
+            }
+
+        metadata: dict[str, Any] = {
+            "source": source,
+            "forecast_model": forecast_model,
+            "latitude": self.config.latitude,
+            "longitude": self.config.longitude,
+            "default_multiplier": global_multiplier,
+            "min_samples": min_samples,
+            "buckets": buckets,
+            "updated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        }
+        self.storage.save_weather_calibration(
+            self.config.model_id, forecast_model, metadata
+        )
+        return metadata
+
+    def _load_weather_correction(self) -> None:
+        """Load adaptive weather correction metadata when available.
+
+        Returns:
+            None.
+        """
+        if self.config.weather_correction is not None:
+            return
+        calibration = self.storage.load_weather_calibration(
+            self.config.model_id, self._forecast_model_id()
+        )
+        if calibration is not None:
+            self.config.weather_correction = calibration
+
+    def _apply_adaptive_weather_correction(
+        self, forecast: pd.DataFrame, future: pd.DataFrame
+    ) -> pd.Series:
+        """Apply persisted adaptive weather correction to forecast columns.
+
+        Args:
+            forecast: Forecast dataframe to mutate.
+            future: Weather dataframe aligned with ``forecast``.
+
+        Returns:
+            Applied multiplier series.
+        """
+        self._load_weather_correction()
+        correction = self.config.weather_correction
+        multipliers = pd.Series(1.0, index=forecast.index)
+        if not self.config.adaptive_weather_correction or not correction:
+            return multipliers
+
+        buckets = correction.get("buckets", {})
+        default_multiplier = float(correction.get("default_multiplier", 1.0))
+        weather_buckets = self._weather_bucket_series(future)
+        multipliers = weather_buckets.map(
+            lambda bucket: buckets.get(str(bucket), {}).get(
+                "multiplier", default_multiplier
+            )
+        )
+        multipliers = pd.to_numeric(multipliers, errors="coerce").fillna(1.0)
+
+        for col in ["yhat", "yhat_lower", "yhat_upper"]:
+            forecast[col] *= multipliers.values
+        return cast(pd.Series, multipliers)
+
+    def _apply_curtailment(
+        self,
+        forecast: pd.DataFrame,
+        future: pd.DataFrame,
+        dynamic_export_limits: Optional[pd.DataFrame] = None,
+    ) -> None:
+        """Apply optional inverter/export limits to delivered forecast columns.
+
+        Args:
+            forecast: Forecast dataframe to mutate.
+            future: Weather dataframe aligned with forecast rows.
+            dynamic_export_limits: Optional time-varying export limits.
+
+        Returns:
+            None.
+        """
+        limit = self._curtailment_limit_series(future, dynamic_export_limits)
+        finite_limit = limit.replace(float("inf"), pd.NA)
+        forecast["applied_curtailment_limit_kwh"] = finite_limit
+        forecast["pre_curtailment_yhat"] = forecast["yhat"]
+
+        clipped_yhat = forecast["yhat"].combine(limit, min)
+        forecast["curtailed_kwh"] = (forecast["yhat"] - clipped_yhat).clip(lower=0)
+        forecast["curtailment_active"] = forecast["curtailed_kwh"] > 0
+        forecast["yhat"] = clipped_yhat
+
+        for col in ["yhat_lower", "yhat_upper"]:
+            forecast[col] = forecast[col].combine(limit, min)
+
+    def _save_forecast_archive(
+        self, forecast: pd.DataFrame, future: pd.DataFrame
+    ) -> None:
+        """Persist forecast outputs and weather inputs for future calibration.
+
+        Args:
+            forecast: Forecast dataframe after post-processing.
+            future: Weather dataframe aligned with forecast rows.
+
+        Returns:
+            None.
+        """
+        weather_columns = [column for column in future.columns if column != "ds"]
+        output_columns = [
+            "ds",
+            "pre_weather_correction_yhat",
+            "weather_corrected_yhat",
+            "pre_curtailment_yhat",
+            "yhat",
+            "applied_curtailment_limit_kwh",
+            "curtailed_kwh",
+            "curtailment_active",
+            "weather_correction_multiplier",
+        ]
+        archive = forecast[[c for c in output_columns if c in forecast.columns]].copy()
+        archive["ds"] = pd.to_datetime(archive["ds"], utc=True)
+        weather_archive = future[["ds", *weather_columns]].copy()
+        weather_archive["ds"] = pd.to_datetime(weather_archive["ds"], utc=True)
+        archive = pd.merge(archive, weather_archive, on="ds", how="left")
+        archive["forecast_model"] = self._forecast_model_id()
+        self.storage.save_forecast_archive(
+            self.config.model_id, self._forecast_model_id(), archive
+        )
+
     def train(self, history_df: pd.DataFrame, force: bool = False):
         """
         Trains the Prophet model using the provided history.
@@ -368,6 +741,7 @@ class KPowerForecast:
         # Calibrate physics-informed efficiency limit
         self.config.efficiency_factor = self.calibrate_efficiency(df)
         self.config.efficiency_profile = self.calibrate_efficiency_profile(df)
+        self.config.weather_correction = self._calibrate_weather_correction(df)
 
         m = Prophet(
             changepoint_prior_scale=self.config.changepoint_prior_scale,
@@ -530,6 +904,7 @@ class KPowerForecast:
         # Recalibrate efficiency on full accumulated dataset
         self.config.efficiency_factor = self.calibrate_efficiency(combined)
         self.config.efficiency_profile = self.calibrate_efficiency_profile(combined)
+        self.config.weather_correction = self._calibrate_weather_correction(combined)
 
         # Resolve prior model for warm start
         prior_model = self._model
@@ -577,7 +952,11 @@ class KPowerForecast:
         self.storage.save_training_data(self.config.model_id, combined)
         self._model = m
 
-    def predict(self, days: int = 7) -> pd.DataFrame:
+    def predict(
+        self,
+        days: int = 7,
+        dynamic_export_limits: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
         """
         Generates forecast for the next 'days' days with physics-informed constraints.
         """
@@ -617,7 +996,7 @@ class KPowerForecast:
 
         # 1. Solar Production Constraints
         if self.config.forecast_type == "solar":
-            logger.info("Applying physical constraints (Snow & Clouds)...")
+            logger.info("Applying physical solar constraints...")
 
             # A. Snow Masking (The "Winter Killer")
             # Hard Cap: snow_depth > 5cm (0.05m) -> 0% production
@@ -627,41 +1006,14 @@ class KPowerForecast:
                 future["snow_depth"] <= 0.05
             )
 
-            # B. Linear Cloud Damping (Diffuse Light Physics)
-            # Factor = 1.0 - (cloud_cover_fraction * cloud_impact)
-            # This allows diffuse light to pass through even at 100% clouds.
-            cloud_damping = (
-                1.0 - (future["cloud_cover"] / 100.0) * self.config.cloud_impact
-            )
-
             for col in ["yhat", "yhat_lower", "yhat_upper"]:
-                # Apply Cloud Damping
-                forecast[col] *= cloud_damping.values
                 # Apply Snow Constraints
                 forecast.loc[snow_mask_soft.values, col] *= 0.5
                 forecast.loc[snow_mask_hard.values, col] = 0.0
 
             # C. Efficiency Cap
-            base_efficiency_factor = self.config.efficiency_factor
-            if base_efficiency_factor is not None:
-                minute_of_day = future["ds"].dt.hour * 60 + future["ds"].dt.minute
-                efficiency_profile = self.config.efficiency_profile
-                if efficiency_profile:
-                    efficiency_factor = minute_of_day.map(
-                        lambda minute: efficiency_profile.get(
-                            int(minute), base_efficiency_factor
-                        )
-                    )
-                else:
-                    efficiency_factor = pd.Series(
-                        base_efficiency_factor, index=future.index
-                    )
-
-                power_limit = future["shortwave_radiation"] * (
-                    efficiency_factor * self.config.efficiency_cap_headroom
-                )
-                interval_hours = self.config.interval_minutes / 60.0
-                energy_limit = power_limit * interval_hours
+            energy_limit = self._energy_limit_from_efficiency(future)
+            if energy_limit is not None:
                 energy_limit.index = forecast.index
 
                 for col in ["yhat", "yhat_lower", "yhat_upper"]:
@@ -674,9 +1026,19 @@ class KPowerForecast:
             )
             forecast.loc[elevations < 0, ["yhat", "yhat_lower", "yhat_upper"]] = 0
 
+            forecast["pre_weather_correction_yhat"] = forecast["yhat"]
+            forecast["weather_correction_multiplier"] = (
+                self._apply_adaptive_weather_correction(forecast, future)
+            )
+            forecast["weather_corrected_yhat"] = forecast["yhat"]
+            self._apply_curtailment(forecast, future, dynamic_export_limits)
+
         # Clip all forecasts to 0
         for col in ["yhat", "yhat_lower", "yhat_upper"]:
             forecast[col] = forecast[col].clip(lower=0)
+
+        if self.config.forecast_type == "solar":
+            self._save_forecast_archive(forecast, future)
 
         return cast(pd.DataFrame, forecast)
 
