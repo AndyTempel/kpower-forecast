@@ -135,3 +135,29 @@ def test_process_response_keeps_gmt_times_as_utc():
         pd.Timestamp("2024-06-01T00:00:00Z"),
         pd.Timestamp("2024-06-01T01:00:00Z"),
     ]
+
+
+def test_resample_weather_clips_physical_negative_values() -> None:
+    client = WeatherClient(lat=46.0, lon=14.0)
+    df = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-06-01", periods=4, freq="h", tz="UTC"),
+            "temperature_2m": [10.0, 12.0, 11.0, 13.0],
+            "shortwave_radiation": [0.0, -10.0, 50.0, 0.0],
+            "direct_radiation": [0.0, -5.0, 40.0, 0.0],
+            "diffuse_radiation": [0.0, -3.0, 10.0, 0.0],
+            "snow_depth": [0.0, -0.1, 0.0, 0.0],
+            "rain": [0.0, -1.0, 0.0, 0.0],
+        }
+    )
+
+    resampled = client.resample_weather(df, interval_minutes=15)
+
+    for column in [
+        "shortwave_radiation",
+        "direct_radiation",
+        "diffuse_radiation",
+        "snow_depth",
+        "rain",
+    ]:
+        assert resampled[column].min() >= 0.0

@@ -47,6 +47,15 @@ cli = [
     "plotext>=5.2.8",
     "plotly>=6.3.0",
 ]
+ml = [
+    "statsforecast>=2.0.0",
+    "mlforecast>=1.0.0",
+    "neuralforecast>=3.0.0",
+    "lightgbm>=4.6.0",
+    "scikit-learn>=1.6.0",
+    "joblib>=1.4.0",
+    "holidays>=0.70",
+]
 
 [project.scripts]
 kpower-forecast = "kpower_forecast.cli:app"
@@ -62,6 +71,12 @@ module = [
     "prophet.*",
     "pvlib.*",
     "pysolar.*",
+    "statsforecast.*",
+    "mlforecast.*",
+    "neuralforecast.*",
+    "lightgbm.*",
+    "sklearn.*",
+    "holidays.*",
 ]
 ignore_missing_imports = true
 

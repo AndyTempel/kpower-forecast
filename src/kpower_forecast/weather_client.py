@@ -9,6 +9,20 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+PHYSICAL_LOWER_BOUNDED_COLUMNS: tuple[str, ...] = (
+    "shortwave_radiation",
+    "direct_radiation",
+    "diffuse_radiation",
+    "snow_depth",
+    "snowfall",
+    "precipitation",
+    "rain",
+    "showers",
+    "snowfall_convective_water_equivalent",
+    "snowfall_water_equivalent",
+    "snowfall_height",
+)
+
 
 class WeatherConfig(BaseModel):
     """Configuration for Open-Meteo-compatible weather requests.
@@ -220,7 +234,26 @@ class WeatherClient:
         # Linear interpolation is usually safe for weather gaps
         df = df.interpolate(method="linear").bfill().ffill()
 
-        return df
+        return self._clip_physical_bounds(df)
+
+    def _clip_physical_bounds(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clip weather variables that cannot be physically negative.
+
+        Args:
+            df: Weather dataframe with optional Open-Meteo columns.
+
+        Returns:
+            Copy of ``df`` with lower-bounded physical variables clipped to zero.
+        """
+        bounded_columns = [
+            column for column in PHYSICAL_LOWER_BOUNDED_COLUMNS if column in df.columns
+        ]
+        if not bounded_columns:
+            return df
+
+        clipped = df.copy()
+        clipped[bounded_columns] = clipped[bounded_columns].clip(lower=0.0)
+        return clipped
 
     def resample_weather(self, df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
         """
@@ -240,7 +273,7 @@ class WeatherClient:
         target_freq = f"{interval_minutes}min"
 
         if current_freq == target_freq:
-            return df.reset_index()
+            return self._clip_physical_bounds(df.reset_index())
 
         # Resample and interpolate
         # Cubic is good for temperature/radiation curves
@@ -249,4 +282,4 @@ class WeatherClient:
         df_resampled = df.resample(target_freq).interpolate(method="cubic")
 
         # Reset index to get 'ds' column back
-        return df_resampled.reset_index()
+        return self._clip_physical_bounds(df_resampled.reset_index())
