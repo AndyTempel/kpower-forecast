@@ -88,6 +88,7 @@ class KPowerMLForecast:
         train_frame, calibration_frame = self._chronological_split(prepared)
         train_features = self.feature_builder.build(train_frame)
         calibration_features = self.feature_builder.build(calibration_frame)
+        full_features = self.feature_builder.build(prepared)
 
         self.bias_corrector.fit_from_historical_proxy(train_frame)
         self.backend.fit(train_frame, train_features, calibration_frame)
@@ -97,6 +98,7 @@ class KPowerMLForecast:
         self.conformal.fit(
             actual=calibration_frame["y"], predicted=calibration_predictions["yhat"]
         )
+        self.backend.fit(prepared, full_features, calibration_frame)
 
         manifest = MLModelManifest(
             model_id=self.config.model_id,

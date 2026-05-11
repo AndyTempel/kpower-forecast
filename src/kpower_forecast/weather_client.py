@@ -1,5 +1,6 @@
 import datetime
 import logging
+import re
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -8,6 +9,8 @@ import requests
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+INVALID_VARIABLE_PATTERN = re.compile(r"invalid String value\s+([a-zA-Z0-9_]+)")
 
 PHYSICAL_LOWER_BOUNDED_COLUMNS: tuple[str, ...] = (
     "shortwave_radiation",
@@ -59,7 +62,6 @@ class WeatherConfig(BaseModel):
             "rain",
             "showers",
             "weather_code",
-            "snowfall_convective_water_equivalent",
             "snowfall_water_equivalent",
             "snowfall_height",
         ]
@@ -93,48 +95,120 @@ class WeatherClient:
         """
         Fetch historical weather data for training.
         """
-        params: dict[str, str | float | list[str]] = {
-            "latitude": self.lat,
-            "longitude": self.lon,
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-            "hourly": self.config.hourly_variables,
-            "timezone": "UTC",
-        }
+        hourly_variables = list(self.config.hourly_variables)
+
+        while True:
+            params: dict[str, str | float | list[str]] = {
+                "latitude": self.lat,
+                "longitude": self.lon,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "hourly": hourly_variables,
+                "timezone": "UTC",
+            }
+
+            try:
+                logger.info(
+                    f"Fetching historical weather from {self.config.archive_url}"
+                )
+                response = requests.get(
+                    self.config.archive_url, params=params, timeout=10
+                )
+                response.raise_for_status()
+                data = response.json()
+                return self._process_response(data)
+            except requests.HTTPError as error:
+                invalid_variable = self._extract_invalid_variable(error)
+                if invalid_variable and invalid_variable in hourly_variables:
+                    logger.warning(
+                        "Archive API rejected variable '%s'. Retrying without it.",
+                        invalid_variable,
+                    )
+                    hourly_variables = [
+                        variable
+                        for variable in hourly_variables
+                        if variable != invalid_variable
+                    ]
+                    if not hourly_variables:
+                        logger.error(
+                            "Archive API rejected all hourly variables "
+                            "for historical fetch."
+                        )
+                        raise
+                    continue
+
+                logger.error(f"Failed to fetch historical weather: {error}")
+                raise
+            except requests.RequestException as error:
+                logger.error(f"Failed to fetch historical weather: {error}")
+                raise
+
+    def _extract_invalid_variable(self, error: requests.HTTPError) -> Optional[str]:
+        """Extract unsupported variable name from Open-Meteo error payload."""
+        response = error.response
+        if response is None:
+            return None
 
         try:
-            logger.info(f"Fetching historical weather from {self.config.archive_url}")
-            response = requests.get(self.config.archive_url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            return self._process_response(data)
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch historical weather: {e}")
-            raise
+            payload = response.json()
+        except ValueError:
+            return None
+
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if not isinstance(reason, str):
+            return None
+
+        match = INVALID_VARIABLE_PATTERN.search(reason)
+        return match.group(1) if match else None
 
     def fetch_forecast(self, days: int = 7) -> pd.DataFrame:
         """
         Fetch weather forecast for prediction.
         """
-        params: dict[str, str | float | int | list[str]] = {
-            "latitude": self.lat,
-            "longitude": self.lon,
-            "hourly": self.config.hourly_variables,
-            "forecast_days": days,
-            "timezone": "UTC",
-        }
-        if self.config.forecast_model:
-            params["models"] = self.config.forecast_model
+        hourly_variables = list(self.config.hourly_variables)
 
-        try:
-            logger.info(f"Fetching forecast weather from {self.config.base_url}")
-            response = requests.get(self.config.base_url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            return self._process_response(data)
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch weather forecast: {e}")
-            raise
+        while True:
+            params: dict[str, str | float | int | list[str]] = {
+                "latitude": self.lat,
+                "longitude": self.lon,
+                "hourly": hourly_variables,
+                "forecast_days": days,
+                "timezone": "UTC",
+            }
+            if self.config.forecast_model:
+                params["models"] = self.config.forecast_model
+
+            try:
+                logger.info(f"Fetching forecast weather from {self.config.base_url}")
+                response = requests.get(self.config.base_url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                return self._process_response(data)
+            except requests.HTTPError as error:
+                invalid_variable = self._extract_invalid_variable(error)
+                if invalid_variable and invalid_variable in hourly_variables:
+                    logger.warning(
+                        "Forecast API rejected variable '%s'. Retrying without it.",
+                        invalid_variable,
+                    )
+                    hourly_variables = [
+                        variable
+                        for variable in hourly_variables
+                        if variable != invalid_variable
+                    ]
+                    if not hourly_variables:
+                        logger.error(
+                            "Forecast API rejected all hourly variables "
+                            "for forecast fetch."
+                        )
+                        raise
+                    continue
+
+                logger.error(f"Failed to fetch weather forecast: {error}")
+                raise
+            except requests.RequestException as error:
+                logger.error(f"Failed to fetch weather forecast: {error}")
+                raise
 
     def _get_response_timezone(self, data: dict) -> datetime.tzinfo:
         """Resolve the timezone metadata returned by Open-Meteo-compatible APIs.

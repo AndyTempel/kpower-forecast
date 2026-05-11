@@ -1,4 +1,5 @@
 import pandas as pd
+import requests
 
 from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
@@ -161,3 +162,146 @@ def test_resample_weather_clips_physical_negative_values() -> None:
         "rain",
     ]:
         assert resampled[column].min() >= 0.0
+
+
+def test_fetch_historical_retries_without_invalid_archive_variable(monkeypatch) -> None:
+    client = WeatherClient(
+        lat=46.0,
+        lon=14.0,
+        config=WeatherConfig(
+            optional_hourly_variables=["snowfall_convective_water_equivalent"]
+        ),
+    )
+    observed_hourly_params: list[list[str]] = []
+    call_count = 0
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError("bad request", response=self)
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        nonlocal call_count
+        assert timeout == 10
+        assert url == "https://archive-api.open-meteo.com/v1/archive"
+        hourly = params.get("hourly")
+        assert isinstance(hourly, list)
+        observed_hourly_params.append(list(hourly))
+        call_count += 1
+
+        if call_count == 1:
+            return Response(
+                400,
+                {
+                    "reason": (
+                        "Data corrupted at path ''. Cannot initialize "
+                        "SurfacePressureAndHeightVariable<...> from invalid String "
+                        "value snowfall_convective_water_equivalent."
+                    ),
+                    "error": True,
+                },
+            )
+
+        return Response(
+            200,
+            {
+                "timezone": "UTC",
+                "utc_offset_seconds": 0,
+                "hourly": {
+                    "time": ["2026-05-01T00:00", "2026-05-01T01:00"],
+                    "temperature_2m": [10.0, 11.0],
+                    "cloud_cover": [20.0, 25.0],
+                    "shortwave_radiation": [0.0, 50.0],
+                    "snow_depth": [None, None],
+                    "snowfall": [None, None],
+                },
+            },
+        )
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+
+    frame = client.fetch_historical(
+        start_date=pd.Timestamp("2026-05-01").date(),
+        end_date=pd.Timestamp("2026-05-01").date(),
+    )
+
+    assert len(observed_hourly_params) == 2
+    assert "snowfall_convective_water_equivalent" in observed_hourly_params[0]
+    assert "snowfall_convective_water_equivalent" not in observed_hourly_params[1]
+    assert not frame.empty
+
+
+def test_fetch_forecast_retries_without_invalid_variable(monkeypatch) -> None:
+    client = WeatherClient(
+        lat=46.0,
+        lon=14.0,
+        config=WeatherConfig(
+            optional_hourly_variables=["snowfall_convective_water_equivalent"]
+        ),
+    )
+    observed_hourly_params: list[list[str]] = []
+    call_count = 0
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError("bad request", response=self)
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        nonlocal call_count
+        assert timeout == 10
+        assert url == "https://api.open-meteo.com/v1/forecast"
+        hourly = params.get("hourly")
+        assert isinstance(hourly, list)
+        observed_hourly_params.append(list(hourly))
+        call_count += 1
+
+        if call_count == 1:
+            return Response(
+                400,
+                {
+                    "reason": (
+                        "invalid String value snowfall_convective_water_equivalent"
+                    ),
+                    "error": True,
+                },
+            )
+
+        return Response(
+            200,
+            {
+                "timezone": "UTC",
+                "utc_offset_seconds": 0,
+                "hourly": {
+                    "time": ["2026-05-01T00:00", "2026-05-01T01:00"],
+                    "temperature_2m": [10.0, 11.0],
+                    "cloud_cover": [20.0, 25.0],
+                    "shortwave_radiation": [0.0, 50.0],
+                    "snow_depth": [None, None],
+                    "snowfall": [None, None],
+                },
+            },
+        )
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+
+    frame = client.fetch_forecast(days=2)
+
+    assert len(observed_hourly_params) == 2
+    assert "snowfall_convective_water_equivalent" in observed_hourly_params[0]
+    assert "snowfall_convective_water_equivalent" not in observed_hourly_params[1]
+    assert not frame.empty
