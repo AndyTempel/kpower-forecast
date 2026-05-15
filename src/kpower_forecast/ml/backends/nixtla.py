@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import pandas as pd
 
-from kpower_forecast.ml.config import KPowerMLConfig
+from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
 from kpower_forecast.ml.dependencies import ensure_optional_dependencies
 
 STATE_FILE = "state.json"
@@ -159,6 +159,8 @@ class NixtlaHybridBackend:
 
     def _fit_solar_profile(self, history: pd.DataFrame, features: pd.DataFrame) -> None:
         """Learn interval kWh per W/m2 by minute-of-day for solar forecasts."""
+        if self.config.forecast_type != MLForecastType.SOLAR:
+            return
         if "shortwave_radiation" not in features.columns:
             return
 

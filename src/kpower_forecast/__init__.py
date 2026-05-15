@@ -1,4 +1,4 @@
 from .core import KPowerForecast
 
 __all__ = ["KPowerForecast"]
-__version__ = "2026.5.4"
+__version__ = "2026.5.5"
