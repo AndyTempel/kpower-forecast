@@ -1,6 +1,6 @@
 [project]
 name = "kpower-forecast"
-version = "2026.5.3"
+version = "2026.5.4"
 description = "Solar production and power consumption forecasting package."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -50,9 +50,13 @@ cli = [
 ml = [
     "statsforecast>=2.0.0",
     "mlforecast>=1.0.0",
-    "neuralforecast>=3.0.0",
     "lightgbm>=4.6.0",
     "scikit-learn>=1.6.0",
+    "joblib>=1.4.0",
+    "holidays>=0.70",
+]
+ai = [
+    "neuralforecast>=3.0.0",
     "joblib>=1.4.0",
     "holidays>=0.70",
 ]

@@ -140,3 +140,12 @@ def test_optional_dependency_boundary_reports_install_hint(monkeypatch) -> None:
 
     with pytest.raises(MissingMLDependencyError, match=r"kpower-forecast\[ml\]"):
         ensure_optional_dependencies(("missing_backend",), "Missing backend")
+
+
+def test_optional_dependency_boundary_supports_ai_extra_hint(monkeypatch) -> None:
+    monkeypatch.setattr("kpower_forecast.ml.dependencies.find_spec", lambda name: None)
+
+    with pytest.raises(MissingMLDependencyError, match=r"kpower-forecast\[ai\]"):
+        ensure_optional_dependencies(
+            ("neuralforecast",), "NeuralForecast backend", extra="ai"
+        )

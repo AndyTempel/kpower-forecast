@@ -8,13 +8,14 @@ class MissingMLDependencyError(RuntimeError):
 
 
 def ensure_optional_dependencies(
-    import_names: tuple[str, ...], backend_name: str
+    import_names: tuple[str, ...], backend_name: str, extra: str = "ml"
 ) -> None:
     """Ensure optional dependencies for a backend are importable.
 
     Args:
         import_names: Top-level import names required by the backend.
         backend_name: Human-readable backend name for error messages.
+        extra: Package extra that installs the missing dependencies.
 
     Returns:
         None.
@@ -27,5 +28,5 @@ def ensure_optional_dependencies(
         packages = ", ".join(sorted(missing))
         raise MissingMLDependencyError(
             f"{backend_name} requires optional ML dependencies: {packages}. "
-            'Install them with: pip install "kpower-forecast[ml]"'
+            f'Install them with: pip install "kpower-forecast[{extra}]"'
         )

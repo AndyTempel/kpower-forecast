@@ -777,7 +777,7 @@ wheels = [
 
 [[package]]
 name = "kpower-forecast"
-version = "2026.5.3"
+version = "2026.5.4"
 source = { editable = "." }
 dependencies = [
     { name = "cmdstanpy" },
@@ -793,6 +793,11 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+ai = [
+    { name = "holidays" },
+    { name = "joblib" },
+    { name = "neuralforecast" },
+]
 cli = [
     { name = "plotext" },
     { name = "plotly" },
@@ -815,7 +820,6 @@ ml = [
     { name = "joblib" },
     { name = "lightgbm" },
     { name = "mlforecast" },
-    { name = "neuralforecast" },
     { name = "scikit-learn" },
     { name = "statsforecast" },
 ]
@@ -823,12 +827,14 @@ ml = [
 [package.metadata]
 requires-dist = [
     { name = "cmdstanpy", specifier = ">=1.2.0" },
+    { name = "holidays", marker = "extra == 'ai'", specifier = ">=0.70" },
     { name = "holidays", marker = "extra == 'ml'", specifier = ">=0.70" },
+    { name = "joblib", marker = "extra == 'ai'", specifier = ">=1.4.0" },
     { name = "joblib", marker = "extra == 'ml'", specifier = ">=1.4.0" },
     { name = "lightgbm", marker = "extra == 'ml'", specifier = ">=4.6.0" },
     { name = "mlforecast", marker = "extra == 'ml'", specifier = ">=1.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
-    { name = "neuralforecast", marker = "extra == 'ml'", specifier = ">=3.0.0" },
+    { name = "neuralforecast", marker = "extra == 'ai'", specifier = ">=3.0.0" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pandas", specifier = ">=2.2.0" },
     { name = "pandas-stubs", marker = "extra == 'dev'" },
@@ -853,7 +859,7 @@ requires-dist = [
     { name = "types-pytz", marker = "extra == 'dev'" },
     { name = "types-requests", marker = "extra == 'dev'" },
 ]
-provides-extras = ["dev", "cli", "ml"]
+provides-extras = ["dev", "cli", "ml", "ai"]
 
 [[package]]
 name = "librt"

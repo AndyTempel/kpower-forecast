@@ -59,7 +59,9 @@ class NeuralForecastBackend:
             self._fitted = True
             return
 
-        ensure_optional_dependencies(("neuralforecast",), "NeuralForecast backend")
+        ensure_optional_dependencies(
+            ("neuralforecast",), "NeuralForecast backend", extra="ai"
+        )
         from neuralforecast import NeuralForecast
 
         nixtla_history = to_nixtla_frame(history, self.config.model_id)
@@ -108,7 +110,9 @@ class NeuralForecastBackend:
             json.dump(state, file, indent=2, sort_keys=True)
 
         if self._model is not None:
-            ensure_optional_dependencies(("joblib",), "NeuralForecast persistence")
+            ensure_optional_dependencies(
+                ("joblib",), "NeuralForecast persistence", extra="ai"
+            )
             import joblib
 
             joblib.dump(self._model, path / MODEL_FILE)
@@ -130,7 +134,9 @@ class NeuralForecastBackend:
 
         model_path = path / MODEL_FILE
         if model_path.exists():
-            ensure_optional_dependencies(("joblib",), "NeuralForecast persistence")
+            ensure_optional_dependencies(
+                ("joblib",), "NeuralForecast persistence", extra="ai"
+            )
             import joblib
 
             loaded_model = joblib.load(model_path)

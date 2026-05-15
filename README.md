@@ -36,8 +36,11 @@ pip install kpower-forecast
 # With CLI support (recommended for interactive use)
 pip install "kpower-forecast[cli]"
 
-# With optional Nixtla-based ML forecasting backends
+# With the local Nixtla hybrid ML forecasting backend
 pip install "kpower-forecast[ml]"
+
+# With NeuralForecast / AI forecasting support
+pip install "kpower-forecast[ai]"
 ```
 
 ### 🖥️ CLI Usage
@@ -106,8 +109,8 @@ kp_cons = KPowerForecast(
 ### 🧠 Optional ML Forecasting Add-on
 
 The core `KPowerForecast` API remains optimized for lightweight Prophet-based
-forecasting. For heavier workstation/server training workflows, install the ML
-extra and use `KPowerMLForecast` from the optional namespace:
+forecasting. For local classical ML workflows, install the `ml` extra and use
+`KPowerMLForecast` from the optional namespace:
 
 ```python
 from kpower_forecast.ml import KPowerMLForecast, MLBackendType, MLForecastType
@@ -128,10 +131,11 @@ print(forecast[["ds", "yhat", "yhat_lower_90", "yhat_upper_90"]].head())
 
 The ML add-on uses Nixtla-compatible backends behind a small project-owned
 backend interface. `NIXTLA_HYBRID` combines a `statsforecast` structural baseline
-with an `mlforecast`/LightGBM residual learner. `NEURALFORECAST` is also wired as
-a selectable Nixtla backend for users who provide NeuralForecast model objects in
-`backend_params`. Future foundation-model adapters can plug into the same backend
-contract without changing the public API.
+with an `mlforecast`/LightGBM residual learner and is suitable for local CPU-only
+controller deployments. `NEURALFORECAST` is also wired as a selectable Nixtla
+backend for users who install `kpower-forecast[ai]` and provide NeuralForecast
+model objects in `backend_params`. Future foundation-model adapters can plug into
+the same backend contract without changing the public API.
 
 For PV forecasts, `inverter_ac_limit_kw` and `grid_export_limit_kw` cap the
 predicted interval energy to account for inverter clipping and static export
