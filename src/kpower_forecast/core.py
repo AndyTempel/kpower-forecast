@@ -25,6 +25,7 @@ class DataCategory(str, Enum):
     INSTANT_ENERGY = "instant_energy"  # Energy per interval (kWh/Wh)
     CUMULATIVE_ENERGY = "cumulative_energy"  # Meter reading (kWh/Wh)
     POWER = "power"  # Instantaneous power (kW/W)
+    TEMPERATURE_C = "temperature_c"  # Direct Celsius temperature target
 
 
 class PredictionInterval(BaseModel):

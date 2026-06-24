@@ -79,6 +79,20 @@ class MLFeatureBuilder:
             features["hvac_temperature_delta"] = features.get(
                 "heating_degree", 0.0
             ) + features.get("cooling_degree", 0.0)
+            if "hvac_power_w" in features.columns:
+                features["hvac_power_kw"] = (
+                    pd.to_numeric(features["hvac_power_w"], errors="coerce")
+                    .fillna(0.0)
+                    .clip(lower=0.0)
+                    / 1000.0
+                )
+            if "hvac_setpoint_c" in features.columns:
+                setpoint = pd.to_numeric(features["hvac_setpoint_c"], errors="coerce")
+                if "y" in features.columns:
+                    indoor = pd.to_numeric(features["y"], errors="coerce")
+                    features["hvac_setpoint_gap_c"] = (setpoint - indoor).fillna(0.0)
+                else:
+                    features["hvac_setpoint_gap_c"] = setpoint.fillna(0.0)
 
         return features.fillna(0.0)
 

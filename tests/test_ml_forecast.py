@@ -104,6 +104,30 @@ def test_ml_forecast_applies_static_pv_inverter_curtailment(tmp_path) -> None:
     assert result[["yhat", "yhat_lower_90", "yhat_upper_90"]].max().max() == 0.6
 
 
+def test_hvac_history_normalization_preserves_celsius_target(tmp_path) -> None:
+    forecast = KPowerMLForecast(
+        model_id="hvac-temp",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.HVAC,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+    history = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", periods=4, freq="30min", tz="UTC"),
+            "y": [20.0, 20.5, 21.0, 21.5],
+            "hvac_power_w": [0.0, 500.0, 1000.0, 1000.0],
+        }
+    )
+
+    normalized = forecast._normalize_hvac_history(history)
+
+    assert normalized["y"].tolist() == [20.25, 21.25]
+    assert normalized["hvac_power_w"].tolist() == [250.0, 1000.0]
+
+
 def test_ml_forecast_applies_dynamic_export_curtailment(tmp_path) -> None:
     forecast = KPowerMLForecast(
         model_id="pv-dynamic",

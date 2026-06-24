@@ -78,12 +78,15 @@ class KPowerMLForecast:
             self._restore_from_manifest(existing_manifest)
             return
 
-        normalized = normalize_to_instant_kwh(
-            history_df,
-            category=self.config.data_category.value,
-            unit=self.config.unit.value,
-            target_interval_min=self.config.interval_minutes,
-        )
+        if self.config.forecast_type == MLForecastType.HVAC:
+            normalized = self._normalize_hvac_history(history_df)
+        else:
+            normalized = normalize_to_instant_kwh(
+                history_df,
+                category=self.config.data_category.value,
+                unit=self.config.unit.value,
+                target_interval_min=self.config.interval_minutes,
+            )
         prepared = self._prepare_training_data(normalized)
         train_frame, calibration_frame = self._chronological_split(prepared)
         train_features = self.feature_builder.build(train_frame)
@@ -239,6 +242,43 @@ class KPowerMLForecast:
             prepared[weather_columns].interpolate().bfill().ffill()
         )
         return prepared.dropna(subset=["y"]).reset_index(drop=True)
+
+    def _normalize_hvac_history(self, history_df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize HVAC indoor-temperature history without energy conversion.
+
+        Args:
+            history_df: Input frame with ``ds`` and Celsius ``y`` columns.
+
+        Returns:
+            A sorted, interval-aligned frame retaining numeric actuator columns.
+
+        Raises:
+            ValueError: If required columns are missing or no valid targets remain.
+        """
+        if "ds" not in history_df.columns or "y" not in history_df.columns:
+            raise ValueError("history_df must contain 'ds' and 'y' columns")
+
+        frame = history_df.copy()
+        frame["ds"] = pd.to_datetime(frame["ds"], utc=True)
+        frame["y"] = pd.to_numeric(frame["y"], errors="coerce")
+        frame = frame.dropna(subset=["ds", "y"]).sort_values("ds")
+        if frame.empty:
+            raise ValueError("history_df must contain at least one valid HVAC target")
+
+        numeric_columns = [
+            column for column in frame.columns if column not in {"ds", "y"}
+        ]
+        for column in numeric_columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+        frame = frame.set_index("ds")
+        aggregation = {"y": "mean", **{column: "mean" for column in numeric_columns}}
+        frame = frame.resample(f"{self.config.interval_minutes}min").agg(aggregation)
+        frame["y"] = frame["y"].interpolate(method="time")
+        for column in numeric_columns:
+            frame[column] = frame[column].interpolate(method="time").ffill().bfill()
+        frame = frame.dropna(subset=["y"]).reset_index()
+        return frame
 
     def _chronological_split(
         self, df: pd.DataFrame
