@@ -1,5 +1,6 @@
 import logging
 from enum import Enum
+from pathlib import Path
 from typing import Any, List, Literal, Optional, cast
 
 import pandas as pd
@@ -109,10 +110,28 @@ class KPowerForecast:
         self.weather_client = WeatherClient(
             lat=self.config.latitude,
             lon=self.config.longitude,
-            config=weather_config,
+            config=self._weather_config_with_default_cache(weather_config),
         )
         self.storage = ModelStorage(storage_path=self.config.storage_path)
         self._model: Optional[Prophet] = None
+
+    def _weather_config_with_default_cache(
+        self, weather_config: Optional[WeatherConfig]
+    ) -> WeatherConfig:
+        """Return weather config with a storage-scoped default cache directory.
+
+        Args:
+            weather_config: Optional caller-provided weather configuration.
+
+        Returns:
+            Weather configuration for this forecast instance.
+        """
+        default_cache_dir = Path(self.config.storage_path) / "weather_cache"
+        if weather_config is None:
+            return WeatherConfig(cache_dir=default_cache_dir)
+        if weather_config.cache_enabled and weather_config.cache_dir is None:
+            return weather_config.model_copy(update={"cache_dir": default_cache_dir})
+        return weather_config
 
     def _apply_model_metadata(self, metadata: dict[str, Any]) -> None:
         """Apply persisted model metadata to the runtime configuration.
@@ -146,9 +165,9 @@ class KPowerForecast:
         """Return a stable weather model identifier for metadata and storage.
 
         Returns:
-            Weather model identifier, or ``default`` when unspecified.
+            Weather model identifier, including long-horizon fallback when configured.
         """
-        return self.weather_client.config.forecast_model or "default"
+        return self.weather_client.effective_forecast_model_id()
 
     def _normalize_efficiency_profile(self, profile: Any) -> Optional[dict[int, float]]:
         """Normalize persisted efficiency profile keys and values.
