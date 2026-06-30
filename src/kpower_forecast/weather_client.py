@@ -19,7 +19,11 @@ logger = logging.getLogger(__name__)
 
 INVALID_VARIABLE_PATTERN = re.compile(r"invalid String value\s+([a-zA-Z0-9_]+)")
 DEFAULT_WEATHER_CACHE_DIR = Path(".kpower_weather_cache")
+MINUTELY_15 = "minutely_15"
+HOURLY = "hourly"
 FORECAST_HOURS_PER_DAY = 24
+WEATHER_REQUEST_INTERVAL_MINUTES = 15
+FORECAST_INTERVALS_PER_HOUR = 60 // WEATHER_REQUEST_INTERVAL_MINUTES
 
 PHYSICAL_LOWER_BOUNDED_COLUMNS: tuple[str, ...] = (
     "shortwave_radiation",
@@ -89,10 +93,10 @@ class WeatherConfig(BaseModel):
 
     @property
     def hourly_variables(self) -> list[str]:
-        """Return de-duplicated hourly variables for API requests.
+        """Return de-duplicated weather variables for API requests.
 
         Returns:
-            List of hourly variable names.
+            List of weather variable names.
         """
         return list(
             dict.fromkeys(
@@ -143,7 +147,8 @@ class WeatherClient:
         """
         Fetch historical weather data for training.
         """
-        hourly_variables = list(self.config.hourly_variables)
+        weather_variables = list(self.config.hourly_variables)
+        request_field = MINUTELY_15
 
         while True:
             params: dict[str, str | float | list[str]] = {
@@ -151,7 +156,7 @@ class WeatherClient:
                 "longitude": self.lon,
                 "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(),
-                "hourly": hourly_variables,
+                request_field: weather_variables,
                 "timezone": "UTC",
             }
 
@@ -168,22 +173,29 @@ class WeatherClient:
                 return self._process_response(data)
             except requests.HTTPError as error:
                 invalid_variable = self._extract_invalid_variable(error)
-                if invalid_variable and invalid_variable in hourly_variables:
+                if invalid_variable and invalid_variable in weather_variables:
                     logger.warning(
                         "Archive API rejected variable '%s'. Retrying without it.",
                         invalid_variable,
                     )
-                    hourly_variables = [
+                    weather_variables = [
                         variable
-                        for variable in hourly_variables
+                        for variable in weather_variables
                         if variable != invalid_variable
                     ]
-                    if not hourly_variables:
+                    if not weather_variables:
                         logger.error(
-                            "Archive API rejected all hourly variables "
+                            "Archive API rejected all weather variables "
                             "for historical fetch."
                         )
                         raise
+                    continue
+                if self._should_retry_hourly(error, request_field):
+                    request_field = HOURLY
+                    logger.warning(
+                        "Archive API rejected 15-minute weather data. "
+                        "Retrying with hourly data."
+                    )
                     continue
 
                 logger.error(f"Failed to fetch historical weather: {error}")
@@ -214,13 +226,15 @@ class WeatherClient:
         """
         Fetch weather forecast for prediction.
         """
-        hourly_variables = list(self.config.hourly_variables)
+        weather_variables = list(self.config.hourly_variables)
+        request_field = MINUTELY_15
 
         while True:
             params = self._build_forecast_params(
-                hourly_variables=hourly_variables,
+                weather_variables=weather_variables,
                 days=days,
                 model=self.config.forecast_model,
+                request_field=request_field,
             )
 
             try:
@@ -234,28 +248,36 @@ class WeatherClient:
                 primary = self._process_response(primary_data, interpolate=False)
                 merged = self._maybe_fill_long_horizon(
                     primary=primary,
-                    hourly_variables=hourly_variables,
+                    weather_variables=weather_variables,
                     days=days,
+                    request_field=request_field,
                 )
                 return self._finalize_weather_frame(merged)
             except requests.HTTPError as error:
                 invalid_variable = self._extract_invalid_variable(error)
-                if invalid_variable and invalid_variable in hourly_variables:
+                if invalid_variable and invalid_variable in weather_variables:
                     logger.warning(
                         "Forecast API rejected variable '%s'. Retrying without it.",
                         invalid_variable,
                     )
-                    hourly_variables = [
+                    weather_variables = [
                         variable
-                        for variable in hourly_variables
+                        for variable in weather_variables
                         if variable != invalid_variable
                     ]
-                    if not hourly_variables:
+                    if not weather_variables:
                         logger.error(
-                            "Forecast API rejected all hourly variables "
+                            "Forecast API rejected all weather variables "
                             "for forecast fetch."
                         )
                         raise
+                    continue
+                if self._should_retry_hourly(error, request_field):
+                    request_field = HOURLY
+                    logger.warning(
+                        "Forecast API rejected 15-minute weather data. "
+                        "Retrying with hourly data."
+                    )
                     continue
 
                 logger.error(f"Failed to fetch weather forecast: {error}")
@@ -264,15 +286,39 @@ class WeatherClient:
                 logger.error(f"Failed to fetch weather forecast: {error}")
                 raise
 
+    def _should_retry_hourly(
+        self, error: requests.HTTPError, request_field: str
+    ) -> bool:
+        """Return whether a 15-minute request should fall back to hourly data.
+
+        Args:
+            error: HTTP error raised by the weather API.
+            request_field: Current weather variable request field.
+
+        Returns:
+            True when the request can safely retry with ``hourly``.
+        """
+        response = error.response
+        return (
+            request_field == MINUTELY_15
+            and response is not None
+            and response.status_code == 400
+        )
+
     def _build_forecast_params(
-        self, hourly_variables: list[str], days: int, model: Optional[str]
+        self,
+        weather_variables: list[str],
+        days: int,
+        model: Optional[str],
+        request_field: str,
     ) -> dict[str, str | float | int | list[str]]:
         """Build Open-Meteo forecast query parameters.
 
         Args:
-            hourly_variables: Hourly variable names to request.
+            weather_variables: Weather variable names to request.
             days: Requested forecast horizon in days.
             model: Optional Open-Meteo model identifier.
+            request_field: Open-Meteo resolution field.
 
         Returns:
             Query parameter dictionary.
@@ -280,7 +326,7 @@ class WeatherClient:
         params: dict[str, str | float | int | list[str]] = {
             "latitude": self.lat,
             "longitude": self.lon,
-            "hourly": hourly_variables,
+            request_field: weather_variables,
             "forecast_days": days,
             "timezone": "UTC",
         }
@@ -289,19 +335,24 @@ class WeatherClient:
         return params
 
     def _maybe_fill_long_horizon(
-        self, primary: pd.DataFrame, hourly_variables: list[str], days: int
+        self,
+        primary: pd.DataFrame,
+        weather_variables: list[str],
+        days: int,
+        request_field: str,
     ) -> pd.DataFrame:
         """Fill short primary forecasts with the configured long-horizon model.
 
         Args:
             primary: Primary forecast dataframe.
-            hourly_variables: Hourly variable names used by the primary request.
+            weather_variables: Weather variable names used by the primary request.
             days: Requested forecast horizon in days.
+            request_field: Open-Meteo resolution field used by the primary request.
 
         Returns:
             Primary dataframe, optionally filled by the long-horizon dataframe.
         """
-        expected_rows = self._expected_forecast_rows(days)
+        expected_rows = self._expected_forecast_rows(days, request_field)
         if self._forecast_row_count(primary) >= expected_rows:
             return primary
 
@@ -311,16 +362,17 @@ class WeatherClient:
             return primary
 
         logger.warning(
-            "Primary weather forecast returned %s hourly rows for requested "
+            "Primary weather forecast returned %s rows for requested "
             "%s-day horizon. Fetching long-horizon model '%s'.",
             self._forecast_row_count(primary),
             days,
             long_horizon_model,
         )
         params = self._build_forecast_params(
-            hourly_variables=hourly_variables,
+            weather_variables=weather_variables,
             days=days,
             model=long_horizon_model,
+            request_field=request_field,
         )
         long_data = self._request_json(
             endpoint="forecast",
@@ -330,19 +382,23 @@ class WeatherClient:
         )
         long_horizon = self._process_response(long_data, interpolate=False)
         merged = self._merge_weather_frames(primary=primary, fallback=long_horizon)
-        self._warn_partial_forecast(merged, days)
+        self._warn_partial_forecast(merged, days, request_field)
         return merged
 
-    def _expected_forecast_rows(self, days: int) -> int:
-        """Return the expected hourly forecast row count.
+    def _expected_forecast_rows(self, days: int, request_field: str) -> int:
+        """Return the expected forecast row count.
 
         Args:
             days: Forecast horizon in days.
+            request_field: Open-Meteo resolution field.
 
         Returns:
-            Number of hourly rows expected for the requested horizon.
+            Number of rows expected for the requested horizon.
         """
-        return max(days, 0) * FORECAST_HOURS_PER_DAY
+        intervals_per_hour = (
+            FORECAST_INTERVALS_PER_HOUR if request_field == MINUTELY_15 else 1
+        )
+        return max(days, 0) * FORECAST_HOURS_PER_DAY * intervals_per_hour
 
     def _forecast_row_count(self, df: pd.DataFrame) -> int:
         """Return the number of unique forecast timestamps in a dataframe.
@@ -357,22 +413,25 @@ class WeatherClient:
             return len(df)
         return int(pd.to_datetime(df["ds"], utc=True).nunique())
 
-    def _warn_partial_forecast(self, df: pd.DataFrame, days: int) -> None:
+    def _warn_partial_forecast(
+        self, df: pd.DataFrame, days: int, request_field: str = MINUTELY_15
+    ) -> None:
         """Log a warning when returned forecast rows are below the request.
 
         Args:
             df: Forecast dataframe.
             days: Requested forecast horizon in days.
+            request_field: Open-Meteo resolution field.
 
         Returns:
             None.
         """
-        expected_rows = self._expected_forecast_rows(days)
+        expected_rows = self._expected_forecast_rows(days, request_field)
         row_count = self._forecast_row_count(df)
         if row_count >= expected_rows:
             return
         logger.warning(
-            "Weather forecast returned %s hourly rows, below requested %s rows "
+            "Weather forecast returned %s rows, below requested %s rows "
             "for a %s-day horizon. Returning partial weather data.",
             row_count,
             expected_rows,
@@ -587,8 +646,26 @@ class WeatherClient:
         offset_seconds = int(data.get("utc_offset_seconds") or 0)
         return datetime.timezone(datetime.timedelta(seconds=offset_seconds))
 
-    def _parse_hourly_times(self, data: dict) -> pd.Series:
-        """Parse hourly timestamps and normalize them to UTC.
+    def _weather_payload(self, data: dict) -> dict[str, object]:
+        """Return the highest-resolution weather payload from the response.
+
+        Args:
+            data: Raw JSON payload from the weather API.
+
+        Returns:
+            Weather payload dictionary.
+
+        Raises:
+            ValueError: If no supported weather payload is available.
+        """
+        for key in (MINUTELY_15, HOURLY):
+            payload = data.get(key)
+            if isinstance(payload, dict):
+                return cast(dict[str, object], payload)
+        raise ValueError("No weather data in response")
+
+    def _parse_weather_times(self, data: dict) -> pd.Series:
+        """Parse weather timestamps and normalize them to UTC.
 
         Args:
             data: Raw JSON payload from the weather API.
@@ -597,15 +674,15 @@ class WeatherClient:
             Series of UTC-aware timestamps.
 
         Raises:
-            ValueError: If the response does not contain hourly timestamps.
+            ValueError: If the response does not contain weather timestamps.
         """
-        hourly = data.get("hourly", {})
-        if not isinstance(hourly, dict) or "time" not in hourly:
-            raise ValueError("No hourly time data in response")
+        weather_payload = self._weather_payload(data)
+        if "time" not in weather_payload:
+            raise ValueError("No weather time data in response")
 
-        raw_times = hourly["time"]
+        raw_times = weather_payload["time"]
         if not isinstance(raw_times, list):
-            raise ValueError("Hourly time data must be a list")
+            raise ValueError("Weather time data must be a list")
 
         time_series = pd.to_datetime(
             pd.Series(raw_times, dtype="object"), errors="raise"
@@ -632,21 +709,19 @@ class WeatherClient:
             DataFrame with UTC timestamps and numeric weather columns.
 
         Raises:
-            ValueError: If the response does not contain hourly data.
+            ValueError: If the response does not contain weather data.
         """
-        hourly = data.get("hourly", {})
-        if not hourly:
-            raise ValueError("No hourly data in response")
+        weather_payload = self._weather_payload(data)
 
-        timestamps = self._parse_hourly_times(data)
+        timestamps = self._parse_weather_times(data)
         cols: dict[str, object] = {"ds": timestamps}
         for variable in self.config.required_hourly_variables:
-            values = hourly.get(variable)
+            values = weather_payload.get(variable)
             cols[variable] = values if values is not None else [None] * len(timestamps)
 
         for variable in self.config.optional_hourly_variables:
-            if variable in hourly:
-                cols[variable] = hourly[variable]
+            if variable in weather_payload:
+                cols[variable] = weather_payload[variable]
 
         df = pd.DataFrame(cols)
 
@@ -714,8 +789,7 @@ class WeatherClient:
 
     def resample_weather(self, df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
         """
-        Upsample hourly weather data to matching interval (e.g. 15 min).
-        Uses cubic interpolation for smooth curves.
+        Resample weather data to the configured forecast interval.
         """
         if df.empty:
             return df

@@ -5,13 +5,15 @@ from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
 
 def _weather_payload(
-    times: list[str], temperature: list[float | None]
+    times: list[str],
+    temperature: list[float | None],
+    payload_key: str = "minutely_15",
 ) -> dict[str, object]:
-    """Build a minimal Open-Meteo hourly response payload."""
+    """Build a minimal Open-Meteo weather response payload."""
     return {
         "timezone": "UTC",
         "utc_offset_seconds": 0,
-        "hourly": {
+        payload_key: {
             "time": times,
             "temperature_2m": temperature,
             "cloud_cover": [20.0] * len(times),
@@ -51,9 +53,9 @@ def test_fetch_forecast_omits_model_by_default(monkeypatch) -> None:
 
     assert "models" not in observed_params
     assert observed_params["forecast_days"] == 5
-    hourly_variables = observed_params["hourly"]
-    assert isinstance(hourly_variables, list)
-    assert "direct_radiation" in hourly_variables
+    weather_variables = observed_params["minutely_15"]
+    assert isinstance(weather_variables, list)
+    assert "direct_radiation" in weather_variables
 
 
 def test_fetch_forecast_uses_explicit_primary_model(monkeypatch) -> None:
@@ -75,7 +77,7 @@ def test_fetch_forecast_uses_explicit_primary_model(monkeypatch) -> None:
             times = [
                 timestamp.strftime("%Y-%m-%dT%H:%M")
                 for timestamp in pd.date_range(
-                    "2026-05-01T00:00", periods=120, freq="h"
+                    "2026-05-01T00:00", periods=480, freq="15min"
                 )
             ]
             return _weather_payload(
@@ -126,16 +128,16 @@ def test_fetch_forecast_fills_short_horizon_from_long_model(
                 _weather_payload(
                     [
                         "2026-05-01T00:00",
-                        "2026-05-01T01:00",
-                        "2026-05-01T02:00",
-                        "2026-05-01T03:00",
+                        "2026-05-01T00:15",
+                        "2026-05-01T00:30",
+                        "2026-05-01T00:45",
                     ],
                     [100.0, 101.0, 102.0, 103.0],
                 )
             )
         return Response(
             _weather_payload(
-                ["2026-05-01T00:00", "2026-05-01T01:00"],
+                ["2026-05-01T00:00", "2026-05-01T00:15"],
                 [10.0, None],
             )
         )
@@ -147,12 +149,40 @@ def test_fetch_forecast_fills_short_horizon_from_long_model(
     assert observed_models == [None, "ecmwf_ifs"]
     assert frame["ds"].tolist() == [
         pd.Timestamp("2026-05-01T00:00:00Z"),
-        pd.Timestamp("2026-05-01T01:00:00Z"),
-        pd.Timestamp("2026-05-01T02:00:00Z"),
-        pd.Timestamp("2026-05-01T03:00:00Z"),
+        pd.Timestamp("2026-05-01T00:15:00Z"),
+        pd.Timestamp("2026-05-01T00:30:00Z"),
+        pd.Timestamp("2026-05-01T00:45:00Z"),
     ]
     assert frame["temperature_2m"].tolist() == [10.0, 101.0, 102.0, 103.0]
     assert "Returning partial weather data" in caplog.text
+
+
+def test_process_response_prefers_minutely_15_payload() -> None:
+    client = WeatherClient(lat=46.0, lon=14.0)
+    data = {
+        "timezone": "UTC",
+        "utc_offset_seconds": 0,
+        "hourly": {
+            "time": ["2024-06-01T00:00"],
+            "temperature_2m": [99.0],
+        },
+        "minutely_15": {
+            "time": ["2024-06-01T00:00", "2024-06-01T00:15"],
+            "temperature_2m": [20.0, 21.0],
+            "cloud_cover": [100.0, 90.0],
+            "shortwave_radiation": [0.0, 10.0],
+            "snow_depth": [None, None],
+            "snowfall": [None, None],
+        },
+    }
+
+    df = client._process_response(data)
+
+    assert df["ds"].tolist() == [
+        pd.Timestamp("2024-06-01T00:00:00Z"),
+        pd.Timestamp("2024-06-01T00:15:00Z"),
+    ]
+    assert df["temperature_2m"].tolist() == [20.0, 21.0]
 
 
 def test_process_response_includes_available_optional_fields() -> None:
@@ -285,7 +315,8 @@ def test_fetch_historical_retries_without_invalid_archive_variable(monkeypatch) 
             cache_enabled=False,
         ),
     )
-    observed_hourly_params: list[list[str]] = []
+    observed_weather_params: list[list[str]] = []
+    observed_request_fields: list[str] = []
     call_count = 0
 
     class Response:
@@ -304,9 +335,10 @@ def test_fetch_historical_retries_without_invalid_archive_variable(monkeypatch) 
         nonlocal call_count
         assert timeout == 10
         assert url == "https://archive-api.open-meteo.com/v1/archive"
-        hourly = params.get("hourly")
-        assert isinstance(hourly, list)
-        observed_hourly_params.append(list(hourly))
+        weather = params.get("minutely_15")
+        assert isinstance(weather, list)
+        observed_request_fields.append("minutely_15")
+        observed_weather_params.append(list(weather))
         call_count += 1
 
         if call_count == 1:
@@ -345,9 +377,10 @@ def test_fetch_historical_retries_without_invalid_archive_variable(monkeypatch) 
         end_date=pd.Timestamp("2026-05-01").date(),
     )
 
-    assert len(observed_hourly_params) == 2
-    assert "snowfall_convective_water_equivalent" in observed_hourly_params[0]
-    assert "snowfall_convective_water_equivalent" not in observed_hourly_params[1]
+    assert observed_request_fields == ["minutely_15", "minutely_15"]
+    assert len(observed_weather_params) == 2
+    assert "snowfall_convective_water_equivalent" in observed_weather_params[0]
+    assert "snowfall_convective_water_equivalent" not in observed_weather_params[1]
     assert not frame.empty
 
 
@@ -361,7 +394,8 @@ def test_fetch_forecast_retries_without_invalid_variable(monkeypatch) -> None:
             long_horizon_model=None,
         ),
     )
-    observed_hourly_params: list[list[str]] = []
+    observed_weather_params: list[list[str]] = []
+    observed_request_fields: list[str] = []
     call_count = 0
 
     class Response:
@@ -380,9 +414,10 @@ def test_fetch_forecast_retries_without_invalid_variable(monkeypatch) -> None:
         nonlocal call_count
         assert timeout == 10
         assert url == "https://api.open-meteo.com/v1/forecast"
-        hourly = params.get("hourly")
-        assert isinstance(hourly, list)
-        observed_hourly_params.append(list(hourly))
+        weather = params.get("minutely_15")
+        assert isinstance(weather, list)
+        observed_request_fields.append("minutely_15")
+        observed_weather_params.append(list(weather))
         call_count += 1
 
         if call_count == 1:
@@ -416,10 +451,60 @@ def test_fetch_forecast_retries_without_invalid_variable(monkeypatch) -> None:
 
     frame = client.fetch_forecast(days=2)
 
-    assert len(observed_hourly_params) == 2
-    assert "snowfall_convective_water_equivalent" in observed_hourly_params[0]
-    assert "snowfall_convective_water_equivalent" not in observed_hourly_params[1]
+    assert observed_request_fields == ["minutely_15", "minutely_15"]
+    assert len(observed_weather_params) == 2
+    assert "snowfall_convective_water_equivalent" in observed_weather_params[0]
+    assert "snowfall_convective_water_equivalent" not in observed_weather_params[1]
     assert not frame.empty
+
+
+def test_fetch_forecast_falls_back_to_hourly_when_minutely_15_is_rejected(
+    monkeypatch,
+) -> None:
+    client = WeatherClient(
+        lat=46.0,
+        lon=14.0,
+        config=WeatherConfig(cache_enabled=False, long_horizon_model=None),
+    )
+    observed_request_fields: list[str] = []
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError("bad request", response=self)
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        assert timeout == 10
+        assert url == "https://api.open-meteo.com/v1/forecast"
+        if "minutely_15" in params:
+            observed_request_fields.append("minutely_15")
+            return Response(400, {"reason": "unsupported parameter", "error": True})
+
+        observed_request_fields.append("hourly")
+        hourly = params.get("hourly")
+        assert isinstance(hourly, list)
+        return Response(
+            200,
+            _weather_payload(
+                ["2026-05-01T00:00", "2026-05-01T01:00"],
+                [10.0, 11.0],
+                payload_key="hourly",
+            ),
+        )
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+
+    frame = client.fetch_forecast(days=1)
+
+    assert observed_request_fields == ["minutely_15", "hourly"]
+    assert frame["temperature_2m"].tolist() == [10.0, 11.0]
 
 
 def test_fetch_forecast_uses_cache_for_repeated_payload(monkeypatch, tmp_path) -> None:
