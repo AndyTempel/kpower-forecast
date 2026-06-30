@@ -353,21 +353,30 @@ class WeatherClient:
             Primary dataframe, optionally filled by the long-horizon dataframe.
         """
         expected_rows = self._expected_forecast_rows(days, request_field)
-        if self._forecast_row_count(primary) >= expected_rows:
+        has_full_horizon = self._forecast_row_count(primary) >= expected_rows
+        has_weather_data = self._has_required_weather_data(primary)
+        if has_full_horizon and has_weather_data:
             return primary
 
         long_horizon_model = self.config.long_horizon_model
         if not long_horizon_model or long_horizon_model == self.config.forecast_model:
-            self._warn_partial_forecast(primary, days)
+            self._warn_partial_forecast(primary, days, request_field)
             return primary
 
-        logger.warning(
-            "Primary weather forecast returned %s rows for requested "
-            "%s-day horizon. Fetching long-horizon model '%s'.",
-            self._forecast_row_count(primary),
-            days,
-            long_horizon_model,
-        )
+        if not has_full_horizon:
+            logger.warning(
+                "Primary weather forecast returned %s rows for requested "
+                "%s-day horizon. Fetching long-horizon model '%s'.",
+                self._forecast_row_count(primary),
+                days,
+                long_horizon_model,
+            )
+        else:
+            logger.warning(
+                "Primary weather forecast returned no usable required weather "
+                "data. Fetching long-horizon model '%s'.",
+                long_horizon_model,
+            )
         params = self._build_forecast_params(
             weather_variables=weather_variables,
             days=days,
@@ -384,6 +393,23 @@ class WeatherClient:
         merged = self._merge_weather_frames(primary=primary, fallback=long_horizon)
         self._warn_partial_forecast(merged, days, request_field)
         return merged
+
+    def _has_required_weather_data(self, df: pd.DataFrame) -> bool:
+        """Return whether a weather frame has usable required weather values.
+
+        Args:
+            df: Weather dataframe.
+
+        Returns:
+            True when at least one required weather column contains data.
+        """
+        required_columns = [
+            column for column in self.config.required_hourly_variables if column in df
+        ]
+        if not required_columns:
+            return False
+        required_values = df[required_columns].apply(pd.to_numeric, errors="coerce")
+        return bool(required_values.notna().any().any())
 
     def _expected_forecast_rows(self, days: int, request_field: str) -> int:
         """Return the expected forecast row count.

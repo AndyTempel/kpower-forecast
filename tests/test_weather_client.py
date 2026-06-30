@@ -157,6 +157,54 @@ def test_fetch_forecast_fills_short_horizon_from_long_model(
     assert "Returning partial weather data" in caplog.text
 
 
+def test_fetch_forecast_fills_empty_best_match_from_long_model(
+    monkeypatch, caplog
+) -> None:
+    client = WeatherClient(
+        lat=40.7128,
+        lon=-74.0060,
+        config=WeatherConfig(cache_enabled=False),
+    )
+    observed_models: list[object] = []
+    times = [
+        timestamp.strftime("%Y-%m-%dT%H:%M")
+        for timestamp in pd.date_range("2026-05-01T00:00", periods=96, freq="15min")
+    ]
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        assert url == "https://api.open-meteo.com/v1/forecast"
+        assert timeout == 10
+        observed_models.append(params.get("models"))
+        if params.get("models") == "ecmwf_ifs":
+            return Response(_weather_payload(times, [20.0] * len(times)))
+        payload = _weather_payload(times, [None] * len(times))
+        weather_payload = payload["minutely_15"]
+        assert isinstance(weather_payload, dict)
+        weather_payload["cloud_cover"] = [None] * len(times)
+        weather_payload["shortwave_radiation"] = [None] * len(times)
+        return Response(payload)
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+
+    frame = client.fetch_forecast(days=1)
+
+    assert observed_models == [None, "ecmwf_ifs"]
+    assert len(frame) == 96
+    assert frame["temperature_2m"].isna().sum() == 0
+    assert frame["temperature_2m"].tolist() == [20.0] * 96
+    assert "no usable required weather data" in caplog.text
+
+
 def test_process_response_prefers_minutely_15_payload() -> None:
     client = WeatherClient(lat=46.0, lon=14.0)
     data = {
