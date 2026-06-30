@@ -4,7 +4,6 @@ from typing import List, Union, cast
 import numpy as np
 import pandas as pd
 from pvlib.location import Location
-from pysolar.solar import get_altitude
 
 
 def calculate_solar_elevation(
@@ -14,13 +13,19 @@ def calculate_solar_elevation(
     Calculate solar elevation angles (altitude) for a list of times
     at a specific location.
     """
-    elevations = []
-    for t in times:
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=datetime.timezone.utc)
-        alt = get_altitude(lat, lon, t)
-        elevations.append(alt)
-    return np.array(elevations)
+    if len(times) == 0:
+        return np.array([], dtype=float)
+
+    time_index = pd.DatetimeIndex(times)
+    if time_index.tz is None:
+        time_index = time_index.tz_localize(datetime.timezone.utc)
+    else:
+        time_index = time_index.tz_convert(datetime.timezone.utc)
+
+    location = Location(lat, lon)
+    solar_position = location.get_solarposition(time_index)
+    elevations = cast(pd.Series, solar_position["apparent_elevation"])
+    return elevations.to_numpy(dtype=float)
 
 
 def get_clear_sky_ghi(lat: float, lon: float, times: pd.DatetimeIndex) -> pd.Series:

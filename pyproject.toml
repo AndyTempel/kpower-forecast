@@ -1,6 +1,6 @@
 [project]
 name = "kpower-forecast"
-version = "2026.6.2"
+version = "2026.6.3"
 description = "Solar production and power consumption forecasting package."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -21,7 +21,6 @@ dependencies = [
     "pandas>=2.2.0",
     "numpy>=1.26.0",
     "pydantic>=2.6.0",
-    "pysolar>=0.8.0",
     "requests>=2.31.0",
     "cmdstanpy>=1.2.0",
     "pytz>=2024.1",
@@ -74,7 +73,6 @@ ignore_missing_imports = true
 module = [
     "prophet.*",
     "pvlib.*",
-    "pysolar.*",
     "statsforecast.*",
     "mlforecast.*",
     "neuralforecast.*",

@@ -1,3 +1,4 @@
+import warnings
 from typing import cast
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ import pytest
 from prophet import Prophet
 
 from kpower_forecast.core import KPowerForecast
+from kpower_forecast.utils import calculate_solar_elevation
 
 
 @pytest.fixture
@@ -15,6 +17,18 @@ def sample_history():
     # Simulate some production
     y = [0.0] * 6 + [1.0, 2.0, 3.0, 4.0, 5.0, 5.0, 4.0, 3.0, 2.0, 1.0] + [0.0] * 8
     return pd.DataFrame({"ds": ds, "y": y})
+
+
+def test_calculate_solar_elevation_uses_2026_without_pysolar_warning():
+    times = pd.date_range("2026-06-30T10:00:00Z", periods=4, freq="h")
+
+    with warnings.catch_warnings(record=True) as warning_records:
+        warnings.simplefilter("always")
+        elevations = calculate_solar_elevation(46.0569, 14.5058, times)
+
+    assert len(elevations) == 4
+    assert elevations[0] > 0.0
+    assert not any("Leap seconds" in str(item.message) for item in warning_records)
 
 
 def test_calibrate_efficiency(sample_history):
