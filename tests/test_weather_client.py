@@ -432,6 +432,64 @@ def test_fetch_historical_retries_without_invalid_archive_variable(monkeypatch) 
     assert not frame.empty
 
 
+def test_fetch_historical_falls_back_to_hourly_when_minutely_15_is_empty(
+    monkeypatch,
+) -> None:
+    client = WeatherClient(
+        lat=46.0,
+        lon=14.0,
+        config=WeatherConfig(cache_enabled=False),
+    )
+    observed_request_fields: list[str] = []
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        assert timeout == 10
+        assert url == "https://archive-api.open-meteo.com/v1/archive"
+        if "minutely_15" in params:
+            observed_request_fields.append("minutely_15")
+            return Response(
+                {
+                    "latitude": 46.08084,
+                    "longitude": 14.45151,
+                    "utc_offset_seconds": 0,
+                    "timezone": "GMT",
+                    "timezone_abbreviation": "GMT",
+                    "elevation": 302.0,
+                }
+            )
+
+        observed_request_fields.append("hourly")
+        hourly = params.get("hourly")
+        assert isinstance(hourly, list)
+        return Response(
+            _weather_payload(
+                ["2026-06-30T00:00", "2026-06-30T01:00"],
+                [21.2, 20.5],
+                payload_key="hourly",
+            )
+        )
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+
+    frame = client.fetch_historical(
+        start_date=pd.Timestamp("2026-06-30").date(),
+        end_date=pd.Timestamp("2026-06-30").date(),
+    )
+
+    assert observed_request_fields == ["minutely_15", "hourly"]
+    assert frame["temperature_2m"].tolist() == [21.2, 20.5]
+
+
 def test_fetch_forecast_retries_without_invalid_variable(monkeypatch) -> None:
     client = WeatherClient(
         lat=46.0,

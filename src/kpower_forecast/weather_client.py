@@ -170,7 +170,17 @@ class WeatherClient:
                     params=params,
                     ttl_hours=self.config.historical_cache_ttl_hours,
                 )
-                return self._process_response(data)
+                try:
+                    return self._process_response(data)
+                except ValueError as error:
+                    if self._should_retry_hourly_on_empty_payload(error, request_field):
+                        request_field = HOURLY
+                        logger.warning(
+                            "Archive API returned no 15-minute weather data. "
+                            "Retrying with hourly data."
+                        )
+                        continue
+                    raise
             except requests.HTTPError as error:
                 invalid_variable = self._extract_invalid_variable(error)
                 if invalid_variable and invalid_variable in weather_variables:
@@ -303,6 +313,23 @@ class WeatherClient:
             request_field == MINUTELY_15
             and response is not None
             and response.status_code == 400
+        )
+
+    def _should_retry_hourly_on_empty_payload(
+        self, error: ValueError, request_field: str
+    ) -> bool:
+        """Return whether an empty 15-minute payload should fall back to hourly.
+
+        Args:
+            error: Error raised while parsing the weather response.
+            request_field: Current weather variable request field.
+
+        Returns:
+            True when a successful response contained no weather payload for a
+            15-minute archive request.
+        """
+        return request_field == MINUTELY_15 and str(error) == (
+            "No weather data in response"
         )
 
     def _build_forecast_params(
