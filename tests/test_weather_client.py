@@ -4,6 +4,10 @@ import requests
 from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
 
+def test_weather_config_defaults_recent_forecast_history_to_one_day() -> None:
+    assert WeatherConfig().recent_forecast_past_days == 1
+
+
 def _weather_payload(
     times: list[str],
     temperature: list[float | None],
@@ -49,10 +53,11 @@ def test_fetch_forecast_omits_model_by_default(monkeypatch) -> None:
 
     monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
 
-    client.fetch_forecast(days=5)
+    client.fetch_forecast(days=5, past_days=2)
 
     assert "models" not in observed_params
     assert observed_params["forecast_days"] == 5
+    assert observed_params["past_days"] == 2
     weather_variables = observed_params["minutely_15"]
     assert isinstance(weather_variables, list)
     assert "direct_radiation" in weather_variables

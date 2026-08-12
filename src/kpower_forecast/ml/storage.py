@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class MLModelManifest(BaseModel):
     """JSON-serializable manifest describing ML model artifacts."""
 
+    contract_version: int = 1
     model_id: str
     backend_type: str
     target_type: str
@@ -63,3 +64,10 @@ class MLModelStorage:
         """Persist prepared ML training data for later update/debug workflows."""
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         df.to_parquet(self.artifact_dir / "training.parquet", index=False)
+
+    def load_training_frame(self) -> Optional[pd.DataFrame]:
+        """Load the prepared training frame when one has been persisted."""
+        path = self.artifact_dir / "training.parquet"
+        if not path.exists():
+            return None
+        return pd.read_parquet(path)

@@ -6,6 +6,10 @@ from typing import Any, cast
 
 import pandas as pd
 
+from kpower_forecast.ml.alignment import (
+    ForecastAlignmentError,
+    validate_timestamp_grid,
+)
 from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
 from kpower_forecast.ml.dependencies import ensure_optional_dependencies
 
@@ -46,7 +50,6 @@ class NixtlaHybridBackend:
         self._last_train_ds: pd.Timestamp | None = None
         self._solar_global_factor: float | None = None
         self._solar_profile: dict[int, float] = {}
-        self._observed_history = pd.DataFrame(columns=["ds", "y"])
         self._fitted = False
         self._stats_model: Any = None
         self._residual_model: Any = None
@@ -68,8 +71,6 @@ class NixtlaHybridBackend:
         self._feature_columns = self._select_feature_columns(features)
         self._last_observed = float(history["y"].iloc[-1])
         self._last_train_ds = pd.to_datetime(history["ds"], utc=True).max()
-        self._observed_history = self._normalize_observed_history(history)
-
         ensure_optional_dependencies(
             ("lightgbm", "mlforecast", "statsforecast"), "Nixtla hybrid backend"
         )
@@ -125,13 +126,24 @@ class NixtlaHybridBackend:
 
         future = future_features.head(horizon).copy()
         future["ds"] = pd.to_datetime(future["ds"], utc=True)
-
-        baseline = self._predict_stats_baseline(horizon=len(future))
+        if self._last_train_ds is None:
+            raise ForecastAlignmentError("Nixtla training cutoff is unavailable")
+        expected_start = self._last_train_ds + pd.Timedelta(
+            minutes=self.config.interval_minutes
+        )
+        validate_timestamp_grid(
+            future,
+            interval_minutes=self.config.interval_minutes,
+            expected_start=expected_start,
+            expected_length=horizon,
+            label="Nixtla future features",
+        )
+        baseline = self._predict_stats_baseline(future)
         solar_baseline = self._predict_solar_baseline(future)
         if solar_baseline is not None:
             baseline = solar_baseline
         residual = self._predict_residual_adjustment(
-            horizon=len(future), future_features=future_features
+            horizon=len(future), future_features=future
         )
         yhat = baseline.reset_index(drop=True) + residual.reset_index(drop=True)
 
@@ -139,7 +151,6 @@ class NixtlaHybridBackend:
         output["yhat"] = pd.to_numeric(output["yhat"], errors="coerce").fillna(
             self._last_observed
         )
-        output = self._apply_observed_overlap(output)
         return output
 
     def _build_residual_training_frame(
@@ -223,28 +234,6 @@ class NixtlaHybridBackend:
             pd.to_numeric(baseline, errors="coerce"), index=frame.index, dtype="float64"
         ).fillna(0.0)
 
-    def _normalize_observed_history(self, history: pd.DataFrame) -> pd.DataFrame:
-        """Normalize observed training targets for elapsed forecast intervals."""
-        observed = history[["ds", "y"]].copy()
-        observed["ds"] = pd.to_datetime(observed["ds"], utc=True)
-        observed["y"] = pd.to_numeric(observed["y"], errors="coerce")
-        return observed.dropna(subset=["ds", "y"]).drop_duplicates(
-            subset=["ds"], keep="last"
-        )
-
-    def _apply_observed_overlap(self, forecast: pd.DataFrame) -> pd.DataFrame:
-        """Replace elapsed forecast intervals with known observed production."""
-        if self._observed_history.empty:
-            return forecast
-
-        output = forecast.copy()
-        output["ds"] = pd.to_datetime(output["ds"], utc=True)
-        observed = self._observed_history.rename(columns={"y": "observed_y"})
-        output = pd.merge(output, observed, on="ds", how="left")
-        observed_mask = output["observed_y"].notna()
-        output.loc[observed_mask, "yhat"] = output.loc[observed_mask, "observed_y"]
-        return output.drop(columns=["observed_y"])
-
     def _select_feature_columns(self, features: pd.DataFrame) -> list[str]:
         """Select numeric dynamic exogenous feature columns for residual learning."""
         feature_columns: list[str] = []
@@ -270,12 +259,22 @@ class NixtlaHybridBackend:
             frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
         return frame
 
-    def _predict_stats_baseline(self, horizon: int) -> pd.Series:
-        """Predict the structural baseline component."""
+    def _predict_stats_baseline(self, future_features: pd.DataFrame) -> pd.Series:
+        """Predict and validate the structural baseline component."""
+        horizon = len(future_features)
         if self._stats_model is None:
             return pd.Series([self._last_observed] * horizon, dtype="float64")
 
         forecast = self._stats_model.predict(h=horizon)
+        if "ds" not in forecast.columns:
+            raise ForecastAlignmentError("StatsForecast output is missing timestamps")
+        validate_timestamp_grid(
+            forecast,
+            interval_minutes=self.config.interval_minutes,
+            expected_start=pd.to_datetime(future_features["ds"].iloc[0], utc=True),
+            expected_length=horizon,
+            label="StatsForecast output",
+        )
         model_columns = [
             column for column in forecast.columns if column not in {"unique_id", "ds"}
         ]
@@ -299,15 +298,31 @@ class NixtlaHybridBackend:
                 minutes=self.config.interval_minutes
             )
             if future_start != expected_start:
-                return pd.Series([0.0] * horizon, dtype="float64")
+                raise ForecastAlignmentError(
+                    f"residual forecast starts at {future_start.isoformat()}; "
+                    f"expected {expected_start.isoformat()}"
+                )
 
         try:
             forecast = self._residual_model.predict(
                 h=horizon,
                 X_df=self._build_exogenous_frame(future_features),
             )
-        except ValueError:
-            return pd.Series([0.0] * horizon, dtype="float64")
+        except ValueError as exc:
+            raise ForecastAlignmentError(
+                "residual forecast rejected the aligned exogenous grid"
+            ) from exc
+        if "ds" not in forecast.columns:
+            raise ForecastAlignmentError(
+                "residual forecast output is missing timestamps"
+            )
+        validate_timestamp_grid(
+            forecast,
+            interval_minutes=self.config.interval_minutes,
+            expected_start=pd.to_datetime(future_features["ds"].iloc[0], utc=True),
+            expected_length=horizon,
+            label="residual forecast output",
+        )
         model_columns = [
             column for column in forecast.columns if column not in {"unique_id", "ds"}
         ]
@@ -347,7 +362,6 @@ class NixtlaHybridBackend:
             {
                 "stats_model": self._stats_model,
                 "residual_model": self._residual_model,
-                "observed_history": self._observed_history,
             },
             models_path,
         )
@@ -386,11 +400,6 @@ class NixtlaHybridBackend:
             models = joblib.load(models_path)
             self._stats_model = models.get("stats_model")
             self._residual_model = models.get("residual_model")
-            observed_history = models.get("observed_history")
-            if isinstance(observed_history, pd.DataFrame):
-                self._observed_history = self._normalize_observed_history(
-                    observed_history
-                )
 
     def feature_schema(self) -> list[str]:
         """Return the feature columns learned during training."""

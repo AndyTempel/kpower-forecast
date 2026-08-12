@@ -25,7 +25,7 @@ def calculate_solar_elevation(
     location = Location(lat, lon)
     solar_position = location.get_solarposition(time_index)
     elevations = cast(pd.Series, solar_position["apparent_elevation"])
-    return elevations.to_numpy(dtype=float)
+    return np.asarray(elevations.to_numpy(dtype=float), dtype=float)
 
 
 def get_clear_sky_ghi(lat: float, lon: float, times: pd.DatetimeIndex) -> pd.Series:
