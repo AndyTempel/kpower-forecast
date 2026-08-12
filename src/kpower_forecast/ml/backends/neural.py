@@ -42,6 +42,7 @@ class NeuralForecastBackend:
         self._feature_columns: list[str] = []
         self._last_observed: float = 0.0
         self._last_train_ds: pd.Timestamp | None = None
+        self._configured_horizon: int | None = None
         self._model: NeuralForecastModel | None = None
         self._fitted = False
 
@@ -64,6 +65,7 @@ class NeuralForecastBackend:
         if not models:
             self._fitted = True
             return
+        self._configured_horizon = self._resolve_model_horizon(models)
 
         ensure_optional_dependencies(
             ("neuralforecast",), "NeuralForecast backend", extra="ai"
@@ -104,6 +106,12 @@ class NeuralForecastBackend:
                 [self._last_observed] * len(future), dtype="float64"
             )
         else:
+            if self._configured_horizon != horizon:
+                raise ForecastAlignmentError(
+                    "NeuralForecast models use fixed horizon "
+                    f"{self._configured_horizon}; requested {horizon}. "
+                    "Retrain models with the requested horizon or omit custom models."
+                )
             forecast = self._model.predict().reset_index()
             validate_timestamp_grid(
                 forecast,
@@ -134,6 +142,7 @@ class NeuralForecastBackend:
             "last_train_ds": (
                 None if self._last_train_ds is None else self._last_train_ds.isoformat()
             ),
+            "configured_horizon": self._configured_horizon,
             "fitted": self._fitted,
         }
         with (path / STATE_FILE).open("w", encoding="utf-8") as file:
@@ -164,6 +173,10 @@ class NeuralForecastBackend:
         self._last_train_ds = (
             None if last_train_ds is None else pd.to_datetime(last_train_ds, utc=True)
         )
+        configured_horizon = state.get("configured_horizon")
+        self._configured_horizon = (
+            None if configured_horizon is None else int(configured_horizon)
+        )
         self._fitted = bool(state.get("fitted", False))
 
         model_path = path / MODEL_FILE
@@ -177,6 +190,18 @@ class NeuralForecastBackend:
             if not hasattr(loaded_model, "fit") or not hasattr(loaded_model, "predict"):
                 raise RuntimeError("persisted NeuralForecast model is invalid")
             self._model = loaded_model
+
+    def _resolve_model_horizon(self, models: object) -> int:
+        """Return the common positive fixed horizon for configured models."""
+        if not isinstance(models, (list, tuple)) or not models:
+            raise ValueError("backend_params['models'] must be a non-empty sequence")
+        horizons = {getattr(model, "h", None) for model in models}
+        if len(horizons) != 1:
+            raise ValueError("all NeuralForecast models must use the same horizon")
+        horizon = next(iter(horizons))
+        if not isinstance(horizon, int) or horizon <= 0:
+            raise ValueError("NeuralForecast models must expose a positive 'h' horizon")
+        return horizon
 
     def feature_schema(self) -> list[str]:
         """Return feature columns learned during training."""

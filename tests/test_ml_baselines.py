@@ -76,3 +76,22 @@ def test_rolling_origin_baseline_reports_exact_metrics() -> None:
     assert metrics.wape_pct == 0.0
     assert metrics.bias_pct == 0.0
     assert metrics.p90_absolute_error == pytest.approx(0.0)
+
+
+def test_rolling_origin_baseline_reuses_generator_for_each_horizon() -> None:
+    ds = pd.date_range("2026-07-01T00:00:00Z", periods=24 * 4 * 10, freq="15min")
+    history = pd.DataFrame({"ds": ds, "y": [2.0] * len(ds)})
+    origin_values = (
+        origin.to_pydatetime()
+        for origin in pd.date_range("2026-07-08T00:00:00Z", periods=2, freq="6h")
+    )
+
+    metrics = evaluate_local_slot_baseline(
+        history,
+        origins=origin_values,
+        horizon_periods=[4, 8],
+        interval_minutes=15,
+    )
+
+    assert metrics[4].samples == 8
+    assert metrics[8].samples == 16

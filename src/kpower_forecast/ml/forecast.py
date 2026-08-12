@@ -164,6 +164,7 @@ class KPowerMLForecast:
             dynamic_export_limits: Optional time-varying solar export limits.
             origin: Optional timezone-aware first returned timestamp. It must be
                 interval-aligned and cannot precede the first post-training slot.
+                When omitted, prediction starts at the next current interval.
 
         Returns:
             Forecast dataframe containing exactly ``days`` of future intervals.
@@ -180,8 +181,9 @@ class KPowerMLForecast:
         interval_minutes = self.config.interval_minutes
         interval = pd.Timedelta(minutes=interval_minutes)
         model_start = self._training_end + interval
+        current_start = pd.Timestamp.now(tz="UTC").ceil(f"{interval_minutes}min")
         requested_start = (
-            model_start
+            max(model_start, current_start)
             if origin is None
             else prediction_origin(origin, interval_minutes)
         )
@@ -200,10 +202,16 @@ class KPowerMLForecast:
         skipped_steps = int(offset / interval)
         model_horizon = skipped_steps + returned_horizon
         requested_end = requested_start + returned_horizon * interval
-        intervals_per_day = 24 * 60 // interval_minutes
-        weather_days = days + ceil(skipped_steps / intervals_per_day) + 1
-        weather = self.weather_client.fetch_forecast(days=weather_days)
-        weather = self.weather_client.resample_weather(weather, interval_minutes)
+        current_day_start = current_start.floor("D")
+        weather_days = max(
+            days + 1,
+            ceil(max((requested_end - current_day_start) / pd.Timedelta(days=1), 0)),
+        )
+        weather = self._weather_for_model_grid(
+            start=model_start,
+            horizon=model_horizon,
+            forecast_days=weather_days,
+        )
         weather = self.bias_corrector.apply(weather)
         aligned_weather = self._align_weather_grid(
             weather,
@@ -250,6 +258,53 @@ class KPowerMLForecast:
                 forecast, dynamic_export_limits=dynamic_export_limits
             )
         return forecast
+
+    def _weather_for_model_grid(
+        self,
+        *,
+        start: pd.Timestamp,
+        horizon: int,
+        forecast_days: int,
+    ) -> pd.DataFrame:
+        """Combine archive and forecast weather for the complete model grid.
+
+        Recursive backends must advance through every interval after their
+        training cutoff, even though only the requested future slice is
+        returned. Historical weather fills any elapsed prefix no longer
+        supplied by the forecast endpoint.
+        """
+        interval_minutes = self.config.interval_minutes
+        interval = pd.Timedelta(minutes=interval_minutes)
+        end = start + (horizon - 1) * interval
+        forecast = self.weather_client.fetch_forecast(days=forecast_days)
+        forecast = self.weather_client.resample_weather(forecast, interval_minutes)
+        if "ds" not in forecast.columns or forecast.empty:
+            raise ForecastAlignmentError("weather forecast has no timestamps")
+        forecast = forecast.copy()
+        forecast["ds"] = pd.to_datetime(forecast["ds"], utc=True)
+        forecast_start = pd.to_datetime(forecast["ds"].min(), utc=True)
+
+        frames: list[pd.DataFrame] = []
+        historical_end = min(end, forecast_start - interval)
+        if start <= historical_end:
+            historical = self.weather_client.fetch_historical(
+                start.date(), historical_end.date()
+            )
+            historical = self.weather_client.resample_weather(
+                historical, interval_minutes
+            )
+            frames.append(historical)
+        frames.append(forecast)
+
+        combined = pd.concat(frames, ignore_index=True)
+        if "ds" not in combined.columns:
+            raise ForecastAlignmentError("weather data is missing 'ds'")
+        combined["ds"] = pd.to_datetime(combined["ds"], utc=True)
+        return (
+            combined.drop_duplicates(subset="ds", keep="last")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
 
     def _align_weather_grid(
         self,
@@ -302,6 +357,8 @@ class KPowerMLForecast:
         """Load persisted manifest state when available."""
         manifest = self.storage.load_manifest()
         if manifest is None:
+            return
+        if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         self._restore_from_manifest(manifest)
 

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pandas as pd
 import pytest
@@ -59,7 +59,8 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     )
 
     forecast.train(history, force=True)
-    result = forecast.predict(days=1)
+    origin = datetime(2024, 1, 1, 8, tzinfo=timezone.utc)
+    result = forecast.predict(days=1, origin=origin)
 
     assert len(result) == 24
     assert {"yhat", "yhat_lower_50", "yhat_upper_90"}.issubset(result.columns)
@@ -85,7 +86,7 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
         lambda frame, interval_minutes: cast(pd.DataFrame, frame),
     )
 
-    restored_result = restored.predict(days=1)
+    restored_result = restored.predict(days=1, origin=origin)
     baseline_result = restored.predict_baseline(
         days=1,
         origin=datetime(2024, 1, 1, 8, tzinfo=timezone.utc),
@@ -136,7 +137,7 @@ def test_ml_forecast_aligns_backend_grid_and_slices_explicit_origin(
         def feature_schema(self) -> list[str]:
             return []
 
-    forecast.backend = RecordingBackend()
+    forecast.backend = cast(Any, RecordingBackend())
     weather = pd.DataFrame(
         {
             "ds": pd.date_range("2026-08-12T00:00:00Z", periods=288, freq="15min"),
@@ -163,6 +164,76 @@ def test_ml_forecast_aligns_backend_grid_and_slices_explicit_origin(
     assert len(result) == 96
     assert result["ds"].iloc[0] == pd.Timestamp("2026-08-12T10:00:00Z")
     assert result["ds"].iloc[-1] == pd.Timestamp("2026-08-13T09:45:00Z")
+
+
+def test_ml_forecast_defaults_to_current_slot_and_loads_elapsed_weather(
+    monkeypatch, tmp_path
+) -> None:
+    interval_minutes = 15
+    current_start = pd.Timestamp.now(tz="UTC").ceil(f"{interval_minutes}min")
+    model_start = current_start - pd.Timedelta(days=1)
+    forecast = KPowerMLForecast(
+        model_id="current-consumption",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=interval_minutes,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+    forecast._training_end = model_start - pd.Timedelta(minutes=interval_minutes)
+    observed: dict[str, object] = {}
+
+    class RecordingBackend:
+        def predict(self, future_features: pd.DataFrame, horizon: int) -> pd.DataFrame:
+            observed["first"] = future_features["ds"].iloc[0]
+            observed["horizon"] = horizon
+            return pd.DataFrame({"ds": future_features["ds"], "yhat": [0.2] * horizon})
+
+    forecast.backend = cast(Any, RecordingBackend())
+    forecast_start = current_start.floor("D")
+    historical_weather = pd.DataFrame(
+        {
+            "ds": pd.date_range(
+                model_start,
+                forecast_start - pd.Timedelta(minutes=interval_minutes),
+                freq=f"{interval_minutes}min",
+            ),
+            "temperature_2m": 20.0,
+        }
+    )
+    future_weather = pd.DataFrame(
+        {
+            "ds": pd.date_range(
+                forecast_start,
+                current_start + pd.Timedelta(days=2),
+                freq=f"{interval_minutes}min",
+            ),
+            "temperature_2m": 20.0,
+        }
+    )
+    historical_calls: list[tuple[object, object]] = []
+
+    def fetch_historical(start: object, end: object) -> pd.DataFrame:
+        historical_calls.append((start, end))
+        return historical_weather
+
+    monkeypatch.setattr(forecast.weather_client, "fetch_historical", fetch_historical)
+    monkeypatch.setattr(
+        forecast.weather_client, "fetch_forecast", lambda days: future_weather
+    )
+    monkeypatch.setattr(
+        forecast.weather_client,
+        "resample_weather",
+        lambda frame, requested_interval: cast(pd.DataFrame, frame),
+    )
+
+    result = forecast.predict(days=1)
+
+    assert historical_calls
+    assert observed == {"first": model_start, "horizon": 192}
+    assert result["ds"].iloc[0] == current_start
+    assert result["ds"].iloc[-1] == current_start + pd.Timedelta(hours=23, minutes=45)
 
 
 def test_ml_forecast_rejects_missing_weather_grid_timestamp(
@@ -226,7 +297,9 @@ def test_ml_forecast_rejects_invalid_explicit_origin(
         forecast.predict(days=1, origin=origin)
 
 
-def test_ml_forecast_requires_retrain_for_legacy_manifest(tmp_path) -> None:
+def test_ml_forecast_permits_forced_retrain_of_legacy_manifest(
+    monkeypatch, tmp_path
+) -> None:
     storage = MLModelStorage(str(tmp_path), "legacy")
     storage.save_manifest(
         MLModelManifest(
@@ -238,16 +311,40 @@ def test_ml_forecast_requires_retrain_for_legacy_manifest(tmp_path) -> None:
         )
     )
 
+    forecast = KPowerMLForecast(
+        model_id="legacy",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+    history = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", periods=8, freq="h", tz="UTC"),
+            "y": [1.0] * 8,
+        }
+    )
+    weather = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", periods=48, freq="h", tz="UTC"),
+            "temperature_2m": [10.0] * 48,
+        }
+    )
+    monkeypatch.setattr(
+        forecast.weather_client, "fetch_historical", lambda start, end: weather
+    )
+
+    assert forecast.training_end is None
     with pytest.raises(ForecastAlignmentError, match="requires a full retrain"):
-        KPowerMLForecast(
-            model_id="legacy",
-            latitude=46.0,
-            longitude=14.0,
-            storage_path=str(tmp_path),
-            interval_minutes=15,
-            forecast_type=MLForecastType.CONSUMPTION,
-            backend=MLBackendType.NEURALFORECAST,
-        )
+        forecast.train(history, force=False)
+
+    forecast.train(history, force=True)
+
+    manifest = storage.load_manifest()
+    assert manifest is not None
+    assert manifest.contract_version == FORECAST_CONTRACT_VERSION
 
 
 def test_ml_forecast_applies_static_pv_inverter_curtailment(tmp_path) -> None:

@@ -90,11 +90,12 @@ def evaluate_local_slot_baseline(
 ) -> dict[int, BaselineMetrics]:
     """Evaluate the baseline over exact rolling-origin horizons."""
     prepared = _prepare_history(history).set_index("ds")
+    origin_values = list(origins)
     results: dict[int, BaselineMetrics] = {}
     for periods in horizon_periods:
         actual_values: list[float] = []
         predicted_values: list[float] = []
-        for origin_value in origins:
+        for origin_value in origin_values:
             origin = prediction_origin(origin_value, interval_minutes)
             expected = pd.date_range(
                 start=origin,
