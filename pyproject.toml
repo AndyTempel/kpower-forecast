@@ -1,6 +1,6 @@
 [project]
 name = "kpower-forecast"
-version = "2026.6.3"
+version = "2026.8.0"
 description = "Solar production and power consumption forecasting package."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -62,6 +62,7 @@ ai = [
 
 [project.scripts]
 kpower-forecast = "kpower_forecast.cli:app"
+kpower-forecast-benchmark = "kpower_forecast.ml.benchmark:main"
 
 [tool.mypy]
 python_version = "3.13"

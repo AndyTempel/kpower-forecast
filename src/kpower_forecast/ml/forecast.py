@@ -1,14 +1,23 @@
 """Public ML forecasting API."""
 
 from datetime import date, datetime
+from math import ceil
 from numbers import Real
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import pandas as pd
 
+from kpower_forecast import __version__
 from kpower_forecast.core import PredictionInterval
+from kpower_forecast.ml.alignment import (
+    FORECAST_CONTRACT_VERSION,
+    ForecastAlignmentError,
+    prediction_origin,
+    validate_timestamp_grid,
+)
 from kpower_forecast.ml.backends import create_backend
+from kpower_forecast.ml.baselines import local_slot_weekday_class_median
 from kpower_forecast.ml.bias_correction import WeatherBiasCorrector
 from kpower_forecast.ml.config import KPowerMLConfig, MLBackendType, MLForecastType
 from kpower_forecast.ml.conformal import SplitConformalCalibrator
@@ -62,6 +71,7 @@ class KPowerMLForecast:
             min_samples=self.config.min_weather_correction_samples
         )
         self.conformal = SplitConformalCalibrator(self.config.interval_levels)
+        self._training_end: pd.Timestamp | None = None
         self._restore_existing_manifest()
 
     def _weather_config_with_default_cache(
@@ -108,6 +118,7 @@ class KPowerMLForecast:
         train_features = self.feature_builder.build(train_frame)
         calibration_features = self.feature_builder.build(calibration_frame)
         full_features = self.feature_builder.build(prepared)
+        self._training_end = pd.to_datetime(prepared["ds"], utc=True).max()
 
         self.bias_corrector.fit_from_historical_proxy(train_frame)
         self.backend.fit(train_frame, train_features, calibration_frame)
@@ -120,6 +131,7 @@ class KPowerMLForecast:
         self.backend.fit(prepared, full_features, calibration_frame)
 
         manifest = MLModelManifest(
+            contract_version=FORECAST_CONTRACT_VERSION,
             model_id=self.config.model_id,
             backend_type=self.config.backend.value,
             target_type=self.config.forecast_type.value,
@@ -130,6 +142,7 @@ class KPowerMLForecast:
             weather_bias_source=self.bias_corrector.source,
             training_start=pd.Timestamp(prepared["ds"].min()).isoformat(),
             training_end=pd.Timestamp(prepared["ds"].max()).isoformat(),
+            package_version=__version__,
             metadata={
                 "weather_bias": self.bias_corrector.to_dict(),
                 "pv_limits": self._pv_limit_metadata(),
@@ -142,23 +155,148 @@ class KPowerMLForecast:
         self,
         days: int = 7,
         dynamic_export_limits: Optional[pd.DataFrame] = None,
+        origin: datetime | None = None,
     ) -> pd.DataFrame:
-        """Generate an ML forecast for the next ``days`` days."""
-        horizon = days * (24 * 60 // self.config.interval_minutes)
-        weather = self.weather_client.fetch_forecast(days=days)
-        weather = self.weather_client.resample_weather(
-            weather, self.config.interval_minutes
+        """Generate an aligned ML forecast for the next ``days`` days.
+
+        Args:
+            days: Number of complete 24-hour periods to return.
+            dynamic_export_limits: Optional time-varying solar export limits.
+            origin: Optional timezone-aware first returned timestamp. It must be
+                interval-aligned and cannot precede the first post-training slot.
+
+        Returns:
+            Forecast dataframe containing exactly ``days`` of future intervals.
+
+        Raises:
+            ForecastAlignmentError: If the training cutoff, origin, weather grid,
+                backend output, or returned horizon is not exactly aligned.
+        """
+        if days <= 0:
+            raise ValueError("days must be positive")
+        if self._training_end is None:
+            raise ForecastAlignmentError("model training cutoff is not available")
+
+        interval_minutes = self.config.interval_minutes
+        interval = pd.Timedelta(minutes=interval_minutes)
+        model_start = self._training_end + interval
+        requested_start = (
+            model_start
+            if origin is None
+            else prediction_origin(origin, interval_minutes)
         )
+        if requested_start < model_start:
+            raise ForecastAlignmentError(
+                f"prediction origin {requested_start.isoformat()} precedes first "
+                f"post-training slot {model_start.isoformat()}"
+            )
+        offset = requested_start - model_start
+        if offset % interval != pd.Timedelta(0):
+            raise ForecastAlignmentError(
+                "prediction origin is not reachable on the model interval grid"
+            )
+
+        returned_horizon = days * (24 * 60 // interval_minutes)
+        skipped_steps = int(offset / interval)
+        model_horizon = skipped_steps + returned_horizon
+        requested_end = requested_start + returned_horizon * interval
+        intervals_per_day = 24 * 60 // interval_minutes
+        weather_days = days + ceil(skipped_steps / intervals_per_day) + 1
+        weather = self.weather_client.fetch_forecast(days=weather_days)
+        weather = self.weather_client.resample_weather(weather, interval_minutes)
         weather = self.bias_corrector.apply(weather)
-        features = self.feature_builder.build(weather)
-        forecast = self.backend.predict(features, horizon=horizon)
+        aligned_weather = self._align_weather_grid(
+            weather,
+            start=model_start,
+            horizon=model_horizon,
+        )
+        features = self.feature_builder.build(aligned_weather)
+        validate_timestamp_grid(
+            features,
+            interval_minutes=interval_minutes,
+            expected_start=model_start,
+            expected_length=model_horizon,
+            label="forecast features",
+        )
+        forecast = self.backend.predict(features, horizon=model_horizon)
+        validate_timestamp_grid(
+            forecast,
+            interval_minutes=interval_minutes,
+            expected_start=model_start,
+            expected_length=model_horizon,
+            label="backend forecast",
+        )
         forecast = self.conformal.apply(forecast)
+        forecast = forecast.iloc[
+            skipped_steps : skipped_steps + returned_horizon
+        ].reset_index(drop=True)
+        validate_timestamp_grid(
+            forecast,
+            interval_minutes=interval_minutes,
+            expected_start=requested_start,
+            expected_length=returned_horizon,
+            label="returned forecast",
+        )
+        if (
+            pd.to_datetime(forecast["ds"].iloc[-1], utc=True) + interval
+            != requested_end
+        ):
+            raise ForecastAlignmentError(
+                "returned forecast has an invalid end boundary"
+            )
         if self.config.forecast_type == MLForecastType.SOLAR:
             forecast = self._apply_solar_constraints(forecast)
             forecast = self._apply_pv_curtailment(
                 forecast, dynamic_export_limits=dynamic_export_limits
             )
         return forecast
+
+    def _align_weather_grid(
+        self,
+        weather: pd.DataFrame,
+        *,
+        start: pd.Timestamp,
+        horizon: int,
+    ) -> pd.DataFrame:
+        """Select weather rows for the exact model forecast grid.
+
+        Args:
+            weather: Resampled weather forecast containing ``ds``.
+            start: First post-training model timestamp.
+            horizon: Number of model-grid rows required.
+
+        Returns:
+            Weather dataframe ordered on the exact contiguous model grid.
+
+        Raises:
+            ForecastAlignmentError: If weather coverage is missing or duplicated.
+        """
+        if "ds" not in weather.columns:
+            raise ForecastAlignmentError("weather forecast is missing 'ds'")
+        normalized = weather.copy()
+        normalized["ds"] = pd.to_datetime(normalized["ds"], utc=True)
+        if normalized["ds"].duplicated().any():
+            raise ForecastAlignmentError(
+                "weather forecast contains duplicate timestamps"
+            )
+        normalized = normalized.sort_values("ds").set_index("ds")
+        expected = pd.date_range(
+            start=start,
+            periods=horizon,
+            freq=f"{self.config.interval_minutes}min",
+            tz="UTC",
+        )
+        available = pd.DatetimeIndex(normalized.index)
+        missing = expected.difference(available)
+        if not missing.empty:
+            preview = ", ".join(timestamp.isoformat() for timestamp in missing[:3])
+            raise ForecastAlignmentError(
+                f"weather forecast is missing {len(missing)} required timestamps: "
+                f"{preview}"
+            )
+        aligned = normalized.reindex(expected)
+        aligned.index.name = "ds"
+        return aligned.reset_index()
 
     def _restore_existing_manifest(self) -> None:
         """Load persisted manifest state when available."""
@@ -169,6 +307,12 @@ class KPowerMLForecast:
 
     def _restore_from_manifest(self, manifest: MLModelManifest) -> None:
         """Restore backend, interval, and correction state from a manifest."""
+        if manifest.contract_version != FORECAST_CONTRACT_VERSION:
+            raise ForecastAlignmentError(
+                "stored model uses forecast contract "
+                f"{manifest.contract_version}; contract "
+                f"{FORECAST_CONTRACT_VERSION} requires a full retrain"
+            )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
                 "stored ML backend does not match configured backend: "
@@ -181,12 +325,22 @@ class KPowerMLForecast:
             )
 
         self.backend.load(self.storage.artifact_dir)
+        if manifest.training_end is None:
+            raise ForecastAlignmentError("stored model has no training cutoff")
+        self._training_end = pd.to_datetime(manifest.training_end, utc=True)
         self.conformal = SplitConformalCalibrator.from_dict(
             manifest.interval_levels, manifest.conformal_quantiles
         )
         weather_bias = manifest.metadata.get("weather_bias")
         if isinstance(weather_bias, dict):
             self.bias_corrector.load_dict(weather_bias)
+
+    @property
+    def training_end(self) -> datetime | None:
+        """Return the UTC cutoff used to build the active model."""
+        if self._training_end is None:
+            return None
+        return cast(datetime, self._training_end.to_pydatetime())
 
     def get_prediction_intervals(
         self, days: int = 7, level: int = 90
@@ -207,6 +361,26 @@ class KPowerMLForecast:
             )
             for row in forecast.itertuples(index=False)
         ]
+
+    def predict_baseline(
+        self,
+        *,
+        days: int,
+        origin: datetime,
+        timezone: str = "UTC",
+    ) -> pd.DataFrame:
+        """Generate the leakage-safe fallback forecast from persisted history."""
+        history = self.storage.load_training_frame()
+        if history is None:
+            raise ForecastAlignmentError("baseline training history is unavailable")
+        periods = days * (24 * 60 // self.config.interval_minutes)
+        return local_slot_weekday_class_median(
+            history,
+            origin=origin,
+            periods=periods,
+            interval_minutes=self.config.interval_minutes,
+            timezone=timezone,
+        )
 
     def _coerce_timestamp(self, value: object) -> pd.Timestamp:
         """Coerce an arbitrary value to a timezone-aware pandas timestamp."""

@@ -6,6 +6,10 @@ from typing import Protocol
 
 import pandas as pd
 
+from kpower_forecast.ml.alignment import (
+    ForecastAlignmentError,
+    validate_timestamp_grid,
+)
 from kpower_forecast.ml.config import KPowerMLConfig
 from kpower_forecast.ml.dependencies import ensure_optional_dependencies
 
@@ -37,6 +41,7 @@ class NeuralForecastBackend:
         self.config = config
         self._feature_columns: list[str] = []
         self._last_observed: float = 0.0
+        self._last_train_ds: pd.Timestamp | None = None
         self._model: NeuralForecastModel | None = None
         self._fitted = False
 
@@ -54,6 +59,7 @@ class NeuralForecastBackend:
             column for column in features.columns if column != "ds"
         ]
         self._last_observed = float(history["y"].iloc[-1])
+        self._last_train_ds = pd.to_datetime(history["ds"], utc=True).max()
         models = self.config.backend_params.get("models")
         if not models:
             self._fitted = True
@@ -79,12 +85,33 @@ class NeuralForecastBackend:
 
         future = future_features.head(horizon).copy()
         future["ds"] = pd.to_datetime(future["ds"], utc=True)
+        if self._last_train_ds is None:
+            raise ForecastAlignmentError(
+                "NeuralForecast training cutoff is unavailable"
+            )
+        expected_start = self._last_train_ds + pd.Timedelta(
+            minutes=self.config.interval_minutes
+        )
+        validate_timestamp_grid(
+            future,
+            interval_minutes=self.config.interval_minutes,
+            expected_start=expected_start,
+            expected_length=horizon,
+            label="NeuralForecast future features",
+        )
         if self._model is None:
             yhat_values = pd.Series(
                 [self._last_observed] * len(future), dtype="float64"
             )
         else:
             forecast = self._model.predict().reset_index()
+            validate_timestamp_grid(
+                forecast,
+                interval_minutes=self.config.interval_minutes,
+                expected_start=expected_start,
+                expected_length=horizon,
+                label="NeuralForecast output",
+            )
             model_columns = [
                 column
                 for column in forecast.columns
@@ -104,6 +131,9 @@ class NeuralForecastBackend:
         state = {
             "feature_columns": self._feature_columns,
             "last_observed": self._last_observed,
+            "last_train_ds": (
+                None if self._last_train_ds is None else self._last_train_ds.isoformat()
+            ),
             "fitted": self._fitted,
         }
         with (path / STATE_FILE).open("w", encoding="utf-8") as file:
@@ -130,6 +160,10 @@ class NeuralForecastBackend:
             state = json.load(file)
         self._feature_columns = list(state.get("feature_columns", []))
         self._last_observed = float(state.get("last_observed", 0.0))
+        last_train_ds = state.get("last_train_ds")
+        self._last_train_ds = (
+            None if last_train_ds is None else pd.to_datetime(last_train_ds, utc=True)
+        )
         self._fitted = bool(state.get("fitted", False))
 
         model_path = path / MODEL_FILE
