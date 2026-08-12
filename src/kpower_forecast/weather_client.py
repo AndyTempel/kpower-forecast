@@ -24,6 +24,7 @@ HOURLY = "hourly"
 FORECAST_HOURS_PER_DAY = 24
 WEATHER_REQUEST_INTERVAL_MINUTES = 15
 FORECAST_INTERVALS_PER_HOUR = 60 // WEATHER_REQUEST_INTERVAL_MINUTES
+MAX_FORECAST_PAST_DAYS = 92
 
 PHYSICAL_LOWER_BOUNDED_COLUMNS: tuple[str, ...] = (
     "shortwave_radiation",
@@ -232,10 +233,14 @@ class WeatherClient:
         match = INVALID_VARIABLE_PATTERN.search(reason)
         return match.group(1) if match else None
 
-    def fetch_forecast(self, days: int = 7) -> pd.DataFrame:
+    def fetch_forecast(self, days: int = 7, past_days: int = 0) -> pd.DataFrame:
         """
-        Fetch weather forecast for prediction.
+        Fetch weather forecast and optional recent archived forecast days.
         """
+        if past_days < 0 or past_days > MAX_FORECAST_PAST_DAYS:
+            raise ValueError(
+                f"past_days must be between 0 and {MAX_FORECAST_PAST_DAYS}"
+            )
         weather_variables = list(self.config.hourly_variables)
         request_field = MINUTELY_15
 
@@ -245,6 +250,7 @@ class WeatherClient:
                 days=days,
                 model=self.config.forecast_model,
                 request_field=request_field,
+                past_days=past_days,
             )
 
             try:
@@ -261,6 +267,7 @@ class WeatherClient:
                     weather_variables=weather_variables,
                     days=days,
                     request_field=request_field,
+                    past_days=past_days,
                 )
                 return self._finalize_weather_frame(merged)
             except requests.HTTPError as error:
@@ -338,6 +345,7 @@ class WeatherClient:
         days: int,
         model: Optional[str],
         request_field: str,
+        past_days: int = 0,
     ) -> dict[str, str | float | int | list[str]]:
         """Build Open-Meteo forecast query parameters.
 
@@ -346,6 +354,7 @@ class WeatherClient:
             days: Requested forecast horizon in days.
             model: Optional Open-Meteo model identifier.
             request_field: Open-Meteo resolution field.
+            past_days: Number of recent forecast-archive days to include.
 
         Returns:
             Query parameter dictionary.
@@ -359,6 +368,8 @@ class WeatherClient:
         }
         if model:
             params["models"] = model
+        if past_days:
+            params["past_days"] = past_days
         return params
 
     def _maybe_fill_long_horizon(
@@ -367,6 +378,7 @@ class WeatherClient:
         weather_variables: list[str],
         days: int,
         request_field: str,
+        past_days: int = 0,
     ) -> pd.DataFrame:
         """Fill short primary forecasts with the configured long-horizon model.
 
@@ -375,11 +387,12 @@ class WeatherClient:
             weather_variables: Weather variable names used by the primary request.
             days: Requested forecast horizon in days.
             request_field: Open-Meteo resolution field used by the primary request.
+            past_days: Number of recent forecast-archive days requested.
 
         Returns:
             Primary dataframe, optionally filled by the long-horizon dataframe.
         """
-        expected_rows = self._expected_forecast_rows(days, request_field)
+        expected_rows = self._expected_forecast_rows(days + past_days, request_field)
         has_full_horizon = self._forecast_row_count(primary) >= expected_rows
         has_weather_data = self._has_required_weather_data(primary)
         if has_full_horizon and has_weather_data:
@@ -409,6 +422,7 @@ class WeatherClient:
             days=days,
             model=long_horizon_model,
             request_field=request_field,
+            past_days=past_days,
         )
         long_data = self._request_json(
             endpoint="forecast",

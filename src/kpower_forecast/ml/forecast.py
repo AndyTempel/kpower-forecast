@@ -24,7 +24,11 @@ from kpower_forecast.ml.conformal import SplitConformalCalibrator
 from kpower_forecast.ml.features import MLFeatureBuilder
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 from kpower_forecast.utils import calculate_solar_elevation, normalize_to_instant_kwh
-from kpower_forecast.weather_client import WeatherClient, WeatherConfig
+from kpower_forecast.weather_client import (
+    MAX_FORECAST_PAST_DAYS,
+    WeatherClient,
+    WeatherConfig,
+)
 
 DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "grid_export_limit_kw",
@@ -276,7 +280,15 @@ class KPowerMLForecast:
         interval_minutes = self.config.interval_minutes
         interval = pd.Timedelta(minutes=interval_minutes)
         end = start + (horizon - 1) * interval
-        forecast = self.weather_client.fetch_forecast(days=forecast_days)
+        current_day_start = pd.Timestamp.now(tz="UTC").floor("D")
+        past_days = min(
+            MAX_FORECAST_PAST_DAYS,
+            max(ceil((current_day_start - start) / pd.Timedelta(days=1)), 0),
+        )
+        forecast = self.weather_client.fetch_forecast(
+            days=forecast_days,
+            past_days=past_days,
+        )
         forecast = self.weather_client.resample_weather(forecast, interval_minutes)
         if "ds" not in forecast.columns or forecast.empty:
             raise ForecastAlignmentError("weather forecast has no timestamps")

@@ -51,7 +51,11 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     monkeypatch.setattr(
         forecast.weather_client, "fetch_historical", lambda start, end: weather
     )
-    monkeypatch.setattr(forecast.weather_client, "fetch_forecast", lambda days: weather)
+    monkeypatch.setattr(
+        forecast.weather_client,
+        "fetch_forecast",
+        lambda days, past_days=0: weather,
+    )
     monkeypatch.setattr(
         forecast.weather_client,
         "resample_weather",
@@ -79,7 +83,11 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
         forecast_type=MLForecastType.CONSUMPTION,
         backend=MLBackendType.NEURALFORECAST,
     )
-    monkeypatch.setattr(restored.weather_client, "fetch_forecast", lambda days: weather)
+    monkeypatch.setattr(
+        restored.weather_client,
+        "fetch_forecast",
+        lambda days, past_days=0: weather,
+    )
     monkeypatch.setattr(
         restored.weather_client,
         "resample_weather",
@@ -144,7 +152,11 @@ def test_ml_forecast_aligns_backend_grid_and_slices_explicit_origin(
             "temperature_2m": [20.0] * 288,
         }
     )
-    monkeypatch.setattr(forecast.weather_client, "fetch_forecast", lambda days: weather)
+    monkeypatch.setattr(
+        forecast.weather_client,
+        "fetch_forecast",
+        lambda days, past_days=0: weather,
+    )
     monkeypatch.setattr(
         forecast.weather_client,
         "resample_weather",
@@ -191,21 +203,10 @@ def test_ml_forecast_defaults_to_current_slot_and_loads_elapsed_weather(
             return pd.DataFrame({"ds": future_features["ds"], "yhat": [0.2] * horizon})
 
     forecast.backend = cast(Any, RecordingBackend())
-    forecast_start = current_start.floor("D")
-    historical_weather = pd.DataFrame(
-        {
-            "ds": pd.date_range(
-                model_start,
-                forecast_start - pd.Timedelta(minutes=interval_minutes),
-                freq=f"{interval_minutes}min",
-            ),
-            "temperature_2m": 20.0,
-        }
-    )
     future_weather = pd.DataFrame(
         {
             "ds": pd.date_range(
-                forecast_start,
+                model_start,
                 current_start + pd.Timedelta(days=2),
                 freq=f"{interval_minutes}min",
             ),
@@ -213,15 +214,18 @@ def test_ml_forecast_defaults_to_current_slot_and_loads_elapsed_weather(
         }
     )
     historical_calls: list[tuple[object, object]] = []
+    forecast_calls: list[tuple[int, int]] = []
 
     def fetch_historical(start: object, end: object) -> pd.DataFrame:
         historical_calls.append((start, end))
-        return historical_weather
+        raise AssertionError("recent elapsed weather must not use the archive API")
+
+    def fetch_forecast(days: int, past_days: int = 0) -> pd.DataFrame:
+        forecast_calls.append((days, past_days))
+        return future_weather
 
     monkeypatch.setattr(forecast.weather_client, "fetch_historical", fetch_historical)
-    monkeypatch.setattr(
-        forecast.weather_client, "fetch_forecast", lambda days: future_weather
-    )
+    monkeypatch.setattr(forecast.weather_client, "fetch_forecast", fetch_forecast)
     monkeypatch.setattr(
         forecast.weather_client,
         "resample_weather",
@@ -230,7 +234,8 @@ def test_ml_forecast_defaults_to_current_slot_and_loads_elapsed_weather(
 
     result = forecast.predict(days=1)
 
-    assert historical_calls
+    assert not historical_calls
+    assert forecast_calls and forecast_calls[0][1] >= 1
     assert observed == {"first": model_start, "horizon": 192}
     assert result["ds"].iloc[0] == current_start
     assert result["ds"].iloc[-1] == current_start + pd.Timedelta(hours=23, minutes=45)
@@ -257,7 +262,11 @@ def test_ml_forecast_rejects_missing_weather_grid_timestamp(
             "temperature_2m": [20.0] * 191,
         }
     )
-    monkeypatch.setattr(forecast.weather_client, "fetch_forecast", lambda days: weather)
+    monkeypatch.setattr(
+        forecast.weather_client,
+        "fetch_forecast",
+        lambda days, past_days=0: weather,
+    )
     monkeypatch.setattr(
         forecast.weather_client,
         "resample_weather",
