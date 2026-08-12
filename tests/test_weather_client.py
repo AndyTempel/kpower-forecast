@@ -4,6 +4,10 @@ import requests
 from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
 
+def test_weather_config_defaults_recent_forecast_history_to_one_day() -> None:
+    assert WeatherConfig().recent_forecast_past_days == 1
+
+
 def _weather_payload(
     times: list[str],
     temperature: list[float | None],

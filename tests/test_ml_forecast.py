@@ -241,6 +241,70 @@ def test_ml_forecast_defaults_to_current_slot_and_loads_elapsed_weather(
     assert result["ds"].iloc[-1] == current_start + pd.Timedelta(hours=23, minutes=45)
 
 
+def test_ml_forecast_caps_recent_weather_to_configured_one_day(
+    monkeypatch, tmp_path
+) -> None:
+    current_start = pd.Timestamp.now(tz="UTC").ceil("15min")
+    model_start = current_start - pd.Timedelta(days=3)
+    forecast = KPowerMLForecast(
+        model_id="bounded-recent-weather",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=15,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+    assert forecast.weather_client.config.recent_forecast_past_days == 1
+    recent_start = current_start.floor("D") - pd.Timedelta(days=1)
+    archive = pd.DataFrame(
+        {
+            "ds": pd.date_range(
+                model_start,
+                recent_start - pd.Timedelta(minutes=15),
+                freq="15min",
+            ),
+            "temperature_2m": 20.0,
+        }
+    )
+    recent = pd.DataFrame(
+        {
+            "ds": pd.date_range(
+                recent_start, current_start + pd.Timedelta(days=1), freq="15min"
+            ),
+            "temperature_2m": 20.0,
+        }
+    )
+    forecast_calls: list[tuple[int, int]] = []
+    archive_calls: list[tuple[object, object]] = []
+
+    def fetch_forecast(days: int, past_days: int = 0) -> pd.DataFrame:
+        forecast_calls.append((days, past_days))
+        return recent
+
+    def fetch_historical(start: object, end: object) -> pd.DataFrame:
+        archive_calls.append((start, end))
+        return archive
+
+    monkeypatch.setattr(forecast.weather_client, "fetch_forecast", fetch_forecast)
+    monkeypatch.setattr(forecast.weather_client, "fetch_historical", fetch_historical)
+    monkeypatch.setattr(
+        forecast.weather_client,
+        "resample_weather",
+        lambda frame, requested_interval: cast(pd.DataFrame, frame),
+    )
+
+    weather = forecast._weather_for_model_grid(
+        start=model_start,
+        horizon=4 * 24 * 3,
+        forecast_days=2,
+    )
+
+    assert forecast_calls == [(2, 1)]
+    assert archive_calls
+    assert weather["ds"].min() == model_start
+
+
 def test_ml_forecast_rejects_missing_weather_grid_timestamp(
     monkeypatch, tmp_path
 ) -> None:

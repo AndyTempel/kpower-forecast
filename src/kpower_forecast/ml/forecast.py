@@ -24,11 +24,7 @@ from kpower_forecast.ml.conformal import SplitConformalCalibrator
 from kpower_forecast.ml.features import MLFeatureBuilder
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 from kpower_forecast.utils import calculate_solar_elevation, normalize_to_instant_kwh
-from kpower_forecast.weather_client import (
-    MAX_FORECAST_PAST_DAYS,
-    WeatherClient,
-    WeatherConfig,
-)
+from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
 DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "grid_export_limit_kw",
@@ -282,7 +278,7 @@ class KPowerMLForecast:
         end = start + (horizon - 1) * interval
         current_day_start = pd.Timestamp.now(tz="UTC").floor("D")
         past_days = min(
-            MAX_FORECAST_PAST_DAYS,
+            self.weather_client.config.recent_forecast_past_days,
             max(ceil((current_day_start - start) / pd.Timedelta(days=1)), 0),
         )
         forecast = self.weather_client.fetch_forecast(

@@ -54,6 +54,8 @@ class WeatherConfig(BaseModel):
         cache_dir: Optional directory for cached weather responses.
         forecast_cache_ttl_hours: Forecast cache freshness window in hours.
         historical_cache_ttl_hours: Historical cache freshness window in hours.
+        recent_forecast_past_days: Maximum recent elapsed days requested from
+            the forecast endpoint. Defaults to one for self-hosted deployments.
         required_hourly_variables: Variables required by the forecasting core.
         optional_hourly_variables: Extra variables requested when the provider
             supports them.
@@ -67,6 +69,7 @@ class WeatherConfig(BaseModel):
     cache_dir: Optional[Path] = None
     forecast_cache_ttl_hours: float = Field(default=1.0, gt=0)
     historical_cache_ttl_hours: float = Field(default=720.0, gt=0)
+    recent_forecast_past_days: int = Field(default=1, ge=0, le=MAX_FORECAST_PAST_DAYS)
     required_hourly_variables: list[str] = Field(
         default_factory=lambda: [
             "temperature_2m",
