@@ -72,6 +72,7 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     assert manifest is not None
     assert manifest.contract_version == FORECAST_CONTRACT_VERSION
     assert manifest.package_version == "2026.8.1"
+    assert manifest.metadata["sanitized_conformal_state_version"] == 1
     assert forecast.training_end == datetime(2024, 1, 1, 7, tzinfo=timezone.utc)
 
     restored = KPowerMLForecast(
@@ -558,6 +559,42 @@ def test_ml_forecast_permits_forced_retrain_of_legacy_manifest(
     manifest = storage.load_manifest()
     assert manifest is not None
     assert manifest.contract_version == FORECAST_CONTRACT_VERSION
+
+
+def test_ml_forecast_invalidates_conformal_state_from_before_point_sanitation(
+    tmp_path,
+) -> None:
+    storage = MLModelStorage(str(tmp_path), "pre-sanitized")
+    storage.save_manifest(
+        MLModelManifest(
+            contract_version=FORECAST_CONTRACT_VERSION,
+            model_id="pre-sanitized",
+            backend_type=MLBackendType.NEURALFORECAST.value,
+            target_type=MLForecastType.CONSUMPTION.value,
+            interval_levels=[50, 80, 90],
+            feature_columns=[],
+            conformal_quantiles={"90": 2.0},
+            training_end="2026-08-12T08:30:00Z",
+            package_version="2026.8.0",
+        )
+    )
+
+    forecast = KPowerMLForecast(
+        model_id="pre-sanitized",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+
+    assert forecast.training_end is None
+    with pytest.raises(
+        ForecastAlignmentError,
+        match="conformal state predates point-forecast sanitation",
+    ):
+        forecast.train(pd.DataFrame(), force=False)
 
 
 def test_ml_forecast_applies_static_pv_inverter_curtailment(tmp_path) -> None:

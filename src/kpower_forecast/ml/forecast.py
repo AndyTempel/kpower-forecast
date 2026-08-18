@@ -32,6 +32,7 @@ DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "curtailment_limit_kw",
     "limit_kw",
 )
+SANITIZED_CONFORMAL_STATE_VERSION = 1
 
 
 class KPowerMLForecast:
@@ -147,6 +148,9 @@ class KPowerMLForecast:
             metadata={
                 "weather_bias": self.bias_corrector.to_dict(),
                 "pv_limits": self._pv_limit_metadata(),
+                "sanitized_conformal_state_version": (
+                    SANITIZED_CONFORMAL_STATE_VERSION
+                ),
             },
         )
         self.storage.save_training_frame(prepared)
@@ -396,6 +400,11 @@ class KPowerMLForecast:
             return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
+        if (
+            manifest.metadata.get("sanitized_conformal_state_version")
+            != SANITIZED_CONFORMAL_STATE_VERSION
+        ):
+            return
         self._restore_from_manifest(manifest)
 
     def _restore_from_manifest(self, manifest: MLModelManifest) -> None:
@@ -405,6 +414,14 @@ class KPowerMLForecast:
                 "stored model uses forecast contract "
                 f"{manifest.contract_version}; contract "
                 f"{FORECAST_CONTRACT_VERSION} requires a full retrain"
+            )
+        if (
+            manifest.metadata.get("sanitized_conformal_state_version")
+            != SANITIZED_CONFORMAL_STATE_VERSION
+        ):
+            raise ForecastAlignmentError(
+                "stored model conformal state predates point-forecast sanitation; "
+                "a full retrain is required"
             )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
