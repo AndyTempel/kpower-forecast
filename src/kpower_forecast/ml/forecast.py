@@ -234,6 +234,7 @@ class KPowerMLForecast:
             expected_length=model_horizon,
             label="backend forecast",
         )
+        forecast = self._sanitize_point_forecast(forecast)
         forecast = self.conformal.apply(forecast)
         forecast = forecast.iloc[
             skipped_steps : skipped_steps + returned_horizon
@@ -258,6 +259,32 @@ class KPowerMLForecast:
                 forecast, dynamic_export_limits=dynamic_export_limits
             )
         return forecast
+
+    @staticmethod
+    def _sanitize_point_forecast(forecast: pd.DataFrame) -> pd.DataFrame:
+        """Enforce the non-negative physical contract for point forecasts."""
+        if "yhat" not in forecast.columns:
+            raise ForecastAlignmentError("backend forecast is missing 'yhat'")
+
+        output = forecast.copy()
+        numeric = pd.to_numeric(output["yhat"], errors="coerce")
+        for position, value in enumerate(numeric):
+            if pd.isna(value) or value in (float("inf"), float("-inf")):
+                timestamp = (
+                    output["ds"].iloc[position] if "ds" in output.columns else None
+                )
+                timestamp_text = (
+                    pd.to_datetime(timestamp, utc=True).isoformat()
+                    if timestamp is not None
+                    else "unknown"
+                )
+                raw_value = output["yhat"].iloc[position]
+                raise ForecastAlignmentError(
+                    "backend forecast yhat is non-finite at "
+                    f"index={position} timestamp={timestamp_text} value={raw_value!r}"
+                )
+        output["yhat"] = numeric.clip(lower=0.0)
+        return output
 
     def _weather_for_model_grid(
         self,

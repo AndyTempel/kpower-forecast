@@ -71,7 +71,7 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     manifest = forecast.storage.load_manifest()
     assert manifest is not None
     assert manifest.contract_version == FORECAST_CONTRACT_VERSION
-    assert manifest.package_version == "2026.8.0"
+    assert manifest.package_version == "2026.8.1"
     assert forecast.training_end == datetime(2024, 1, 1, 7, tzinfo=timezone.utc)
 
     restored = KPowerMLForecast(
@@ -126,7 +126,9 @@ def test_ml_forecast_aligns_backend_grid_and_slices_explicit_origin(
             observed["first"] = future_features["ds"].iloc[0]
             observed["last"] = future_features["ds"].iloc[-1]
             observed["horizon"] = horizon
-            return pd.DataFrame({"ds": future_features["ds"], "yhat": [0.25] * horizon})
+            points = [0.25] * horizon
+            points[5] = -0.01
+            return pd.DataFrame({"ds": future_features["ds"], "yhat": points})
 
         def fit(
             self,
@@ -174,8 +176,85 @@ def test_ml_forecast_aligns_backend_grid_and_slices_explicit_origin(
         "horizon": 101,
     }
     assert len(result) == 96
+    assert result["yhat"].iloc[0] == 0.0
     assert result["ds"].iloc[0] == pd.Timestamp("2026-08-12T10:00:00Z")
     assert result["ds"].iloc[-1] == pd.Timestamp("2026-08-13T09:45:00Z")
+
+
+@pytest.mark.parametrize(
+    "forecast_type",
+    [MLForecastType.CONSUMPTION, MLForecastType.HVAC],
+)
+def test_ml_forecast_clips_negative_energy_points(
+    forecast_type: MLForecastType, tmp_path
+) -> None:
+    forecast = KPowerMLForecast(
+        model_id=f"negative-{forecast_type.value}",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        forecast_type=forecast_type,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+    frame = pd.DataFrame(
+        {
+            "ds": pd.date_range("2026-08-19T14:15:00Z", periods=3, freq="15min"),
+            "yhat": [0.2, -0.01, 0.3],
+        }
+    )
+
+    result = forecast._sanitize_point_forecast(frame)
+
+    assert result["yhat"].tolist() == [0.2, 0.0, 0.3]
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_ml_forecast_rejects_non_finite_energy_points(
+    bad_value: float, tmp_path
+) -> None:
+    forecast = KPowerMLForecast(
+        model_id="non-finite-consumption",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+    frame = pd.DataFrame(
+        {
+            "ds": [pd.Timestamp("2026-08-19T14:30:00Z")],
+            "yhat": [bad_value],
+        }
+    )
+
+    with pytest.raises(ForecastAlignmentError) as exc_info:
+        forecast._sanitize_point_forecast(frame)
+
+    message = str(exc_info.value)
+    assert "index=0" in message
+    assert "2026-08-19T14:30:00+00:00" in message
+    assert repr(bad_value) in message
+
+
+def test_ml_forecast_preserves_positive_energy_points(tmp_path) -> None:
+    forecast = KPowerMLForecast(
+        model_id="positive-solar",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        forecast_type=MLForecastType.SOLAR,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+    frame = pd.DataFrame(
+        {
+            "ds": pd.date_range("2026-08-19T14:15:00Z", periods=3, freq="15min"),
+            "yhat": [0.0, 0.2, 0.3],
+        }
+    )
+
+    result = forecast._sanitize_point_forecast(frame)
+
+    assert result["yhat"].tolist() == [0.0, 0.2, 0.3]
 
 
 def test_ml_forecast_defaults_to_current_slot_and_loads_elapsed_weather(
@@ -338,7 +417,10 @@ def test_ml_forecast_rejects_missing_weather_grid_timestamp(
     )
 
     with pytest.raises(ForecastAlignmentError, match="missing 1 required timestamps"):
-        forecast.predict(days=1)
+        forecast.predict(
+            days=1,
+            origin=datetime(2026, 8, 12, 8, 45, tzinfo=timezone.utc),
+        )
 
 
 @pytest.mark.parametrize(
