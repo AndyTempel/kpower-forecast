@@ -106,6 +106,64 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     assert baseline_result["ds"].iloc[0] == pd.Timestamp("2024-01-01T08:00:00Z")
 
 
+def test_ml_forecast_calibrates_against_sanitized_predictions(
+    monkeypatch, tmp_path
+) -> None:
+    forecast = KPowerMLForecast(
+        model_id="sanitized-calibration",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+
+    class NegativeCalibrationBackend:
+        def fit(
+            self,
+            history: pd.DataFrame,
+            features: pd.DataFrame,
+            calibration: pd.DataFrame,
+        ) -> None:
+            return None
+
+        def predict(self, future_features: pd.DataFrame, horizon: int) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "ds": future_features["ds"].iloc[:horizon],
+                    "yhat": [-1.0] * horizon,
+                }
+            )
+
+        def save(self, path: Path) -> dict[str, str]:
+            return {}
+
+        def feature_schema(self) -> list[str]:
+            return []
+
+    forecast.backend = cast(Any, NegativeCalibrationBackend())
+    history = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", periods=8, freq="h", tz="UTC"),
+            "y": [1.0] * 8,
+        }
+    )
+    weather = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", periods=8, freq="h", tz="UTC"),
+            "temperature_2m": [10.0] * 8,
+        }
+    )
+    monkeypatch.setattr(
+        forecast.weather_client, "fetch_historical", lambda start, end: weather
+    )
+
+    forecast.train(history, force=True)
+
+    assert set(forecast.conformal.quantiles.values()) == {1.0}
+
+
 def test_ml_forecast_aligns_backend_grid_and_slices_explicit_origin(
     monkeypatch, tmp_path
 ) -> None:

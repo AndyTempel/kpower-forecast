@@ -125,6 +125,7 @@ class KPowerMLForecast:
         calibration_predictions = self.backend.predict(
             calibration_features, horizon=len(calibration_frame)
         )
+        calibration_predictions = self._sanitize_point_forecast(calibration_predictions)
         self.conformal.fit(
             actual=calibration_frame["y"], predicted=calibration_predictions["yhat"]
         )
