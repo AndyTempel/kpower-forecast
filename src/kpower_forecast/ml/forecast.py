@@ -32,7 +32,7 @@ DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "curtailment_limit_kw",
     "limit_kw",
 )
-SANITIZED_CONFORMAL_STATE_VERSION = 1
+SANITIZED_CONFORMAL_STATE_VERSION: int = 1
 
 
 class KPowerMLForecast:
