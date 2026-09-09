@@ -147,3 +147,23 @@ def test_gap_preserving_cumulative_requires_adjacent_readings() -> None:
         preserve_gaps=True,
     )
     assert result["y"].isna().all()
+
+
+def test_gap_preserving_power_clips_negative_values_without_filling_gap() -> None:
+    frame = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(
+                ["2026-01-01T00:00:00Z", "2026-01-01T00:30:00Z"], utc=True
+            ),
+            "y": [-100.0, 400.0],
+        }
+    )
+    result = normalize_to_instant_kwh(
+        frame,
+        category="power",
+        unit="W",
+        target_interval_min=15,
+        preserve_gaps=True,
+    )
+    assert result["y"].iloc[0] == 0.0
+    assert pd.isna(result["y"].iloc[1])

@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 
@@ -27,3 +28,10 @@ def test_ml_storage_round_trips_training_frame(tmp_path) -> None:
     storage.save_training_frame(frame)
 
     pd.testing.assert_frame_equal(storage.load_training_frame(), frame)
+
+
+def test_corrupt_manifest_is_distinct_from_absent_manifest(tmp_path) -> None:
+    storage = MLModelStorage(storage_path=str(tmp_path), model_id="broken")
+    storage.manifest_path.write_text("{truncated", encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest is corrupt"):
+        storage.load_manifest()

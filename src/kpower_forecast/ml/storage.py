@@ -69,8 +69,10 @@ class MLModelStorage:
             with self.manifest_path.open(encoding="utf-8") as file:
                 payload = json.load(file)
             return MLModelManifest.model_validate(payload)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"model manifest is corrupt or incompatible: {self.manifest_path}"
+            ) from exc
 
     def save_training_frame(self, df: pd.DataFrame) -> None:
         """Persist prepared ML training data for later update/debug workflows."""

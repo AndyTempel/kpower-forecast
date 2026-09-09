@@ -121,10 +121,14 @@ class KPowerMLForecast:
             preserve_gaps=self.config.preserve_gaps,
         )
         prepared = self._prepare_training_data(normalized)
+        prepared_features = self.feature_builder.build(prepared)
+        prepared, prepared_features = self._latest_contiguous_observations(
+            prepared, prepared_features
+        )
         train_frame, calibration_frame = self._chronological_split(prepared)
         train_features = self.feature_builder.build(train_frame)
         calibration_features = self.feature_builder.build(calibration_frame)
-        full_features = self.feature_builder.build(prepared)
+        full_features = prepared_features
         self._training_end = pd.to_datetime(prepared["ds"], utc=True).max()
 
         self.bias_corrector.fit_from_historical_proxy(train_frame)
@@ -498,7 +502,7 @@ class KPowerMLForecast:
         *,
         days: int,
         origin: datetime,
-        timezone: str = "UTC",
+        timezone: str | None = None,
     ) -> pd.DataFrame:
         """Generate the leakage-safe fallback forecast from persisted history."""
         history = self.storage.load_training_frame()
@@ -510,7 +514,7 @@ class KPowerMLForecast:
             origin=origin,
             periods=periods,
             interval_minutes=self.config.interval_minutes,
-            timezone=timezone,
+            timezone=timezone or self.config.timezone,
         )
 
     def _coerce_timestamp(self, value: object) -> pd.Timestamp:
@@ -562,7 +566,22 @@ class KPowerMLForecast:
         prepared[weather_columns] = (
             prepared[weather_columns].interpolate().bfill().ffill()
         )
-        return prepared.dropna(subset=["y"]).reset_index(drop=True)
+        return prepared.reset_index(drop=True)
+
+    @staticmethod
+    def _latest_contiguous_observations(
+        prepared: pd.DataFrame, features: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        valid = pd.to_numeric(prepared["y"], errors="coerce").notna()
+        groups = (~valid).cumsum()
+        if not valid.any():
+            raise ValueError("training history has no usable target observations")
+        latest_group = groups.loc[valid].iloc[-1]
+        selected = valid & groups.eq(latest_group)
+        return (
+            prepared.loc[selected].reset_index(drop=True),
+            features.loc[selected].reset_index(drop=True),
+        )
 
     def _chronological_split(
         self, df: pd.DataFrame

@@ -1,15 +1,5 @@
 # ☀️ KPower Forecast 📈
 
-## Time and history contract
-
-Forecast timestamps and the `ds` grid remain UTC. ML calendar and holiday features are derived
-temporarily in the configured IANA timezone. Artifact contract version 3 records that timezone and
-history policy version 1, so incompatible artifacts are retrained before prediction.
-
-Callers can enable `preserve_gaps`. Power samples are then converted independently using the fixed
-interval duration, cumulative energy is differenced only across adjacent valid samples, and missing
-target intervals remain missing through normalization and feature construction.
-
 [![PyPI version](https://img.shields.io/pypi/v/kpower-forecast.svg)](https://pypi.org/project/kpower-forecast/)
 [![Python versions](https://img.shields.io/pypi/pyversions/kpower-forecast.svg)](https://pypi.org/project/kpower-forecast/)
 [![CI](https://github.com/akorenc/kpower-forecast/actions/workflows/ci.yml/badge.svg)](https://github.com/AndyTempel/kpower-forecast/actions/workflows/ci.yml)
@@ -152,6 +142,18 @@ predicted interval energy to account for inverter clipping and static export
 curtailment. `predict(dynamic_export_limits=...)` also accepts a dataframe with
 `ds` plus `export_limit_kw`, `grid_export_limit_kw`, `curtailment_limit_kw`, or
 `limit_kw` for time-varying export controls.
+
+---
+
+## Time and history contract
+
+Forecast timestamps and the `ds` grid remain UTC. ML calendar and holiday features are derived
+temporarily in the configured IANA timezone. Artifact contract version 3 records that timezone and
+history policy version 1, so incompatible artifacts are retrained before prediction.
+
+Callers can enable `preserve_gaps`. Power samples are then converted independently using the fixed
+interval duration, cumulative energy is differenced only across adjacent valid samples, and missing
+target intervals remain missing through normalization and feature construction.
 
 ---
 

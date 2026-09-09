@@ -102,6 +102,7 @@ def normalize_to_instant_kwh(
             values = values.diff().where(adjacent).clip(lower=0.0)
         elif category != "instant_energy":
             raise ValueError(f"Unsupported data category: {category}")
+        values = values.clip(lower=0.0)
         return pd.DataFrame({"ds": target_index, "y": values.to_numpy()})
 
     # 2. Construct Continuous Cumulative Series
