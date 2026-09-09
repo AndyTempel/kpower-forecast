@@ -41,7 +41,7 @@ pip install "kpower-forecast[ml]"
 
 # With NeuralForecast / AI forecasting support
 pip install "kpower-forecast[ai]"
-```
+ ```
 
 ### 🖥️ CLI Usage
 
