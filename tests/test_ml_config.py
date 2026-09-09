@@ -10,6 +10,22 @@ def test_ml_config_defaults_to_nixtla_hybrid() -> None:
     assert config.backend == MLBackendType.NIXTLA_HYBRID
     assert config.forecast_type == MLForecastType.SOLAR
     assert config.interval_levels == [50, 80, 90]
+    assert config.timezone == "UTC"
+
+
+def test_ml_config_validates_timezone() -> None:
+    config = KPowerMLConfig(
+        model_id="local",
+        latitude=46.0,
+        longitude=14.0,
+        timezone="Europe/Ljubljana",
+    )
+    assert config.timezone == "Europe/Ljubljana"
+
+    with pytest.raises(ValueError, match="invalid IANA timezone"):
+        KPowerMLConfig(
+            model_id="bad", latitude=46.0, longitude=14.0, timezone="Mars/Base"
+        )
 
 
 def test_ml_config_accepts_neuralforecast_backend() -> None:

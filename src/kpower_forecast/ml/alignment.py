@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pandas as pd
 
-FORECAST_CONTRACT_VERSION = 2
+FORECAST_CONTRACT_VERSION = 3
 
 
 class ForecastAlignmentError(ValueError):

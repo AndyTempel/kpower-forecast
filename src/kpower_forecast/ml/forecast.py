@@ -33,6 +33,7 @@ DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "limit_kw",
 )
 SANITIZED_CONFORMAL_STATE_VERSION: int = 1
+HISTORY_POLICY_VERSION: int = 1
 
 
 class KPowerMLForecast:
@@ -48,6 +49,8 @@ class KPowerMLForecast:
         forecast_type: MLForecastType = MLForecastType.SOLAR,
         backend: MLBackendType = MLBackendType.NIXTLA_HYBRID,
         weather_config: Optional[WeatherConfig] = None,
+        timezone: str = "UTC",
+        preserve_gaps: bool = False,
         **config_overrides: Any,
     ):
         self.config = KPowerMLConfig(
@@ -56,6 +59,8 @@ class KPowerMLForecast:
             longitude=longitude,
             storage_path=storage_path,
             interval_minutes=interval_minutes,
+            timezone=timezone,
+            preserve_gaps=preserve_gaps,
             forecast_type=forecast_type,
             backend=backend,
             **config_overrides,
@@ -113,12 +118,17 @@ class KPowerMLForecast:
             category=self.config.data_category.value,
             unit=self.config.unit.value,
             target_interval_min=self.config.interval_minutes,
+            preserve_gaps=self.config.preserve_gaps,
         )
-        prepared = self._prepare_training_data(normalized)
+        complete_history = self._prepare_training_data(normalized)
+        prepared_features = self.feature_builder.build(complete_history)
+        prepared, prepared_features = self._latest_contiguous_observations(
+            complete_history, prepared_features
+        )
         train_frame, calibration_frame = self._chronological_split(prepared)
         train_features = self.feature_builder.build(train_frame)
         calibration_features = self.feature_builder.build(calibration_frame)
-        full_features = self.feature_builder.build(prepared)
+        full_features = prepared_features
         self._training_end = pd.to_datetime(prepared["ds"], utc=True).max()
 
         self.bias_corrector.fit_from_historical_proxy(train_frame)
@@ -132,6 +142,7 @@ class KPowerMLForecast:
         )
         self.backend.fit(prepared, full_features, calibration_frame)
 
+        self.storage.invalidate_manifest()
         manifest = MLModelManifest(
             contract_version=FORECAST_CONTRACT_VERSION,
             model_id=self.config.model_id,
@@ -151,9 +162,12 @@ class KPowerMLForecast:
                 "sanitized_conformal_state_version": (
                     SANITIZED_CONFORMAL_STATE_VERSION
                 ),
+                "timezone": self.config.timezone,
+                "history_policy_version": HISTORY_POLICY_VERSION,
+                "preserve_gaps": self.config.preserve_gaps,
             },
         )
-        self.storage.save_training_frame(prepared)
+        self.storage.save_training_frame(complete_history)
         self.storage.save_manifest(manifest)
 
     def predict(
@@ -398,6 +412,12 @@ class KPowerMLForecast:
         manifest = self.storage.load_manifest()
         if manifest is None:
             return
+        if manifest.metadata.get("timezone") != self.config.timezone:
+            return
+        if manifest.metadata.get("history_policy_version") != HISTORY_POLICY_VERSION:
+            return
+        if manifest.metadata.get("preserve_gaps") != self.config.preserve_gaps:
+            return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         if (
@@ -422,6 +442,18 @@ class KPowerMLForecast:
             raise ForecastAlignmentError(
                 "stored model conformal state predates point-forecast sanitation; "
                 "a full retrain is required"
+            )
+        if manifest.metadata.get("timezone") != self.config.timezone:
+            raise ForecastAlignmentError(
+                "stored model timezone requires a full retrain"
+            )
+        if manifest.metadata.get("history_policy_version") != HISTORY_POLICY_VERSION:
+            raise ForecastAlignmentError(
+                "stored model history policy requires a full retrain"
+            )
+        if manifest.metadata.get("preserve_gaps") != self.config.preserve_gaps:
+            raise ForecastAlignmentError(
+                "stored model gap-preservation mode requires a full retrain"
             )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
@@ -477,7 +509,7 @@ class KPowerMLForecast:
         *,
         days: int,
         origin: datetime,
-        timezone: str = "UTC",
+        timezone: str | None = None,
     ) -> pd.DataFrame:
         """Generate the leakage-safe fallback forecast from persisted history."""
         history = self.storage.load_training_frame()
@@ -489,7 +521,7 @@ class KPowerMLForecast:
             origin=origin,
             periods=periods,
             interval_minutes=self.config.interval_minutes,
-            timezone=timezone,
+            timezone=timezone or self.config.timezone,
         )
 
     def _coerce_timestamp(self, value: object) -> pd.Timestamp:
@@ -541,7 +573,22 @@ class KPowerMLForecast:
         prepared[weather_columns] = (
             prepared[weather_columns].interpolate().bfill().ffill()
         )
-        return prepared.dropna(subset=["y"]).reset_index(drop=True)
+        return prepared.reset_index(drop=True)
+
+    @staticmethod
+    def _latest_contiguous_observations(
+        prepared: pd.DataFrame, features: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        valid = pd.to_numeric(prepared["y"], errors="coerce").notna()
+        groups = (~valid).cumsum()
+        if not valid.any():
+            raise ValueError("training history has no usable target observations")
+        latest_group = groups.loc[valid].iloc[-1]
+        selected = valid & groups.eq(latest_group)
+        return (
+            prepared.loc[selected].reset_index(drop=True),
+            features.loc[selected].reset_index(drop=True),
+        )
 
     def _chronological_split(
         self, df: pd.DataFrame

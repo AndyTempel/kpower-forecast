@@ -1,6 +1,7 @@
 """Nixtla hybrid backend using StatsForecast and MLForecast."""
 
 import json
+import math
 from pathlib import Path
 from typing import Any, cast
 
@@ -68,6 +69,24 @@ class NixtlaHybridBackend:
         if history.empty:
             raise ValueError("history must not be empty")
 
+        timestamps = pd.to_datetime(history["ds"], utc=True)
+        values = pd.to_numeric(history["y"], errors="coerce")
+        if not values.map(math.isfinite).all():
+            raise ValueError("history targets must be finite")
+        expected_delta = pd.Timedelta(minutes=self.config.interval_minutes)
+        if (
+            len(timestamps) > 1
+            and not timestamps.diff().iloc[1:].eq(expected_delta).all()
+        ):
+            raise ValueError(
+                "history timestamps must form one contiguous interval grid"
+            )
+        seasonal_length = 24 if self.config.interval_minutes == 60 else 96
+        if len(history) < seasonal_length + 1:
+            raise ValueError(
+                f"history requires at least {seasonal_length + 1} contiguous rows"
+            )
+
         self._feature_columns = self._select_feature_columns(features)
         self._last_observed = float(history["y"].iloc[-1])
         self._last_train_ds = pd.to_datetime(history["ds"], utc=True).max()
@@ -80,7 +99,6 @@ class NixtlaHybridBackend:
         from statsforecast.models import AutoETS, SeasonalNaive
 
         nixtla_history = to_nixtla_frame(history, self.config.model_id)
-        seasonal_length = 24 if self.config.interval_minutes == 60 else 96
         self._fit_solar_profile(history=history, features=features)
         self._stats_model = StatsForecast(
             models=[SeasonalNaive(season_length=seasonal_length), AutoETS()],

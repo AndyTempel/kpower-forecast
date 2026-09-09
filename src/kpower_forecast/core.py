@@ -45,6 +45,7 @@ class KPowerConfig(BaseModel):
     longitude: float = Field(..., ge=-180, le=180)
     storage_path: str = "./data"
     interval_minutes: int = Field(15)
+    preserve_gaps: bool = False
     forecast_type: Literal["solar", "consumption"] = "solar"
     data_category: DataCategory = DataCategory.INSTANT_ENERGY
     unit: MeasurementUnit = MeasurementUnit.KWH
@@ -91,6 +92,7 @@ class KPowerForecast:
         inverter_ac_limit_kw: Optional[float] = None,
         grid_export_limit_kw: Optional[float] = None,
         weather_config: Optional[WeatherConfig] = None,
+        preserve_gaps: bool = False,
     ):
         self.config = KPowerConfig(
             model_id=model_id,
@@ -98,6 +100,7 @@ class KPowerForecast:
             longitude=longitude,
             storage_path=storage_path,
             interval_minutes=interval_minutes,
+            preserve_gaps=preserve_gaps,
             forecast_type=forecast_type,
             data_category=data_category,
             unit=unit,
@@ -753,6 +756,7 @@ class KPowerForecast:
             category=self.config.data_category.value,
             unit=self.config.unit.value,
             target_interval_min=self.config.interval_minutes,
+            preserve_gaps=self.config.preserve_gaps,
         )
 
         df = self._prepare_training_data(history_df)
@@ -891,6 +895,7 @@ class KPowerForecast:
             category=self.config.data_category.value,
             unit=self.config.unit.value,
             target_interval_min=self.config.interval_minutes,
+            preserve_gaps=self.config.preserve_gaps,
         )
         new_prepared = self._prepare_training_data(new_norm)
 

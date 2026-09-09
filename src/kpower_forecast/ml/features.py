@@ -22,9 +22,10 @@ class MLFeatureBuilder:
         features = df.copy()
         features["ds"] = pd.to_datetime(features["ds"], utc=True)
         ds = features["ds"]
-        hour = ds.dt.hour + ds.dt.minute / 60.0
-        day_of_week = ds.dt.dayofweek.astype(float)
-        day_of_year = ds.dt.dayofyear.astype(float)
+        local_ds = ds.dt.tz_convert(self.config.timezone)
+        hour = local_ds.dt.hour + local_ds.dt.minute / 60.0
+        day_of_week = local_ds.dt.dayofweek.astype(float)
+        day_of_year = local_ds.dt.dayofyear.astype(float)
 
         features["hour_sin"] = (2.0 * math.pi * hour / 24.0).map(math.sin)
         features["hour_cos"] = (2.0 * math.pi * hour / 24.0).map(math.cos)
@@ -32,8 +33,8 @@ class MLFeatureBuilder:
         features["dow_cos"] = (2.0 * math.pi * day_of_week / 7.0).map(math.cos)
         features["doy_sin"] = (2.0 * math.pi * day_of_year / 366.0).map(math.sin)
         features["doy_cos"] = (2.0 * math.pi * day_of_year / 366.0).map(math.cos)
-        features["is_weekend"] = ds.dt.dayofweek.isin([5, 6]).astype(int)
-        features["is_holiday"] = self._holiday_flags(ds)
+        features["is_weekend"] = local_ds.dt.dayofweek.isin([5, 6]).astype(int)
+        features["is_holiday"] = self._holiday_flags(local_ds)
 
         indexed = features.set_index("ds")
         if isinstance(indexed.index, pd.DatetimeIndex):
@@ -80,7 +81,11 @@ class MLFeatureBuilder:
                 "heating_degree", 0.0
             ) + features.get("cooling_degree", 0.0)
 
-        return features.fillna(0.0)
+        fill_columns = [
+            column for column in features.columns if column not in {"ds", "y"}
+        ]
+        features[fill_columns] = features[fill_columns].fillna(0.0)
+        return features
 
     def _holiday_flags(self, ds: pd.Series) -> pd.Series:
         """Return holiday flags for configured country/subdivision."""

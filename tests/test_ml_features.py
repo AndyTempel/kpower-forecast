@@ -1,4 +1,7 @@
+import math
+
 import pandas as pd
+import pytest
 
 from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
 from kpower_forecast.ml.features import MLFeatureBuilder
@@ -40,3 +43,28 @@ def test_feature_builder_adds_calendar_physics_and_rolling_features() -> None:
     }
     assert expected.issubset(features.columns)
     assert features["wind_speed_10m"].tolist() == [5.0, 5.0, 5.0, 5.0]
+
+
+@pytest.mark.parametrize(
+    ("timestamps", "expected_hours"),
+    [
+        (["2026-03-29T00:00:00Z", "2026-03-29T01:00:00Z"], [1.0, 3.0]),
+        (["2026-10-25T00:00:00Z", "2026-10-25T01:00:00Z"], [2.0, 2.0]),
+    ],
+)
+def test_calendar_features_use_local_time_without_changing_ds(
+    timestamps: list[str], expected_hours: list[float]
+) -> None:
+    config = KPowerMLConfig(
+        model_id="dst",
+        latitude=46.0,
+        longitude=14.0,
+        timezone="Europe/Ljubljana",
+    )
+    frame = pd.DataFrame({"ds": pd.to_datetime(timestamps, utc=True)})
+    features = MLFeatureBuilder(config).build(frame)
+
+    assert features["ds"].tolist() == frame["ds"].tolist()
+    assert features["hour_sin"].tolist() == pytest.approx(
+        [math.sin(2 * math.pi * hour / 24) for hour in expected_hours]
+    )
