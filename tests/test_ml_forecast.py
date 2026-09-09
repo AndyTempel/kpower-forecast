@@ -151,6 +151,7 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     assert manifest.contract_version == FORECAST_CONTRACT_VERSION
     assert manifest.package_version == "2026.9.0"
     assert manifest.metadata["sanitized_conformal_state_version"] == 1
+    assert manifest.metadata["preserve_gaps"] is False
     assert forecast.training_end == datetime(2024, 1, 1, 7, tzinfo=timezone.utc)
 
     restored = KPowerMLForecast(
@@ -671,6 +672,54 @@ def test_ml_forecast_invalidates_conformal_state_from_before_point_sanitation(
     with pytest.raises(
         ForecastAlignmentError,
         match="conformal state predates point-forecast sanitation",
+    ):
+        forecast.train(pd.DataFrame(), force=False)
+
+
+@pytest.mark.parametrize(
+    ("stored_mode", "configured_mode"),
+    [(False, True), (True, False), (None, False)],
+)
+def test_ml_forecast_rejects_incompatible_gap_preservation_mode(
+    tmp_path, stored_mode, configured_mode
+) -> None:
+    metadata = {
+        "timezone": "UTC",
+        "history_policy_version": 1,
+        "sanitized_conformal_state_version": 1,
+    }
+    if stored_mode is not None:
+        metadata["preserve_gaps"] = stored_mode
+    storage = MLModelStorage(str(tmp_path), "gap-mode")
+    storage.save_manifest(
+        MLModelManifest(
+            contract_version=FORECAST_CONTRACT_VERSION,
+            model_id="gap-mode",
+            backend_type=MLBackendType.NEURALFORECAST.value,
+            target_type=MLForecastType.CONSUMPTION.value,
+            interval_levels=[50, 80, 90],
+            feature_columns=[],
+            training_end="2026-08-12T08:30:00Z",
+            package_version="2026.9.0",
+            metadata=metadata,
+        )
+    )
+
+    forecast = KPowerMLForecast(
+        model_id="gap-mode",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+        preserve_gaps=configured_mode,
+    )
+
+    assert forecast.training_end is None
+    with pytest.raises(
+        ForecastAlignmentError,
+        match="gap-preservation mode requires a full retrain",
     ):
         forecast.train(pd.DataFrame(), force=False)
 

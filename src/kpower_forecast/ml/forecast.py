@@ -164,6 +164,7 @@ class KPowerMLForecast:
                 ),
                 "timezone": self.config.timezone,
                 "history_policy_version": HISTORY_POLICY_VERSION,
+                "preserve_gaps": self.config.preserve_gaps,
             },
         )
         self.storage.save_training_frame(complete_history)
@@ -415,6 +416,8 @@ class KPowerMLForecast:
             return
         if manifest.metadata.get("history_policy_version") != HISTORY_POLICY_VERSION:
             return
+        if manifest.metadata.get("preserve_gaps") != self.config.preserve_gaps:
+            return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         if (
@@ -447,6 +450,10 @@ class KPowerMLForecast:
         if manifest.metadata.get("history_policy_version") != HISTORY_POLICY_VERSION:
             raise ForecastAlignmentError(
                 "stored model history policy requires a full retrain"
+            )
+        if manifest.metadata.get("preserve_gaps") != self.config.preserve_gaps:
+            raise ForecastAlignmentError(
+                "stored model gap-preservation mode requires a full retrain"
             )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
