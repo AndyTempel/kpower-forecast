@@ -70,6 +70,7 @@ def normalize_to_instant_kwh(
     category: str,
     unit: str,
     target_interval_min: int = 15,
+    preserve_gaps: bool = False,
 ) -> pd.DataFrame:
     """
     Normalizes input data to 'instant_energy' in 'kWh' with consistent intervals.
@@ -82,6 +83,26 @@ def normalize_to_instant_kwh(
 
     # 1. Convert units to kWh base (kW for power)
     df = convert_units(df, from_unit=unit, to_unit="kWh")
+
+    if preserve_gaps:
+        frequency = f"{target_interval_min}min"
+        if df.empty:
+            return pd.DataFrame(columns=["ds", "y"])
+        aligned = df["ds"].eq(df["ds"].dt.floor(frequency))
+        if not bool(aligned.all()):
+            raise ValueError("gap-preserving history must be interval-aligned")
+        target_index = pd.date_range(
+            start=df["ds"].min(), end=df["ds"].max(), freq=frequency, tz="UTC"
+        )
+        values = df.set_index("ds")["y"].reindex(target_index)
+        if category == "power":
+            values = values * (target_interval_min / 60.0)
+        elif category == "cumulative_energy":
+            adjacent = values.notna() & values.shift(1).notna()
+            values = values.diff().where(adjacent).clip(lower=0.0)
+        elif category != "instant_energy":
+            raise ValueError(f"Unsupported data category: {category}")
+        return pd.DataFrame({"ds": target_index, "y": values.to_numpy()})
 
     # 2. Construct Continuous Cumulative Series
     if category == "instant_energy":

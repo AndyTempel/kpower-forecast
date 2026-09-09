@@ -108,3 +108,42 @@ def test_normalize_instant_energy_resampling():
 
     # 10:00 to 10:15 span
     assert res["y"].sum() == pytest.approx(0.3)  # 10:15 is the start of next bin
+
+
+def test_gap_preserving_power_does_not_bridge_missing_intervals() -> None:
+    frame = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(
+                ["2026-01-01T00:00:00Z", "2026-01-01T00:30:00Z"], utc=True
+            ),
+            "y": [1000.0, 1000.0],
+        }
+    )
+    result = normalize_to_instant_kwh(
+        frame,
+        category="power",
+        unit="W",
+        target_interval_min=15,
+        preserve_gaps=True,
+    )
+    assert result["y"].iloc[0] == pytest.approx(0.25)
+    assert pd.isna(result["y"].iloc[1])
+    assert result["y"].iloc[2] == pytest.approx(0.25)
+
+
+def test_gap_preserving_cumulative_requires_adjacent_readings() -> None:
+    frame = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(
+                ["2026-01-01T00:00:00Z", "2026-01-01T00:30:00Z"], utc=True
+            ),
+            "y": [10.0, 12.0],
+        }
+    )
+    result = normalize_to_instant_kwh(
+        frame,
+        category="cumulative_energy",
+        unit="kWh",
+        preserve_gaps=True,
+    )
+    assert result["y"].isna().all()

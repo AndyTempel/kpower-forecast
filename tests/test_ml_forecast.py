@@ -71,7 +71,7 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     manifest = forecast.storage.load_manifest()
     assert manifest is not None
     assert manifest.contract_version == FORECAST_CONTRACT_VERSION
-    assert manifest.package_version == "2026.8.1"
+    assert manifest.package_version == "2026.9.0"
     assert manifest.metadata["sanitized_conformal_state_version"] == 1
     assert forecast.training_end == datetime(2024, 1, 1, 7, tzinfo=timezone.utc)
 

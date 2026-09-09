@@ -1,6 +1,7 @@
 """Storage helpers for optional ML model artifacts."""
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -49,16 +50,27 @@ class MLModelStorage:
     def save_manifest(self, manifest: MLModelManifest) -> None:
         """Persist a manifest atomically enough for local single-process use."""
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        with self.manifest_path.open("w", encoding="utf-8") as file:
+        temporary = self.manifest_path.with_suffix(".json.tmp")
+        with temporary.open("w", encoding="utf-8") as file:
             json.dump(manifest.model_dump(mode="json"), file, indent=2, sort_keys=True)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(self.manifest_path)
+
+    def invalidate_manifest(self) -> None:
+        """Remove the completion marker before replacing model artifacts."""
+        self.manifest_path.unlink(missing_ok=True)
 
     def load_manifest(self) -> Optional[MLModelManifest]:
         """Load the active manifest, returning None when absent."""
         if not self.manifest_path.exists():
             return None
-        with self.manifest_path.open(encoding="utf-8") as file:
-            payload = json.load(file)
-        return MLModelManifest.model_validate(payload)
+        try:
+            with self.manifest_path.open(encoding="utf-8") as file:
+                payload = json.load(file)
+            return MLModelManifest.model_validate(payload)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
 
     def save_training_frame(self, df: pd.DataFrame) -> None:
         """Persist prepared ML training data for later update/debug workflows."""

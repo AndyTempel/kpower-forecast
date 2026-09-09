@@ -2,6 +2,7 @@
 
 from enum import Enum
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -32,6 +33,8 @@ class KPowerMLConfig(BaseModel):
     longitude: float = Field(..., ge=-180, le=180)
     storage_path: str = "./data"
     interval_minutes: int = Field(default=15)
+    timezone: str = "UTC"
+    preserve_gaps: bool = False
     forecast_type: MLForecastType = MLForecastType.SOLAR
     data_category: DataCategory = DataCategory.INSTANT_ENERGY
     unit: MeasurementUnit = MeasurementUnit.KWH
@@ -52,6 +55,16 @@ class KPowerMLConfig(BaseModel):
         """Validate supported forecast grid intervals."""
         if value not in (15, 60):
             raise ValueError("interval_minutes must be 15 or 60")
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def check_timezone(cls, value: str) -> str:
+        """Require an explicit valid IANA timezone name."""
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"invalid IANA timezone: {value}") from exc
         return value
 
     @field_validator("interval_levels")
