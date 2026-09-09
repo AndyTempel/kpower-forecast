@@ -84,7 +84,6 @@ class KPowerForecast:
         longitude: float,
         storage_path: str = "./data",
         interval_minutes: int = 15,
-        preserve_gaps: bool = False,
         forecast_type: Literal["solar", "consumption"] = "solar",
         data_category: DataCategory = DataCategory.INSTANT_ENERGY,
         unit: MeasurementUnit = MeasurementUnit.KWH,
@@ -93,6 +92,7 @@ class KPowerForecast:
         inverter_ac_limit_kw: Optional[float] = None,
         grid_export_limit_kw: Optional[float] = None,
         weather_config: Optional[WeatherConfig] = None,
+        preserve_gaps: bool = False,
     ):
         self.config = KPowerConfig(
             model_id=model_id,

@@ -46,11 +46,11 @@ class KPowerMLForecast:
         longitude: float,
         storage_path: str = "./data",
         interval_minutes: int = 15,
-        timezone: str = "UTC",
-        preserve_gaps: bool = False,
         forecast_type: MLForecastType = MLForecastType.SOLAR,
         backend: MLBackendType = MLBackendType.NIXTLA_HYBRID,
         weather_config: Optional[WeatherConfig] = None,
+        timezone: str = "UTC",
+        preserve_gaps: bool = False,
         **config_overrides: Any,
     ):
         self.config = KPowerMLConfig(
@@ -120,10 +120,10 @@ class KPowerMLForecast:
             target_interval_min=self.config.interval_minutes,
             preserve_gaps=self.config.preserve_gaps,
         )
-        prepared = self._prepare_training_data(normalized)
-        prepared_features = self.feature_builder.build(prepared)
+        complete_history = self._prepare_training_data(normalized)
+        prepared_features = self.feature_builder.build(complete_history)
         prepared, prepared_features = self._latest_contiguous_observations(
-            prepared, prepared_features
+            complete_history, prepared_features
         )
         train_frame, calibration_frame = self._chronological_split(prepared)
         train_features = self.feature_builder.build(train_frame)
@@ -166,7 +166,7 @@ class KPowerMLForecast:
                 "history_policy_version": HISTORY_POLICY_VERSION,
             },
         )
-        self.storage.save_training_frame(prepared)
+        self.storage.save_training_frame(complete_history)
         self.storage.save_manifest(manifest)
 
     def predict(

@@ -19,6 +19,84 @@ from kpower_forecast.ml.dependencies import (
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 
 
+def test_ml_constructor_preserves_legacy_positional_argument_order(tmp_path) -> None:
+    forecast = KPowerMLForecast(
+        "legacy-positional",
+        46.0,
+        14.0,
+        str(tmp_path),
+        60,
+        MLForecastType.CONSUMPTION,
+        MLBackendType.NEURALFORECAST,
+    )
+
+    assert forecast.config.forecast_type == MLForecastType.CONSUMPTION
+    assert forecast.config.backend == MLBackendType.NEURALFORECAST
+    assert forecast.config.timezone == "UTC"
+    assert forecast.config.preserve_gaps is False
+
+
+def test_ml_training_persists_full_gapped_history_for_baseline(
+    monkeypatch, tmp_path
+) -> None:
+    forecast = KPowerMLForecast(
+        model_id="gapped-baseline",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+        preserve_gaps=True,
+    )
+    history = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", periods=10, freq="h", tz="UTC"),
+            "y": [1.0, 1.1, 1.2, 1.3, 1.4, float("nan"), 2.0, 2.1, 2.2, 2.3],
+        }
+    )
+    weather = pd.DataFrame(
+        {
+            "ds": history["ds"],
+            "temperature_2m": [10.0] * len(history),
+        }
+    )
+
+    class RecordingBackend:
+        fitted_lengths: list[int] = []
+
+        def fit(self, history, features, calibration) -> None:
+            self.fitted_lengths.append(len(history))
+
+        def predict(self, features, horizon):
+            return pd.DataFrame({"yhat": [1.0] * horizon})
+
+        def feature_schema(self):
+            return []
+
+        def save(self, artifact_dir):
+            return {}
+
+    backend = RecordingBackend()
+    forecast.backend = cast(Any, backend)
+    monkeypatch.setattr(
+        forecast.weather_client, "fetch_historical", lambda start, end: weather
+    )
+    monkeypatch.setattr(
+        forecast.weather_client,
+        "resample_weather",
+        lambda frame, interval_minutes: cast(pd.DataFrame, frame),
+    )
+
+    forecast.train(history, force=True)
+
+    stored = forecast.storage.load_training_frame()
+    assert stored is not None
+    assert len(stored) == len(history)
+    assert stored["y"].isna().sum() == 1
+    assert backend.fitted_lengths[-1] == 4
+
+
 def test_ml_forecast_train_predict_with_neuralforecast_backend(
     monkeypatch, tmp_path
 ) -> None:

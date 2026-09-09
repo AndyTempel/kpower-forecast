@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 from prophet import Prophet
 
-from kpower_forecast.core import KPowerForecast
+from kpower_forecast.core import DataCategory, KPowerForecast
 from kpower_forecast.utils import calculate_solar_elevation
 
 
@@ -29,6 +29,22 @@ def test_calculate_solar_elevation_uses_2026_without_pysolar_warning():
     assert len(elevations) == 4
     assert elevations[0] > 0.0
     assert not any("Leap seconds" in str(item.message) for item in warning_records)
+
+
+def test_constructor_preserves_legacy_positional_argument_order(tmp_path):
+    forecast = KPowerForecast(
+        "legacy-positional",
+        46.0,
+        14.5,
+        str(tmp_path),
+        60,
+        "consumption",
+        DataCategory.POWER,
+    )
+
+    assert forecast.config.forecast_type == "consumption"
+    assert forecast.config.data_category == DataCategory.POWER
+    assert forecast.config.preserve_gaps is False
 
 
 def test_calibrate_efficiency(sample_history):
