@@ -149,7 +149,7 @@ curtailment. `predict(dynamic_export_limits=...)` also accepts a dataframe with
 
 Forecast timestamps and the `ds` grid remain UTC. ML calendar and holiday features are derived
 temporarily in the configured IANA timezone. Artifact contract version 3 records that timezone and
-history policy version 1, so incompatible artifacts are retrained before prediction.
+history policy version 2, so incompatible artifacts are retrained before prediction.
 
 Callers can enable `preserve_gaps`. Power samples are then converted independently using the fixed
 interval duration, cumulative energy is differenced only across adjacent valid samples, and missing

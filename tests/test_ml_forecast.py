@@ -16,6 +16,7 @@ from kpower_forecast.ml.dependencies import (
     MissingMLDependencyError,
     ensure_optional_dependencies,
 )
+from kpower_forecast.ml.forecast import HISTORY_POLICY_VERSION
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 
 
@@ -94,7 +95,39 @@ def test_ml_training_persists_full_gapped_history_for_baseline(
     assert stored is not None
     assert len(stored) == len(history)
     assert stored["y"].isna().sum() == 1
-    assert backend.fitted_lengths[-1] == 4
+    assert backend.fitted_lengths[-1] == 9
+
+
+def test_gap_safe_split_uses_all_observations_and_contiguous_calibration(
+    tmp_path,
+) -> None:
+    forecast = KPowerMLForecast(
+        model_id="gap-safe-split",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+        preserve_gaps=True,
+    )
+    prepared = pd.DataFrame(
+        {
+            "ds": pd.date_range("2026-01-01", periods=20, freq="h", tz="UTC"),
+            "y": [1.0] * 8 + [float("nan")] * 3 + [2.0] * 9,
+        }
+    )
+    features = prepared[["ds"]].copy()
+
+    observed, _, train, calibration = forecast._gap_safe_training_split(
+        prepared, features
+    )
+
+    assert len(observed) == 17
+    assert observed["ds"].iloc[0] == prepared["ds"].iloc[0]
+    assert observed["ds"].iloc[-1] == prepared["ds"].iloc[-1]
+    assert calibration["ds"].diff().dropna().eq(pd.Timedelta(hours=1)).all()
+    assert train["ds"].iloc[-1] + pd.Timedelta(hours=1) == calibration["ds"].iloc[0]
 
 
 def test_ml_forecast_train_predict_with_neuralforecast_backend(
@@ -149,7 +182,7 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     manifest = forecast.storage.load_manifest()
     assert manifest is not None
     assert manifest.contract_version == FORECAST_CONTRACT_VERSION
-    assert manifest.package_version == "2026.9.0"
+    assert manifest.package_version == "2026.9.1"
     assert manifest.metadata["sanitized_conformal_state_version"] == 1
     assert manifest.metadata["preserve_gaps"] is False
     assert forecast.training_end == datetime(2024, 1, 1, 7, tzinfo=timezone.utc)
@@ -685,7 +718,7 @@ def test_ml_forecast_rejects_incompatible_gap_preservation_mode(
 ) -> None:
     metadata = {
         "timezone": "UTC",
-        "history_policy_version": 1,
+        "history_policy_version": HISTORY_POLICY_VERSION,
         "sanitized_conformal_state_version": 1,
     }
     if stored_mode is not None:

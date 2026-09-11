@@ -13,7 +13,7 @@ from kpower_forecast.ml.alignment import (
 from kpower_forecast.ml.config import KPowerMLConfig
 from kpower_forecast.ml.dependencies import ensure_optional_dependencies
 
-from .nixtla import to_nixtla_frame
+from .nixtla import to_segmented_nixtla_frame
 
 STATE_FILE = "state.json"
 MODEL_FILE = "neuralforecast.joblib"
@@ -72,7 +72,9 @@ class NeuralForecastBackend:
         )
         from neuralforecast import NeuralForecast
 
-        nixtla_history = to_nixtla_frame(history, self.config.model_id)
+        nixtla_history = to_segmented_nixtla_frame(
+            history, self.config.model_id, self.config.interval_minutes
+        )
         self._model = NeuralForecast(
             models=models,
             freq=f"{self.config.interval_minutes}min",
@@ -113,6 +115,10 @@ class NeuralForecastBackend:
                     "Retrain models with the requested horizon or omit custom models."
                 )
             forecast = self._model.predict().reset_index()
+            if "unique_id" in forecast.columns:
+                forecast = forecast.loc[
+                    forecast["unique_id"].eq(self.config.model_id)
+                ].reset_index(drop=True)
             validate_timestamp_grid(
                 forecast,
                 interval_minutes=self.config.interval_minutes,

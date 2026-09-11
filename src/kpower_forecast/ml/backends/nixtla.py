@@ -41,6 +41,25 @@ def to_nixtla_frame(df: pd.DataFrame, unique_id: str) -> pd.DataFrame:
     return output
 
 
+def to_segmented_nixtla_frame(
+    df: pd.DataFrame, unique_id: str, interval_minutes: int
+) -> pd.DataFrame:
+    """Convert observed rows to independent contiguous Nixtla series."""
+    output = to_nixtla_frame(df, unique_id)
+    timestamps = pd.to_datetime(output["ds"])
+    expected_delta = pd.Timedelta(minutes=interval_minutes)
+    segment_numbers = timestamps.diff().ne(expected_delta).cumsum()
+    latest_segment = int(segment_numbers.iloc[-1])
+    output["unique_id"] = segment_numbers.map(
+        lambda segment: (
+            unique_id
+            if int(segment) == latest_segment
+            else f"{unique_id}__segment_{int(segment)}"
+        )
+    )
+    return output
+
+
 class NixtlaHybridBackend:
     """StatsForecast structural model plus MLForecast residual model."""
 
@@ -69,22 +88,20 @@ class NixtlaHybridBackend:
         if history.empty:
             raise ValueError("history must not be empty")
 
-        timestamps = pd.to_datetime(history["ds"], utc=True)
         values = pd.to_numeric(history["y"], errors="coerce")
         if not values.map(math.isfinite).all():
             raise ValueError("history targets must be finite")
-        expected_delta = pd.Timedelta(minutes=self.config.interval_minutes)
-        if (
-            len(timestamps) > 1
-            and not timestamps.diff().iloc[1:].eq(expected_delta).all()
-        ):
-            raise ValueError(
-                "history timestamps must form one contiguous interval grid"
-            )
         seasonal_length = 24 if self.config.interval_minutes == 60 else 96
-        if len(history) < seasonal_length + 1:
+        segmented_history = to_segmented_nixtla_frame(
+            history, self.config.model_id, self.config.interval_minutes
+        )
+        structural_history = segmented_history.loc[
+            segmented_history["unique_id"].eq(self.config.model_id)
+        ].reset_index(drop=True)
+        if len(structural_history) < seasonal_length + 1:
             raise ValueError(
-                f"history requires at least {seasonal_length + 1} contiguous rows"
+                "latest history segment requires at least "
+                f"{seasonal_length + 1} contiguous rows"
             )
 
         self._feature_columns = self._select_feature_columns(features)
@@ -98,29 +115,31 @@ class NixtlaHybridBackend:
         from statsforecast import StatsForecast
         from statsforecast.models import AutoETS, SeasonalNaive
 
-        nixtla_history = to_nixtla_frame(history, self.config.model_id)
         self._fit_solar_profile(history=history, features=features)
         self._stats_model = StatsForecast(
             models=[SeasonalNaive(season_length=seasonal_length), AutoETS()],
             freq=f"{self.config.interval_minutes}min",
             n_jobs=1,
         )
-        self._stats_model.fit(nixtla_history)
+        self._stats_model.fit(structural_history)
 
         residual_training = self._build_residual_training_frame(
             history, features=features, seasonal_length=seasonal_length
         )
-        residual_training["unique_id"] = self.config.model_id
-        residual_training = residual_training[["unique_id", "ds", "y"]]
         residual_training["ds"] = pd.to_datetime(
             residual_training["ds"], utc=True
         ).dt.tz_localize(None)
         residual_training = pd.merge(
             residual_training,
-            self._build_exogenous_frame(features),
+            self._build_exogenous_frame(
+                features, unique_ids=residual_training["unique_id"]
+            ),
             on=["unique_id", "ds"],
             how="left",
-        ).fillna(0.0)
+        )
+        residual_training[self._feature_columns] = residual_training[
+            self._feature_columns
+        ].fillna(0.0)
 
         lgbm_params = {
             "n_estimators": 100,
@@ -176,10 +195,17 @@ class NixtlaHybridBackend:
     ) -> pd.DataFrame:
         """Build a residual target frame from seasonal-naive baseline errors."""
         residual_training = history[["ds", "y"]].copy()
+        segmented = to_segmented_nixtla_frame(
+            history, self.config.model_id, self.config.interval_minutes
+        )
+        residual_training.insert(0, "unique_id", segmented["unique_id"].to_numpy())
         solar_baseline = self._predict_solar_baseline(features)
         if solar_baseline is None:
-            fallback = residual_training["y"].expanding(min_periods=1).mean().shift(1)
-            baseline = residual_training["y"].shift(seasonal_length).fillna(fallback)
+            grouped = residual_training.groupby("unique_id", sort=False)["y"]
+            fallback = grouped.transform(
+                lambda values: values.expanding(min_periods=1).mean().shift(1)
+            )
+            baseline = grouped.shift(seasonal_length).fillna(fallback)
             baseline = baseline.fillna(self._last_observed)
         else:
             baseline = solar_baseline.reindex(residual_training.index).fillna(0.0)
@@ -263,7 +289,9 @@ class NixtlaHybridBackend:
                 feature_columns.append(column)
         return feature_columns
 
-    def _build_exogenous_frame(self, features: pd.DataFrame) -> pd.DataFrame:
+    def _build_exogenous_frame(
+        self, features: pd.DataFrame, unique_ids: pd.Series | None = None
+    ) -> pd.DataFrame:
         """Build Nixtla-compatible dynamic exogenous feature frame."""
         frame = features[["ds"]].copy()
         for column in self._feature_columns:
@@ -271,7 +299,15 @@ class NixtlaHybridBackend:
                 frame[column] = features[column]
             else:
                 frame[column] = 0.0
-        frame.insert(0, "unique_id", self.config.model_id)
+        frame.insert(
+            0,
+            "unique_id",
+            (
+                self.config.model_id
+                if unique_ids is None
+                else unique_ids.reset_index(drop=True)
+            ),
+        )
         frame["ds"] = pd.to_datetime(frame["ds"], utc=True).dt.tz_localize(None)
         for column in self._feature_columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
@@ -325,6 +361,7 @@ class NixtlaHybridBackend:
             forecast = self._residual_model.predict(
                 h=horizon,
                 X_df=self._build_exogenous_frame(future_features),
+                ids=[self.config.model_id],
             )
         except ValueError as exc:
             raise ForecastAlignmentError(

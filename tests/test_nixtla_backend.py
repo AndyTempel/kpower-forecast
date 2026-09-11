@@ -66,6 +66,49 @@ def test_solar_target_fits_solar_radiation_baseline() -> None:
     assert backend._predict_solar_baseline(features) is not None
 
 
+def test_nixtla_backend_trains_across_separate_observation_segments() -> None:
+    backend = NixtlaHybridBackend(
+        KPowerMLConfig(
+            model_id="consumption",
+            latitude=46.0,
+            longitude=14.0,
+            interval_minutes=15,
+            forecast_type=MLForecastType.CONSUMPTION,
+        )
+    )
+    timestamps = pd.date_range(
+        "2026-05-01", periods=24 * 30 * 4, freq="15min", tz="UTC"
+    )
+    history = (
+        pd.DataFrame(
+            {
+                "ds": timestamps,
+                "y": [float(1 + index % 96) for index in range(len(timestamps))],
+            }
+        )
+        .drop(index=range(200, 205))
+        .reset_index(drop=True)
+    )
+    features = pd.DataFrame(
+        {"ds": history["ds"], "temperature_2m": [10.0] * len(history)}
+    )
+
+    backend.fit(history, features, history.tail(24))
+    future = pd.DataFrame(
+        {
+            "ds": pd.date_range(
+                timestamps[-1] + pd.Timedelta(minutes=15), periods=4, freq="15min"
+            ),
+            "temperature_2m": [10.0] * 4,
+        }
+    )
+
+    result = backend.predict(future, horizon=4)
+
+    assert result["ds"].tolist() == future["ds"].tolist()
+    assert result["yhat"].notna().all()
+
+
 def test_nixtla_backend_runs_residual_on_exact_post_training_grid() -> None:
     backend = NixtlaHybridBackend(
         KPowerMLConfig(
@@ -96,8 +139,9 @@ def test_nixtla_backend_runs_residual_on_exact_post_training_grid() -> None:
     class ResidualModel:
         calls = 0
 
-        def predict(self, h: int, X_df: pd.DataFrame) -> pd.DataFrame:
+        def predict(self, h: int, X_df: pd.DataFrame, ids: list[str]) -> pd.DataFrame:
             self.calls += 1
+            assert ids == ["consumption"]
             return pd.DataFrame(
                 {
                     "unique_id": ["consumption"] * h,
@@ -150,7 +194,7 @@ def test_nixtla_backend_does_not_silence_residual_prediction_error() -> None:
     backend._last_train_ds = pd.Timestamp("2026-08-12T10:30:00Z")
 
     class RejectingResidualModel:
-        def predict(self, h: int, X_df: pd.DataFrame) -> pd.DataFrame:
+        def predict(self, h: int, X_df: pd.DataFrame, ids: list[str]) -> pd.DataFrame:
             raise ValueError("X_df does not match expected grid")
 
     backend._residual_model = RejectingResidualModel()
