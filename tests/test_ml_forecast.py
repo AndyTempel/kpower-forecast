@@ -130,6 +130,35 @@ def test_gap_safe_split_uses_all_observations_and_contiguous_calibration(
     assert train["ds"].iloc[-1] + pd.Timedelta(hours=1) == calibration["ds"].iloc[0]
 
 
+def test_gap_safe_split_preserves_structural_training_tail(tmp_path) -> None:
+    forecast = KPowerMLForecast(
+        model_id="structural-tail",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=15,
+        forecast_type=MLForecastType.CONSUMPTION,
+        preserve_gaps=True,
+    )
+    prepared = pd.DataFrame(
+        {
+            "ds": pd.date_range("2026-01-01", periods=1121, freq="15min", tz="UTC"),
+            "y": [1.0] * 1000 + [float("nan")] + [2.0] * 120,
+        }
+    )
+    features = prepared[["ds"]].copy()
+
+    observed, _, train, calibration = forecast._gap_safe_training_split(
+        prepared, features
+    )
+
+    assert len(observed) == 1120
+    assert len(calibration) == 23
+    recent_training = train.loc[train["ds"] > prepared["ds"].iloc[1000]]
+    assert len(recent_training) == 97
+    assert train["ds"].iloc[-1] + pd.Timedelta(minutes=15) == calibration["ds"].iloc[0]
+
+
 def test_ml_forecast_train_predict_with_neuralforecast_backend(
     monkeypatch, tmp_path
 ) -> None:

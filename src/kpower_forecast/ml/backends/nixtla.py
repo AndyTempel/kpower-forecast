@@ -74,6 +74,12 @@ class NixtlaHybridBackend:
         self._stats_model: Any = None
         self._residual_model: Any = None
 
+    @property
+    def minimum_contiguous_training_rows(self) -> int:
+        """Return the recent contiguous rows required by structural models."""
+        seasonal_length = 24 if self.config.interval_minutes == 60 else 96
+        return seasonal_length + 1
+
     def fit(
         self,
         history: pd.DataFrame,
@@ -91,7 +97,7 @@ class NixtlaHybridBackend:
         values = pd.to_numeric(history["y"], errors="coerce")
         if not values.map(math.isfinite).all():
             raise ValueError("history targets must be finite")
-        seasonal_length = 24 if self.config.interval_minutes == 60 else 96
+        seasonal_length = self.minimum_contiguous_training_rows - 1
         segmented_history = to_segmented_nixtla_frame(
             history, self.config.model_id, self.config.interval_minutes
         )

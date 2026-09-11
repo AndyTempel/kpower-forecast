@@ -589,12 +589,21 @@ class KPowerMLForecast:
         groups = (~valid).cumsum()
         latest_group = groups.loc[valid].iloc[-1]
         latest_indices = prepared.index[valid & groups.eq(latest_group)]
-        if len(latest_indices) < 2:
+        minimum_training_rows = max(
+            1,
+            int(getattr(self.backend, "minimum_contiguous_training_rows", 1)),
+        )
+        if len(latest_indices) <= minimum_training_rows:
             raise ValueError(
-                "at least two contiguous recent rows are required for ML calibration"
+                "latest contiguous history requires at least "
+                f"{minimum_training_rows + 1} rows to reserve calibration data"
             )
-        calibration_size = max(1, int(len(observed) * self.config.calibration_fraction))
-        calibration_size = min(calibration_size, len(latest_indices) - 1)
+        calibration_size = max(
+            1, int(len(latest_indices) * self.config.calibration_fraction)
+        )
+        calibration_size = min(
+            calibration_size, len(latest_indices) - minimum_training_rows
+        )
         calibration_indices = latest_indices[-calibration_size:]
         calibration_start = calibration_indices[0]
         train_mask = valid & (prepared.index < calibration_start)
