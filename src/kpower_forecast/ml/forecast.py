@@ -33,7 +33,7 @@ DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "limit_kw",
 )
 SANITIZED_CONFORMAL_STATE_VERSION: int = 1
-HISTORY_POLICY_VERSION: int = 1
+HISTORY_POLICY_VERSION: int = 2
 
 
 class KPowerMLForecast:
@@ -121,11 +121,10 @@ class KPowerMLForecast:
             preserve_gaps=self.config.preserve_gaps,
         )
         complete_history = self._prepare_training_data(normalized)
-        prepared_features = self.feature_builder.build(complete_history)
-        prepared, prepared_features = self._latest_contiguous_observations(
-            complete_history, prepared_features
+        complete_features = self.feature_builder.build(complete_history)
+        prepared, prepared_features, train_frame, calibration_frame = (
+            self._gap_safe_training_split(complete_history, complete_features)
         )
-        train_frame, calibration_frame = self._chronological_split(prepared)
         train_features = self.feature_builder.build(train_frame)
         calibration_features = self.feature_builder.build(calibration_frame)
         full_features = prepared_features
@@ -575,19 +574,44 @@ class KPowerMLForecast:
         )
         return prepared.reset_index(drop=True)
 
-    @staticmethod
-    def _latest_contiguous_observations(
-        prepared: pd.DataFrame, features: pd.DataFrame
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def _gap_safe_training_split(
+        self, prepared: pd.DataFrame, features: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Keep all observations while reserving a contiguous calibration tail."""
         valid = pd.to_numeric(prepared["y"], errors="coerce").notna()
-        groups = (~valid).cumsum()
         if not valid.any():
             raise ValueError("training history has no usable target observations")
+        observed = prepared.loc[valid].reset_index(drop=True)
+        observed_features = features.loc[valid].reset_index(drop=True)
+        if len(observed) < 4:
+            raise ValueError("at least four rows are required for ML training")
+
+        groups = (~valid).cumsum()
         latest_group = groups.loc[valid].iloc[-1]
-        selected = valid & groups.eq(latest_group)
+        latest_indices = prepared.index[valid & groups.eq(latest_group)]
+        minimum_training_rows = max(
+            1,
+            int(getattr(self.backend, "minimum_contiguous_training_rows", 1)),
+        )
+        if len(latest_indices) <= minimum_training_rows:
+            raise ValueError(
+                "latest contiguous history requires at least "
+                f"{minimum_training_rows + 1} rows to reserve calibration data"
+            )
+        calibration_size = max(
+            1, int(len(latest_indices) * self.config.calibration_fraction)
+        )
+        calibration_size = min(
+            calibration_size, len(latest_indices) - minimum_training_rows
+        )
+        calibration_indices = latest_indices[-calibration_size:]
+        calibration_start = calibration_indices[0]
+        train_mask = valid & (prepared.index < calibration_start)
         return (
-            prepared.loc[selected].reset_index(drop=True),
-            features.loc[selected].reset_index(drop=True),
+            observed,
+            observed_features,
+            prepared.loc[train_mask].reset_index(drop=True),
+            prepared.loc[calibration_indices].reset_index(drop=True),
         )
 
     def _chronological_split(

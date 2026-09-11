@@ -6,7 +6,7 @@
   temporary series converted to `KPowerMLConfig.timezone`.
 - Preserve target gaps when `preserve_gaps=True`. Never interpolate, edge-fill, or include target
   `y` in broad feature filling.
-- ML artifacts must match forecast contract 3, timezone, and history policy version 1. Publish the
+- ML artifacts must match forecast contract 3, timezone, and history policy version 2. Publish the
   completion manifest atomically after every model artifact succeeds.
 
 ## I. Identity & Role
