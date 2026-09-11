@@ -109,6 +109,38 @@ def test_nixtla_backend_trains_across_separate_observation_segments() -> None:
     assert result["yhat"].notna().all()
 
 
+def test_residual_fallback_stays_local_to_each_observation_segment() -> None:
+    backend = NixtlaHybridBackend(
+        KPowerMLConfig(
+            model_id="consumption",
+            latitude=46.0,
+            longitude=14.0,
+            interval_minutes=60,
+            forecast_type=MLForecastType.CONSUMPTION,
+        )
+    )
+    history = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(
+                [
+                    "2026-05-01T00:00:00Z",
+                    "2026-05-01T01:00:00Z",
+                    "2026-05-02T00:00:00Z",
+                    "2026-05-02T01:00:00Z",
+                ]
+            ),
+            "y": [10.0, 12.0, 100.0, 102.0],
+        }
+    )
+    backend._last_observed = 102.0
+
+    residuals = backend._build_residual_training_frame(
+        history, features=history[["ds"]], seasonal_length=24
+    )
+
+    assert residuals["y"].tolist() == [0.0, 2.0, 0.0, 2.0]
+
+
 def test_nixtla_backend_runs_residual_on_exact_post_training_grid() -> None:
     backend = NixtlaHybridBackend(
         KPowerMLConfig(

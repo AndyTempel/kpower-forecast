@@ -212,7 +212,7 @@ class NixtlaHybridBackend:
                 lambda values: values.expanding(min_periods=1).mean().shift(1)
             )
             baseline = grouped.shift(seasonal_length).fillna(fallback)
-            baseline = baseline.fillna(self._last_observed)
+            baseline = baseline.fillna(grouped.transform("first"))
         else:
             baseline = solar_baseline.reindex(residual_training.index).fillna(0.0)
         residual_training["y"] = residual_training["y"] - baseline
