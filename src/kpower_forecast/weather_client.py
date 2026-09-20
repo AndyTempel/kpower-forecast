@@ -179,7 +179,7 @@ class WeatherClient:
                 except ValueError as error:
                     if self._should_retry_hourly_on_empty_payload(error, request_field):
                         request_field = HOURLY
-                        logger.warning(
+                        logger.info(
                             "Archive API returned no 15-minute weather data. "
                             "Retrying with hourly data."
                         )
@@ -206,7 +206,7 @@ class WeatherClient:
                     continue
                 if self._should_retry_hourly(error, request_field):
                     request_field = HOURLY
-                    logger.warning(
+                    logger.info(
                         "Archive API rejected 15-minute weather data. "
                         "Retrying with hourly data."
                     )
@@ -294,7 +294,7 @@ class WeatherClient:
                     continue
                 if self._should_retry_hourly(error, request_field):
                     request_field = HOURLY
-                    logger.warning(
+                    logger.info(
                         "Forecast API rejected 15-minute weather data. "
                         "Retrying with hourly data."
                     )

@@ -60,6 +60,16 @@ def to_segmented_nixtla_frame(
     return output
 
 
+def _trainable_residual_segment_mask(
+    frame: pd.DataFrame, *, minimum_rows: int
+) -> pd.Series:
+    """Identify series that can produce a row for the configured residual lags."""
+    segment_sizes = frame.groupby("unique_id", sort=False)["unique_id"].transform(
+        "size"
+    )
+    return segment_sizes >= minimum_rows
+
+
 class NixtlaHybridBackend:
     """StatsForecast structural model plus MLForecast residual model."""
 
@@ -129,16 +139,27 @@ class NixtlaHybridBackend:
         )
         self._stats_model.fit(structural_history)
 
+        residual_lags = [1, seasonal_length]
         residual_training = self._build_residual_training_frame(
             history, features=features, seasonal_length=seasonal_length
         )
+        trainable_residual_rows = _trainable_residual_segment_mask(
+            residual_training,
+            minimum_rows=max(residual_lags) + 1,
+        )
+        residual_training = residual_training.loc[trainable_residual_rows].reset_index(
+            drop=True
+        )
+        residual_features = features.iloc[
+            trainable_residual_rows.to_numpy()
+        ].reset_index(drop=True)
         residual_training["ds"] = pd.to_datetime(
             residual_training["ds"], utc=True
         ).dt.tz_localize(None)
         residual_training = pd.merge(
             residual_training,
             self._build_exogenous_frame(
-                features, unique_ids=residual_training["unique_id"]
+                residual_features, unique_ids=residual_training["unique_id"]
             ),
             on=["unique_id", "ds"],
             how="left",
@@ -157,7 +178,7 @@ class NixtlaHybridBackend:
         self._residual_model = MLForecast(
             models={"lgbm": LGBMRegressor(**lgbm_params)},
             freq=f"{self.config.interval_minutes}min",
-            lags=[1, seasonal_length],
+            lags=residual_lags,
         )
         self._residual_model.fit(residual_training, static_features=[])
         self._fitted = True

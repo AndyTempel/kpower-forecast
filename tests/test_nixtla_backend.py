@@ -1,3 +1,5 @@
+import warnings
+
 import pandas as pd
 import pytest
 
@@ -107,6 +109,60 @@ def test_nixtla_backend_trains_across_separate_observation_segments() -> None:
 
     assert result["ds"].tolist() == future["ds"].tolist()
     assert result["yhat"].notna().all()
+
+
+def test_nixtla_backend_excludes_segments_too_short_for_residual_lags(
+    monkeypatch,
+) -> None:
+    backend = NixtlaHybridBackend(
+        KPowerMLConfig(
+            model_id="consumption",
+            latitude=46.0,
+            longitude=14.0,
+            interval_minutes=15,
+            forecast_type=MLForecastType.CONSUMPTION,
+        )
+    )
+    timestamps = pd.DatetimeIndex([])
+    for start, periods in (
+        ("2026-05-01T00:00:00Z", 40),
+        ("2026-05-03T00:00:00Z", 20),
+        ("2026-05-05T00:00:00Z", 200),
+    ):
+        timestamps = timestamps.append(
+            pd.date_range(start, periods=periods, freq="15min")
+        )
+    history = pd.DataFrame(
+        {
+            "ds": timestamps,
+            "y": [float(1 + index % 96) for index in range(len(timestamps))],
+        },
+        index=range(1000, 1000 + len(timestamps)),
+    )
+    features = pd.DataFrame(
+        {
+            "ds": history["ds"].to_numpy(),
+            "temperature_2m": [10.0] * len(history),
+        }
+    )
+    observed_feature_frames: list[pd.DataFrame] = []
+    build_exogenous_frame = backend._build_exogenous_frame
+
+    def record_exogenous_frame(
+        selected_features: pd.DataFrame, unique_ids: pd.Series | None = None
+    ) -> pd.DataFrame:
+        observed_feature_frames.append(selected_features.copy())
+        return build_exogenous_frame(selected_features, unique_ids)
+
+    monkeypatch.setattr(backend, "_build_exogenous_frame", record_exogenous_frame)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        backend.fit(history, features, history.tail(24))
+
+    assert not any("dropped completely" in str(item.message) for item in caught)
+    assert len(observed_feature_frames) == 1
+    assert observed_feature_frames[0]["ds"].tolist() == history["ds"].iloc[60:].tolist()
 
 
 def test_residual_fallback_stays_local_to_each_observation_segment() -> None:

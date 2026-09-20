@@ -1,3 +1,5 @@
+import logging
+
 import pandas as pd
 import requests
 
@@ -438,7 +440,7 @@ def test_fetch_historical_retries_without_invalid_archive_variable(monkeypatch) 
 
 
 def test_fetch_historical_falls_back_to_hourly_when_minutely_15_is_empty(
-    monkeypatch,
+    monkeypatch, caplog
 ) -> None:
     client = WeatherClient(
         lat=46.0,
@@ -485,6 +487,7 @@ def test_fetch_historical_falls_back_to_hourly_when_minutely_15_is_empty(
         )
 
     monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    caplog.set_level(logging.INFO)
 
     frame = client.fetch_historical(
         start_date=pd.Timestamp("2026-06-30").date(),
@@ -493,6 +496,8 @@ def test_fetch_historical_falls_back_to_hourly_when_minutely_15_is_empty(
 
     assert observed_request_fields == ["minutely_15", "hourly"]
     assert frame["temperature_2m"].tolist() == [21.2, 20.5]
+    assert "Retrying with hourly data" in caplog.text
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 
 
 def test_fetch_forecast_retries_without_invalid_variable(monkeypatch) -> None:
@@ -570,7 +575,7 @@ def test_fetch_forecast_retries_without_invalid_variable(monkeypatch) -> None:
 
 
 def test_fetch_forecast_falls_back_to_hourly_when_minutely_15_is_rejected(
-    monkeypatch,
+    monkeypatch, caplog
 ) -> None:
     client = WeatherClient(
         lat=46.0,
@@ -611,11 +616,18 @@ def test_fetch_forecast_falls_back_to_hourly_when_minutely_15_is_rejected(
         )
 
     monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    caplog.set_level(logging.INFO)
 
     frame = client.fetch_forecast(days=1)
 
     assert observed_request_fields == ["minutely_15", "hourly"]
     assert frame["temperature_2m"].tolist() == [10.0, 11.0]
+    assert "Retrying with hourly data" in caplog.text
+    assert not any(
+        record.levelno >= logging.WARNING
+        and "Retrying with hourly data" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_fetch_forecast_uses_cache_for_repeated_payload(monkeypatch, tmp_path) -> None:
