@@ -212,6 +212,56 @@ def test_fetch_forecast_fills_empty_best_match_from_long_model(
     assert "no usable required weather data" in caplog.text
 
 
+def test_fetch_forecast_fills_null_padded_tail_from_long_model(monkeypatch) -> None:
+    client = WeatherClient(
+        lat=46.0,
+        lon=14.0,
+        config=WeatherConfig(cache_enabled=False),
+    )
+    observed_models: list[object] = []
+    times = [
+        timestamp.strftime("%Y-%m-%dT%H:%M")
+        for timestamp in pd.date_range("2026-05-01T00:00", periods=96, freq="15min")
+    ]
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        assert url == "https://api.open-meteo.com/v1/forecast"
+        assert timeout == 10
+        model = params.get("models")
+        observed_models.append(model)
+        if model == "ecmwf_ifs":
+            return Response(_weather_payload(times, [20.0] * len(times)))
+
+        payload = _weather_payload(times, [10.0] * 4 + [None] * 92)
+        weather = payload["minutely_15"]
+        assert isinstance(weather, dict)
+        weather["cloud_cover"] = [20.0] * 4 + [None] * 92
+        weather["shortwave_radiation"] = [50.0] * 4 + [None] * 92
+        return Response(payload)
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+
+    frame = client.fetch_forecast(days=1)
+
+    assert observed_models == [None, "ecmwf_ifs"]
+    assert len(frame) == 96
+    assert frame.loc[3, "shortwave_radiation"] == 50.0
+    assert frame.loc[4, "shortwave_radiation"] == 50.0
+    assert frame.loc[4, "temperature_2m"] == 20.0
+    complete_columns = frame[["temperature_2m", "cloud_cover", "shortwave_radiation"]]
+    assert complete_columns.notna().all().all()
+
+
 def test_process_response_prefers_minutely_15_payload() -> None:
     client = WeatherClient(lat=46.0, lon=14.0)
     data = {

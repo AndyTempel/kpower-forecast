@@ -39,6 +39,7 @@ PHYSICAL_LOWER_BOUNDED_COLUMNS: tuple[str, ...] = (
     "snowfall_water_equivalent",
     "snowfall_height",
 )
+ZERO_FILLED_REQUIRED_COLUMNS: frozenset[str] = frozenset({"snow_depth", "snowfall"})
 
 
 class WeatherConfig(BaseModel):
@@ -439,21 +440,30 @@ class WeatherClient:
         return merged
 
     def _has_required_weather_data(self, df: pd.DataFrame) -> bool:
-        """Return whether a weather frame has usable required weather values.
+        """Return whether every row has complete required weather coverage.
 
         Args:
             df: Weather dataframe.
 
         Returns:
-            True when at least one required weather column contains data.
+            True when every required non-zero-filled column contains data for
+            every timestamp. Snow columns are excluded because missing snow is
+            deliberately interpreted as zero during finalization.
         """
         required_columns = [
             column for column in self.config.required_hourly_variables if column in df
         ]
         if not required_columns:
             return False
-        required_values = df[required_columns].apply(pd.to_numeric, errors="coerce")
-        return bool(required_values.notna().any().any())
+        coverage_columns = [
+            column
+            for column in required_columns
+            if column not in ZERO_FILLED_REQUIRED_COLUMNS
+        ]
+        if not coverage_columns:
+            coverage_columns = required_columns
+        required_values = df[coverage_columns].apply(pd.to_numeric, errors="coerce")
+        return bool(not required_values.empty and required_values.notna().all().all())
 
     def _expected_forecast_rows(self, days: int, request_field: str) -> int:
         """Return the expected forecast row count.
