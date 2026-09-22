@@ -65,6 +65,33 @@ def test_fetch_forecast_omits_model_by_default(monkeypatch) -> None:
     assert "direct_radiation" in weather_variables
 
 
+def test_strict_forecast_keeps_missing_outdoor_temperature(monkeypatch) -> None:
+    """Thermal callers can reject weather gaps before any normal fill occurs."""
+    client = WeatherClient(
+        lat=46.0,
+        lon=14.0,
+        config=WeatherConfig(cache_enabled=False, long_horizon_model=None),
+    )
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return _weather_payload(
+                ["2026-05-01T00:00", "2026-05-01T00:15"], [10.0, None]
+            )
+
+    monkeypatch.setattr(
+        "kpower_forecast.weather_client.requests.get",
+        lambda *args, **kwargs: Response(),
+    )
+    strict = client.fetch_forecast(days=1, strict=True)
+    assert pd.isna(strict.loc[1, "temperature_2m"])
+    normal = client.fetch_forecast(days=1)
+    assert normal.loc[1, "temperature_2m"] == 10.0
+
+
 def test_fetch_forecast_uses_explicit_primary_model(monkeypatch) -> None:
     client = WeatherClient(
         lat=46.0,

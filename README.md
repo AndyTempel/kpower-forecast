@@ -145,6 +145,46 @@ curtailment. `predict(dynamic_export_limits=...)` also accepts a dataframe with
 
 ---
 
+## Passive thermal response model
+
+`kpower_forecast.thermal` is a separate, lightweight heating-regime API. It
+identifies a stable first-order effective response from pairs of **real** indoor
+observations at arbitrary spacing. Every pair carries coverage-gated HVAC
+electric input. `train_with_weather` obtains historical outdoor temperature
+from this package's weather client and integrates it across each actual
+observation interval; indoor targets are never interpolated onto a regular
+grid. The effective gain is a building response coefficient, not COP.
+
+```python
+from kpower_forecast.thermal import KPowerThermalForecast, ThermalObservedTransition
+
+model = KPowerThermalForecast(
+    model_id="thermal_aggregate",
+    authority_fingerprint="site-and-zone-configuration-epoch",
+    storage_path="./data",
+    latitude=46.0569,
+    longitude=14.5058,
+)
+# observations: list[ThermalObservedTransition] from genuine indoor endpoints
+# diagnostics = model.train_with_weather(observations)
+# model.save()  # only when fitted; load() checks full compatibility
+# forecast = model.predict_with_weather(
+#     origin=aligned_utc_origin,
+#     initial_temperature_c=fresh_real_indoor_c,
+#     hvac_electric_power_w=existing_heating_forecast_w,
+#     hvac_drive_source="legacy_heating_forecast",
+# )
+```
+
+Training diagnostics include rejected durations/coverage, excitation, fitted
+time constant and gain, chronological holdout replay at 1/3/6/12 hours,
+persistence comparison, and empirical temperature error bands. A valid fit can
+remain unreliable. EMS must additionally validate real future origins before
+granting any electrical forecast authority. The API never chooses HVAC modes
+or an HVAC electrical schedule.
+
+---
+
 ## Time and history contract
 
 Forecast timestamps and the `ds` grid remain UTC. ML calendar and holiday features are derived
