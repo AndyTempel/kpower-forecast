@@ -187,6 +187,27 @@ class KPowerThermalForecast:
         self.config = config or ThermalModelConfig()
         if (latitude is None) != (longitude is None):
             raise ValueError("latitude and longitude must be supplied together")
+        if weather_client is not None:
+            client_latitude = float(weather_client.lat)
+            client_longitude = float(weather_client.lon)
+            if (
+                latitude is not None
+                and longitude is not None
+                and (latitude != client_latitude or longitude != client_longitude)
+            ):
+                raise ValueError("injected weather client location differs from site")
+            latitude, longitude = client_latitude, client_longitude
+        if (
+            latitude is not None
+            and longitude is not None
+            and not (
+                math.isfinite(latitude)
+                and math.isfinite(longitude)
+                and -90 <= latitude <= 90
+                and -180 <= longitude <= 180
+            )
+        ):
+            raise ValueError("site weather coordinates are invalid")
         self.latitude = latitude
         self.longitude = longitude
         self.weather_client = weather_client

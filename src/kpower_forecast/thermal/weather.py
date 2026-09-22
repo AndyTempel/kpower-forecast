@@ -64,8 +64,10 @@ def mean_outdoor_temperature(
     times, values = _weather_series(frame)
     if start < times[0] or end > times[-1]:
         raise ValueError("historical weather does not cover thermal transition")
-    left = max(int(np.searchsorted(times, start)) - 1, 0)
-    right = min(int(np.searchsorted(times, end, side="right")), len(times) - 1)
+    # Include the bracketing sample only when an endpoint falls between
+    # weather samples. Exact endpoints must not inspect unrelated outer gaps.
+    left = max(int(np.searchsorted(times, start, side="right")) - 1, 0)
+    right = min(int(np.searchsorted(times, end, side="left")), len(times) - 1)
     if np.any(np.diff(times[left : right + 1]) > max_sample_gap.total_seconds()):
         raise ValueError("historical weather has a material gap")
     interior = times[(times > start) & (times < end)]

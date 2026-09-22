@@ -10,6 +10,7 @@ from kpower_forecast.thermal import (
     ThermalModelConfig,
     ThermalTrainingTransition,
 )
+from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
 
 def _synthetic_transitions(
@@ -176,3 +177,37 @@ def test_corrupt_artifact_is_rejected(tmp_path: object) -> None:
     marker = next(tmp_path.glob("*_thermal_manifest.json"))
     marker.write_text("{broken", encoding="utf-8")
     assert not _model(tmp_path).load()
+
+
+def test_injected_weather_location_is_bound_to_artifact(tmp_path: object) -> None:
+    """The same-config artifact cannot be restored for a different site."""
+    first_client = WeatherClient(46.0, 14.0, WeatherConfig(cache_enabled=False))
+    model = KPowerThermalForecast(
+        model_id="thermal_aggregate",
+        authority_fingerprint="epoch-1",
+        storage_path=tmp_path,
+        config=ThermalModelConfig(max_equilibrium_offset_c=16),
+        weather_client=first_client,
+    )
+    assert model.latitude == 46.0
+    assert model.longitude == 14.0
+    assert model.train(_synthetic_transitions()).fitted
+    model.save()
+    other_client = WeatherClient(47.0, 15.0, WeatherConfig(cache_enabled=False))
+    incompatible = KPowerThermalForecast(
+        model_id="thermal_aggregate",
+        authority_fingerprint="epoch-1",
+        storage_path=tmp_path,
+        config=model.config,
+        weather_client=other_client,
+    )
+    assert not incompatible.load()
+    with pytest.raises(ValueError, match="differs from site"):
+        KPowerThermalForecast(
+            model_id="thermal_aggregate",
+            authority_fingerprint="epoch-1",
+            storage_path=tmp_path,
+            latitude=46.0,
+            longitude=14.0,
+            weather_client=other_client,
+        )

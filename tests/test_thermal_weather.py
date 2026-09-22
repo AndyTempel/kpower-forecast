@@ -56,6 +56,29 @@ def test_weather_gap_and_missing_future_slot_fail() -> None:
         )
 
 
+def test_exact_weather_endpoints_ignore_gaps_outside_transition() -> None:
+    """Only weather samples required inside an interval gate its coverage."""
+    frame = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(
+                [
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T02:00:00Z",
+                    "2026-01-01T03:00:00Z",
+                    "2026-01-01T07:00:00Z",
+                ],
+                utc=True,
+            ),
+            "temperature_2m": [0.0, 2.0, 3.0, 7.0],
+        }
+    )
+    assert mean_outdoor_temperature(
+        frame,
+        start_at=datetime(2026, 1, 1, 2, tzinfo=timezone.utc),
+        end_at=datetime(2026, 1, 1, 3, tzinfo=timezone.utc),
+    ) == pytest.approx(2.5)
+
+
 def test_exact_future_weather_grid_across_dst() -> None:
     """Canonical UTC forecast timestamps remain continuous across local DST."""
     frame = pd.DataFrame(
@@ -76,6 +99,8 @@ def test_exact_future_weather_grid_across_dst() -> None:
 def test_package_weather_adapter_keeps_one_real_transition(tmp_path: object) -> None:
     """The high-level adapter fetches strict weather without target filling."""
     weather = Mock(spec=WeatherClient)
+    weather.lat = 46.0
+    weather.lon = 14.0
     weather.config = WeatherConfig()
     weather.fetch_historical.return_value = _weather()
     model = KPowerThermalForecast(
