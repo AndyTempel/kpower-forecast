@@ -147,7 +147,11 @@ class WeatherClient:
         return primary_model
 
     def fetch_historical(
-        self, start_date: datetime.date, end_date: datetime.date
+        self,
+        start_date: datetime.date,
+        end_date: datetime.date,
+        *,
+        strict: bool = False,
     ) -> pd.DataFrame:
         """
         Fetch historical weather data for training.
@@ -176,7 +180,7 @@ class WeatherClient:
                     ttl_hours=self.config.historical_cache_ttl_hours,
                 )
                 try:
-                    return self._process_response(data)
+                    return self._process_response(data, interpolate=not strict)
                 except ValueError as error:
                     if self._should_retry_hourly_on_empty_payload(error, request_field):
                         request_field = HOURLY
@@ -237,7 +241,9 @@ class WeatherClient:
         match = INVALID_VARIABLE_PATTERN.search(reason)
         return match.group(1) if match else None
 
-    def fetch_forecast(self, days: int = 7, past_days: int = 0) -> pd.DataFrame:
+    def fetch_forecast(
+        self, days: int = 7, past_days: int = 0, *, strict: bool = False
+    ) -> pd.DataFrame:
         """
         Fetch weather forecast and optional recent archived forecast days.
         """
@@ -273,6 +279,8 @@ class WeatherClient:
                     request_field=request_field,
                     past_days=past_days,
                 )
+                if strict:
+                    return self._clip_physical_bounds(merged)
                 return self._finalize_weather_frame(merged)
             except requests.HTTPError as error:
                 invalid_variable = self._extract_invalid_variable(error)
