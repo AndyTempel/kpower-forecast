@@ -346,9 +346,8 @@ class KPowerThermalForecast:
                 coverage-gated electric exposure supplied by the data adapter.
 
         Returns:
-            Diagnostics. A failed gate leaves this instance unloadable/unfitted.
+            Attempt diagnostics. A failed retry preserves any active fitted model.
         """
-        self._parameters = None
         ordered = sorted(transitions, key=lambda item: _utc(item.start_at))
         good: list[ThermalTrainingTransition] = []
         short = long = uncovered = overlap = 0
@@ -373,7 +372,8 @@ class KPowerThermalForecast:
             rejected_overlap=overlap,
         )
         if not good:
-            self.diagnostics = d
+            if self._parameters is None:
+                self.diagnostics = d
             return d
         starts = np.array([item.indoor_start_c for item in good])
         ends = np.array([item.indoor_end_c for item in good])
@@ -410,7 +410,8 @@ class KPowerThermalForecast:
         else:
             d.unreliable_reason = None
         if d.unreliable_reason is not None:
-            self.diagnostics = d
+            if self._parameters is None:
+                self.diagnostics = d
             return d
 
         holdout_count = max(
@@ -419,7 +420,8 @@ class KPowerThermalForecast:
         )
         if holdout_count >= len(good) - 2:
             d.unreliable_reason = "insufficient_history"
-            self.diagnostics = d
+            if self._parameters is None:
+                self.diagnostics = d
             return d
         train_end = len(good) - holdout_count
         parameters = self._fit(
@@ -431,7 +433,8 @@ class KPowerThermalForecast:
         )
         if parameters is None:
             d.unreliable_reason = "implausible_parameters"
-            self.diagnostics = d
+            if self._parameters is None:
+                self.diagnostics = d
             return d
         tau, gain, offset = parameters
         d.time_constant_hours = tau

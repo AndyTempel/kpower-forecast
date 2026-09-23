@@ -145,6 +145,36 @@ def test_unexcited_and_implausible_fit_fail_closed(tmp_path: object) -> None:
     assert d.unreliable_reason == "implausible_parameters"
 
 
+def test_failed_retrain_keeps_live_and_saved_fit(tmp_path: object) -> None:
+    """A failed scheduled retry cannot change prediction or saved fit."""
+    model = _model(tmp_path)
+    assert model.train(_synthetic_transitions()).fitted
+    model.save()
+    origin = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    inputs = {
+        "origin": origin,
+        "initial_temperature_c": 18.0,
+        "outdoor_temperature_c": [0.0] * 4,
+        "hvac_electric_power_w": [2000.0] * 4,
+        "outdoor_source": "weather",
+        "hvac_drive_source": "heating",
+    }
+    previous_diagnostics = model.diagnostics.model_copy(deep=True)
+    previous_prediction = model.predict(**inputs)
+
+    failed = model.train([])
+    assert not failed.fitted
+    assert failed.unreliable_reason == "insufficient_history"
+    assert model.diagnostics == previous_diagnostics
+    assert model.predict(**inputs) == previous_prediction
+
+    model.save()
+    restored = _model(tmp_path)
+    assert restored.load()
+    assert restored.diagnostics == previous_diagnostics
+    assert restored.predict(**inputs) == previous_prediction
+
+
 def test_prediction_rejects_missing_or_invalid_drive(tmp_path: object) -> None:
     """A trained model cannot infer or extend an absent future HVAC drive."""
     model = _model(tmp_path)
