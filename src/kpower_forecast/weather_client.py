@@ -26,6 +26,12 @@ WEATHER_REQUEST_INTERVAL_MINUTES = 15
 FORECAST_INTERVALS_PER_HOUR = 60 // WEATHER_REQUEST_INTERVAL_MINUTES
 MAX_FORECAST_PAST_DAYS = 92
 
+
+def _weather_today() -> datetime.date:
+    """Return the current UTC date used by relative weather requests."""
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
 PHYSICAL_LOWER_BOUNDED_COLUMNS: tuple[str, ...] = (
     "shortwave_radiation",
     "direct_radiation",
@@ -153,9 +159,69 @@ class WeatherClient:
         *,
         strict: bool = False,
     ) -> pd.DataFrame:
+        """Fetch archive weather and recent forecast weather for training.
+
+        Archive data can lag behind live observations. Use the configured
+        recent forecast window for that tail, without filling missing values
+        for strict callers. Future date padding is capped at the current UTC
+        date; callers must still validate coverage of their observation spans.
+
+        Args:
+            start_date: First requested UTC date.
+            end_date: Last requested UTC date, inclusive.
+            strict: Preserve missing weather values for coverage validation.
+
+        Returns:
+            Ordered weather samples inside the elapsed requested dates.
+
+        Raises:
+            ValueError: If the date range is reversed or entirely in the future.
+            requests.RequestException: If a weather request fails.
         """
-        Fetch historical weather data for training.
-        """
+        today = _weather_today()
+        if end_date < start_date:
+            raise ValueError("historical weather end_date precedes start_date")
+        end_date = min(end_date, today)
+        if start_date > end_date:
+            raise ValueError("historical weather range is entirely in the future")
+        recent_start = today - datetime.timedelta(
+            days=self.config.recent_forecast_past_days
+        )
+        if end_date < recent_start:
+            return self._fetch_archive(start_date, end_date, strict=strict)
+
+        frames: list[pd.DataFrame] = []
+        archive_end = recent_start - datetime.timedelta(days=1)
+        if start_date <= archive_end:
+            frames.append(self._fetch_archive(start_date, archive_end, strict=True))
+        recent = self.fetch_forecast(
+            days=1,
+            past_days=(today - max(start_date, recent_start)).days,
+            strict=True,
+        )
+        frames.append(recent)
+        combined = pd.concat(frames, ignore_index=True)
+        combined["ds"] = pd.to_datetime(combined["ds"], utc=True)
+        lower = pd.Timestamp(start_date, tz="UTC")
+        upper = pd.Timestamp(end_date + datetime.timedelta(days=1), tz="UTC")
+        combined = (
+            combined.loc[(combined["ds"] >= lower) & (combined["ds"] < upper)]
+            .drop_duplicates(subset="ds", keep="last")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+        if strict:
+            return self._clip_physical_bounds(combined)
+        return self._finalize_weather_frame(combined)
+
+    def _fetch_archive(
+        self,
+        start_date: datetime.date,
+        end_date: datetime.date,
+        *,
+        strict: bool,
+    ) -> pd.DataFrame:
+        """Fetch only archive dates, retaining resolution and variable fallback."""
         weather_variables = list(self.config.hourly_variables)
         request_field = MINUTELY_15
 
@@ -613,6 +679,11 @@ class WeatherClient:
             "url": url,
             "params": params,
         }
+        if endpoint == "forecast":
+            # Relative forecast_days/past_days refer to the current UTC date.
+            # Never replay yesterday's response across midnight, even when its
+            # TTL has not expired. Identical whole-day queries share this key.
+            normalized["reference_date"] = _weather_today().isoformat()
         encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
         cache_key = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         return cache_dir / f"{endpoint}_{cache_key}.json"

@@ -1,9 +1,146 @@
+import datetime
 import logging
+from pathlib import Path
 
 import pandas as pd
+import pytest
 import requests
 
 from kpower_forecast.weather_client import WeatherClient, WeatherConfig
+
+
+def test_recent_training_weather_caps_future_padding_and_shares_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Thermal and electrical clients reuse valid archive and recent weather."""
+    clock = datetime.datetime(2026, 9, 28, 15, 15, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(
+        "kpower_forecast.weather_client._weather_today", lambda: clock.date()
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        calls.append((url, params.copy()))
+        if "archive" in url:
+            assert params["start_date"] == "2026-09-23"
+            assert params["end_date"] == "2026-09-26"
+            return Response(_weather_payload(["2026-09-26T23:45"], [10.0]))
+        assert params["past_days"] == 1
+        assert params["forecast_days"] == 1
+        return Response(
+            _weather_payload(
+                ["2026-09-27T00:00", "2026-09-28T15:00", "2026-09-28T15:15"],
+                [11.0, None, 13.0],
+            )
+        )
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    config = WeatherConfig(cache_dir=tmp_path, long_horizon_model=None)
+    thermal = WeatherClient(46, 14, config)
+    electrical = WeatherClient(46, 14, config)
+    first = thermal.fetch_historical(
+        datetime.date(2026, 9, 23), datetime.date(2026, 9, 29), strict=True
+    )
+    second = electrical.fetch_historical(
+        datetime.date(2026, 9, 23), datetime.date(2026, 9, 28), strict=True
+    )
+    assert len(calls) == 2
+    pd.testing.assert_frame_equal(first, second)
+    assert first["temperature_2m"].isna().tolist() == [False, False, True, False]
+    assert first["ds"].max() == pd.Timestamp("2026-09-28T15:15Z")
+
+
+def test_future_only_history_does_not_make_http_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Future-only training ranges fail without an invalid archive request."""
+    monkeypatch.setattr(
+        "kpower_forecast.weather_client._weather_today",
+        lambda: datetime.date(2026, 9, 28),
+    )
+    client = WeatherClient(46, 14)
+    with pytest.raises(ValueError, match="entirely in the future"):
+        client.fetch_historical(datetime.date(2026, 9, 29), datetime.date(2026, 9, 30))
+
+
+def test_recent_only_history_skips_archive_and_excludes_later_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A yesterday-only request uses recent weather but returns no today's rows."""
+    monkeypatch.setattr(
+        "kpower_forecast.weather_client._weather_today",
+        lambda: datetime.date(2026, 9, 28),
+    )
+    calls: list[str] = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return _weather_payload(
+                ["2026-09-27T23:45", "2026-09-28T00:00"], [11.0, 12.0]
+            )
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        calls.append(url)
+        assert params["past_days"] == 1
+        return Response()
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    client = WeatherClient(
+        46, 14, WeatherConfig(cache_enabled=False, long_horizon_model=None)
+    )
+    result = client.fetch_historical(
+        datetime.date(2026, 9, 27), datetime.date(2026, 9, 27), strict=True
+    )
+    assert calls == [client.config.base_url]
+    assert result["ds"].tolist() == [pd.Timestamp("2026-09-27T23:45Z")]
+
+
+def test_forecast_cache_does_not_replay_previous_utc_day(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Relative day queries refresh across midnight even inside their TTL."""
+    clock = datetime.datetime(2026, 9, 28, 23, 45, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(
+        "kpower_forecast.weather_client._weather_today", lambda: clock.date()
+    )
+    calls = 0
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return _weather_payload(
+                [clock.date().isoformat() + "T00:00"], [float(calls)]
+            )
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        nonlocal calls
+        calls += 1
+        return Response()
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    client = WeatherClient(
+        46, 14, WeatherConfig(cache_dir=tmp_path, long_horizon_model=None)
+    )
+    client.fetch_forecast(days=1)
+    clock += datetime.timedelta(minutes=15)
+    result = client.fetch_forecast(days=1)
+    assert calls == 2
+    assert result["ds"].min() == pd.Timestamp("2026-09-29T00:00Z")
 
 
 def test_weather_config_defaults_recent_forecast_history_to_one_day() -> None:
