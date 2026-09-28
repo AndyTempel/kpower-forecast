@@ -143,6 +143,43 @@ def test_forecast_cache_does_not_replay_previous_utc_day(
     assert result["ds"].min() == pd.Timestamp("2026-09-29T00:00Z")
 
 
+def test_forecast_response_crossing_midnight_keeps_original_cache_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An in-flight yesterday response cannot poison today's cache entry."""
+    day = datetime.date(2026, 9, 28)
+    monkeypatch.setattr("kpower_forecast.weather_client._weather_today", lambda: day)
+    calls = 0
+
+    class Response:
+        def __init__(self, date: datetime.date) -> None:
+            self.date = date
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return _weather_payload([self.date.isoformat() + "T00:00"], [10.0])
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        nonlocal calls, day
+        calls += 1
+        response = Response(day)
+        if calls == 1:
+            day += datetime.timedelta(days=1)
+        return response
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    client = WeatherClient(
+        46, 14, WeatherConfig(cache_dir=tmp_path, long_horizon_model=None)
+    )
+    first = client.fetch_forecast(days=1)
+    second = client.fetch_forecast(days=1)
+    assert calls == 2
+    assert first["ds"].min() == pd.Timestamp("2026-09-28T00:00Z")
+    assert second["ds"].min() == pd.Timestamp("2026-09-29T00:00Z")
+
+
 def test_weather_config_defaults_recent_forecast_history_to_one_day() -> None:
     assert WeatherConfig().recent_forecast_past_days == 1
 

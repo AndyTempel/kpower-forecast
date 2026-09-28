@@ -644,7 +644,10 @@ class WeatherClient:
             requests.RequestException: If the HTTP request fails.
             ValueError: If the API response is not a JSON object.
         """
-        cached = self._load_cached_response(endpoint, url, params)
+        # Bind relative-query cache identity before network I/O. A response
+        # crossing UTC midnight must not be stored under the next day's key.
+        cache_path = self._cache_path(endpoint, url, params)
+        cached = self._load_cached_response(endpoint, cache_path)
         if cached is not None:
             return cached
 
@@ -654,7 +657,7 @@ class WeatherClient:
         if not isinstance(data, dict):
             raise ValueError("Weather API response must be a JSON object")
         payload = cast(dict[str, object], data)
-        self._store_cached_response(endpoint, url, params, payload, ttl_hours)
+        self._store_cached_response(cache_path, payload, ttl_hours)
         return payload
 
     def _cache_path(
@@ -691,15 +694,13 @@ class WeatherClient:
     def _load_cached_response(
         self,
         endpoint: str,
-        url: str,
-        params: dict[str, str | float | int | list[str]],
+        cache_path: Path,
     ) -> Optional[dict[str, object]]:
         """Load a fresh cached weather response if available.
 
         Args:
-            endpoint: Logical endpoint name for cache-key separation.
-            url: Weather API URL.
-            params: Query parameters.
+            endpoint: Logical endpoint name for logging.
+            cache_path: Request cache path bound before network I/O.
 
         Returns:
             Cached raw response payload, or None.
@@ -707,7 +708,6 @@ class WeatherClient:
         if not self.config.cache_enabled:
             return None
 
-        cache_path = self._cache_path(endpoint, url, params)
         if not cache_path.exists():
             return None
 
@@ -744,18 +744,14 @@ class WeatherClient:
 
     def _store_cached_response(
         self,
-        endpoint: str,
-        url: str,
-        params: dict[str, str | float | int | list[str]],
+        cache_path: Path,
         data: dict[str, object],
         ttl_hours: float,
     ) -> None:
         """Store a raw weather response in the on-disk cache.
 
         Args:
-            endpoint: Logical endpoint name for cache-key separation.
-            url: Weather API URL.
-            params: Query parameters.
+            cache_path: Request cache path bound before network I/O.
             data: Raw response payload.
             ttl_hours: Cache time-to-live in hours.
 
@@ -765,7 +761,6 @@ class WeatherClient:
         if not self.config.cache_enabled:
             return
 
-        cache_path = self._cache_path(endpoint, url, params)
         cache_payload = {
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "ttl_seconds": ttl_hours * 3600.0,
