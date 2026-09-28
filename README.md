@@ -155,6 +155,13 @@ from this package's weather client and integrates it across each actual
 observation interval; indoor targets are never interpolated onto a regular
 grid. The effective gain is a building response coefficient, not COP.
 
+Training weather combines archive dates with the forecast endpoint's recent
+`past_days` window (one day by default, plus today). Future date padding never
+reaches the archive endpoint. Strict thermal callers preserve missing weather
+and reject uncovered observation intervals. Recent weather uses the forecast
+cache expiry rather than the long-lived archive cache; relative forecast
+requests also refresh at UTC midnight.
+
 ```python
 from kpower_forecast.thermal import KPowerThermalForecast, ThermalObservedTransition
 
