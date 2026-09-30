@@ -192,6 +192,54 @@ or an HVAC electrical schedule.
 
 ---
 
+### Offline identification matrix (calibration only)
+
+With the `cli` extra installed, run:
+
+```bash
+python -m kpower_forecast.thermal.identification private-bundle.json private-report.json
+```
+
+`MatrixBundle` is a strict Pydantic boundary. Its frozen manifest declares the
+model/source authority epoch, export start, fit cutoff, evaluation start (at least
+six hours after fitting), final export cutoff, input provenance, target tolerance
+and documented source confidence. Aware input timestamps normalize to UTC before
+window arithmetic and serialization. `series` contains all keys `5`, `10`, `15`, `30`,
+`60`, even if empty. Each series is an independently admitted minimum-separation
+selection of genuine endpoints, with exact elapsed time, covered HP electrical
+exposure and pre-exported outdoor means. `source_authority_id` must describe the
+same selected authority at both endpoints. Data adapters own intermediate source,
+receipt, quality and exposure checks; this tool cannot reconstruct them from rows.
+Never rename five-minute rows to manufacture a longer-resolution experiment.
+
+The report includes all 7/14/21-day configurations and an unweighted/runtime
+baseline versus diagnostic confidence/elapsed weighting. Unknown sensor accuracy
+uses a named manifest assumption (default 0.1 C standard deviation); documented
+quantization contributes `resolution_c**2/12`. The conservative two-endpoint
+variance bound does not assume independent endpoint errors. Confidence ratios
+are capped before elapsed-duration weighting. Precision does not establish accuracy.
+
+The solver and physical acceptance limits are shared with the existing RC model.
+Rejected boundary/sign optima remain visible as diagnostics; tau remains bounded
+at 240 h. Neighbor comparisons expose coefficient changes and sign agreement,
+including rejected fits. Complete requested history must be available within the
+authority/export boundary; short datasets are explicitly unavailable.
+
+All physically accepted candidates replay the same chronological real calibration
+targets at 30 min, 1 h, 2 h and 4 h, using observed input exposure and a persistence
+baseline. A source/gap/value discontinuity breaks replay; no indoor interpolation
+is allowed. Unmatched targets stay unmatched. These are observed-drive response
+checks, **not operational unseen-origin forecast evidence**. Internal blocked
+holdout status is reported separately; it cannot establish empirical reliability.
+
+This first slice excludes calibrated excitation/cycle scoring, disturbance
+classification, cycle-balanced weighting, final holdout selection and live-manager
+integration. It never saves an operational model, requests weather, modifies a
+controller or grants control/electrical authority. Keep private bundles/reports
+outside Git. Identical CLI reruns are harmless; different existing outputs are
+refused. Reports are completed and flushed in a private temporary sibling, then
+atomically published without replacing an existing final report.
+
 ## Time and history contract
 
 Forecast timestamps and the `ds` grid remain UTC. ML calendar and holiday features are derived
