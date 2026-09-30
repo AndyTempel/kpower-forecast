@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from kpower_forecast import __version__
 from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
+from .fitting import FitCandidate, fit_candidate
 from .weather import (
     exact_future_outdoor_grid,
     fetch_future_weather,
@@ -546,24 +547,23 @@ class KPowerThermalForecast:
         hours: np.ndarray,
     ) -> tuple[float, float, float] | None:
         """Search bounded time constants; solve remaining coefficients by LS."""
-        best: tuple[float, float, float] | None = None
-        best_error = float("inf")
-        for tau in np.geomspace(
-            self.config.min_time_constant_hours,
-            self.config.max_time_constant_hours,
-            self.config.fit_grid_points,
-        ):
-            decay = -np.expm1(-hours / tau)
-            target = ends - (1 - decay) * starts - decay * outdoors
-            design = np.column_stack((decay * power_kw, decay))
-            if np.linalg.matrix_rank(design) < 2:
-                continue
-            gain, offset = np.linalg.lstsq(design, target, rcond=None)[0]
-            residual = target - design @ np.array([gain, offset])
-            error = float(np.mean(residual**2))
-            if error < best_error:
-                best = (float(tau), float(gain), float(offset))
-                best_error = error
+        candidate = fit_candidate(
+            starts,
+            ends,
+            outdoors,
+            power_kw,
+            hours,
+            min_tau=self.config.min_time_constant_hours,
+            max_tau=self.config.max_time_constant_hours,
+            grid_points=self.config.fit_grid_points,
+        )
+        return self._accepted_parameters(candidate)
+
+    def _accepted_parameters(
+        self, candidate: FitCandidate | None
+    ) -> tuple[float, float, float] | None:
+        """Apply the unchanged physical gates to runtime or diagnostic fits."""
+        best = candidate.parameters if candidate is not None else None
         # A boundary optimum is weakly identified and is not made reliable by
         # silently clipping the fitted time constant.
         if best is None or best[0] in (
