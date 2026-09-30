@@ -203,7 +203,8 @@ python -m kpower_forecast.thermal.identification private-bundle.json private-rep
 `MatrixBundle` is a strict Pydantic boundary. Its frozen manifest declares the
 model/source authority epoch, export start, fit cutoff, evaluation start (at least
 six hours after fitting), final export cutoff, input provenance, target tolerance
-and documented source confidence. `series` contains all keys `5`, `10`, `15`, `30`,
+and documented source confidence. Aware input timestamps normalize to UTC before
+window arithmetic and serialization. `series` contains all keys `5`, `10`, `15`, `30`,
 `60`, even if empty. Each series is an independently admitted minimum-separation
 selection of genuine endpoints, with exact elapsed time, covered HP electrical
 exposure and pre-exported outdoor means. `source_authority_id` must describe the
@@ -236,7 +237,8 @@ classification, cycle-balanced weighting, final holdout selection and live-manag
 integration. It never saves an operational model, requests weather, modifies a
 controller or grants control/electrical authority. Keep private bundles/reports
 outside Git. Identical CLI reruns are harmless; different existing outputs are
-refused.
+refused. Reports are completed and flushed in a private temporary sibling, then
+atomically published without replacing an existing final report.
 
 ## Time and history contract
 

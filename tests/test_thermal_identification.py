@@ -1,6 +1,8 @@
 """Offline chronology, physical rejection and confidence invariants."""
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -13,6 +15,7 @@ from kpower_forecast.thermal.identification import (
     SourceTransition,
     confidence_weights,
     matrix_report,
+    publish_report,
 )
 
 
@@ -71,6 +74,16 @@ def test_matrix_recovers_physics_without_fabricated_half_hour_targets(
     assert {cell["calibration_metrics"]["60min"]["matched"] for cell in cells} == {162}
     assert cells[0]["calibration_metrics"]["240min"]["improvement_c"] > 0
     assert report["empirically_reliable"] is False
+    assert (
+        len(
+            [
+                edge
+                for edge in report["neighbors"]
+                if edge["first"][0] == 5 and edge["second"][0] == 10
+            ]
+        )
+        == 6
+    )
 
 
 def test_external_outcomes_cannot_change_fit_and_missing_windows_are_unavailable(
@@ -161,6 +174,49 @@ def test_bundle_rejects_unadmitted_evidence(bundle: MatrixBundle, change: str) -
         payload["series"][5][0]["hvac_coverage_ratio"] = 0.5
     with pytest.raises(ValidationError):
         MatrixBundle.model_validate(payload)
+
+
+def test_offset_times_serialize_canonically_in_utc(bundle: MatrixBundle) -> None:
+    """Offset representations retain identity but never enter window arithmetic."""
+    payload = bundle.model_dump()
+    offset = timezone(timedelta(hours=2))
+    for key in (
+        "authority_epoch",
+        "export_start_at",
+        "fit_cutoff",
+        "evaluation_start",
+        "cutoff",
+    ):
+        payload["manifest"][key] = payload["manifest"][key].astimezone(offset)
+    for rows in payload["series"].values():
+        for row in rows:
+            row["start_at"] = row["start_at"].astimezone(offset)
+            row["end_at"] = row["end_at"].astimezone(offset)
+    normalized = MatrixBundle.model_validate(payload)
+    assert normalized.model_dump_json() == bundle.model_dump_json()
+    assert normalized.manifest.fit_cutoff.tzinfo is timezone.utc
+    assert normalized.series[5][0].start_at.tzinfo is timezone.utc
+
+
+def test_interrupted_report_is_retryable_and_existing_data_is_preserved(
+    tmp_path: Path,
+) -> None:
+    """Incomplete staging is never the final report; publication never clobbers."""
+    output = tmp_path / "private-report.json"
+    contents = '{"complete": true}\n'
+    with patch(
+        "kpower_forecast.thermal.identification.os.link",
+        side_effect=OSError("interrupted"),
+    ):
+        with pytest.raises(OSError, match="interrupted"):
+            publish_report(output, contents)
+    assert not output.exists()
+    publish_report(output, contents)
+    publish_report(output, contents)
+    assert output.read_text() == contents
+    with pytest.raises(ValueError, match="different contents"):
+        publish_report(output, '{"different": true}\n')
+    assert output.read_text() == contents
 
 
 @pytest.mark.parametrize("tau,gain", [(300, 4), (22, -4)])

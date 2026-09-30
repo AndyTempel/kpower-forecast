@@ -7,15 +7,22 @@ module consumes only their admitted real endpoints and pre-exported weather.
 import hashlib
 import json
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Annotated, Literal, cast
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .fitting import FitCandidate, fit_candidate
-from .model import KPowerThermalForecast, ThermalModelConfig, ThermalTrainingTransition
+from .model import (
+    KPowerThermalForecast,
+    ThermalModelConfig,
+    ThermalTrainingTransition,
+    _utc,
+)
 
 
 class Evidence(BaseModel):
@@ -38,6 +45,12 @@ class SourceTransition(ThermalTrainingTransition):
     model_config = ConfigDict(extra="forbid", frozen=True)
     source_authority_id: str = Field(min_length=1)
 
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def canonical_time(cls, value: datetime) -> datetime:
+        """Keep real source instants canonical in UTC, without changing identity."""
+        return _utc(value)
+
 
 class MatrixManifest(Evidence):
     """Frozen calibration experiment; final holdout and promotion are excluded."""
@@ -54,6 +67,14 @@ class MatrixManifest(Evidence):
     max_confidence_ratio: float = Field(default=10.0, ge=1, allow_inf_nan=False)
     target_tolerance_minutes: float = Field(default=7.5, gt=0, le=7.5)
     confidence: dict[str, SensorConfidence] = Field(default_factory=dict)
+
+    @field_validator(
+        "authority_epoch", "export_start_at", "fit_cutoff", "evaluation_start", "cutoff"
+    )
+    @classmethod
+    def canonical_time(cls, value: datetime) -> datetime:
+        """Normalize aware experiment instants before window arithmetic."""
+        return _utc(value)
 
     @model_validator(mode="after")
     def validate_times(self) -> "MatrixManifest":
@@ -354,7 +375,7 @@ def matrix_report(bundle: MatrixBundle) -> dict[str, object]:
     by_key = {(cell.minutes, cell.days, cell.weighting): cell for cell in cells}
     neighbors: list[dict[str, object]] = []
     for cell in cells:
-        next_minutes = {10: 15, 15: 30, 30: 60}.get(cell.minutes)
+        next_minutes = {5: 10, 10: 15, 15: 30, 30: 60}.get(cell.minutes)
         next_days = {7: 14, 14: 21}.get(cell.days)
         for other_key in (
             (next_minutes, cell.days, cell.weighting),
@@ -420,6 +441,41 @@ def matrix_report(bundle: MatrixBundle) -> dict[str, object]:
     }
 
 
+def publish_report(output_path: Path, contents: str) -> None:
+    """Atomically publish a complete private report without replacing user data.
+
+    Args:
+        output_path: Final path in an existing directory.
+        contents: Complete serialized report.
+
+    Raises:
+        ValueError: If a different report already exists.
+        OSError: If staging or atomic no-clobber publication fails.
+    """
+    if output_path.exists():
+        if output_path.read_text(encoding="utf-8") != contents:
+            raise ValueError("output exists with different contents")
+        return
+    # The unique sibling is private scratch created by this invocation. A
+    # killed process can leave scratch, but never an incomplete final report.
+    with NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.",
+        delete_on_close=False,
+    ) as staging:
+        staging.write(contents)
+        staging.flush()
+        os.fsync(staging.fileno())
+        staging.close()
+        try:
+            os.link(staging.name, output_path)
+        except FileExistsError:
+            if output_path.read_text(encoding="utf-8") != contents:
+                raise ValueError("output exists with different contents") from None
+
+
 def main() -> None:
     """Run the optional Typer CLI with an offline bundle and exclusive output."""
     import typer
@@ -439,12 +495,10 @@ def main() -> None:
         """Write a private JSON report; never overwrite a different report."""
         bundle = MatrixBundle.model_validate_json(bundle_path.read_text())
         contents = json.dumps(matrix_report(bundle), indent=2, allow_nan=False) + "\n"
-        if output_path.exists():
-            if output_path.read_text() != contents:
-                raise typer.BadParameter("output exists with different contents")
-        else:
-            with output_path.open("x") as stream:
-                stream.write(contents)
+        try:
+            publish_report(output_path, contents)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
         Console().print(f"Offline calibration report: {output_path}")
 
     app()
