@@ -35,6 +35,7 @@ class KPowerMLConfig(BaseModel):
     interval_minutes: int = Field(default=15)
     timezone: str = "UTC"
     preserve_gaps: bool = False
+    max_bridged_gap_intervals: int = Field(default=0, ge=0, le=16)
     forecast_type: MLForecastType = MLForecastType.SOLAR
     data_category: DataCategory = DataCategory.INSTANT_ENERGY
     unit: MeasurementUnit = MeasurementUnit.KWH

@@ -36,6 +36,47 @@ SANITIZED_CONFORMAL_STATE_VERSION: int = 1
 HISTORY_POLICY_VERSION: int = 2
 
 
+def bridge_short_target_gaps(
+    history: pd.DataFrame, max_intervals: int
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Bridge short interior target gaps on a regular grid.
+
+    Telemetry with intermittent attribution drops single rows far more often
+    than it loses whole hours. Those rows would otherwise split the latest
+    contiguous structural segment. Runs of at most ``max_intervals`` missing
+    rows with an observation on both sides are filled linearly; longer gaps and
+    leading or trailing gaps stay missing.
+
+    Args:
+        history: Grid-aligned frame with ``ds`` and ``y``; gaps are NaN rows.
+        max_intervals: Longest missing run to bridge. ``0`` disables bridging.
+
+    Returns:
+        A copy of ``history`` with bridged ``y`` values and a boolean mask, on
+        the same index, marking the bridged rows.
+
+    Raises:
+        ValueError: If ``max_intervals`` is negative or ``y`` is missing.
+    """
+    if max_intervals < 0:
+        raise ValueError("max_intervals must not be negative")
+    if "y" not in history.columns:
+        raise ValueError("history must contain a 'y' column")
+    values = pd.to_numeric(history["y"], errors="coerce")
+    missing = values.isna()
+    bridged = pd.Series(False, index=history.index)
+    if max_intervals == 0 or not bool(missing.any()):
+        return history.copy(), bridged
+    run_id = missing.ne(missing.shift()).cumsum()
+    run_length = missing.groupby(run_id).transform("size")
+    interior = values.ffill().notna() & values.bfill().notna()
+    bridged = missing & interior & run_length.le(max_intervals)
+    output = history.copy()
+    filled = values.interpolate(method="linear", limit_area="inside")
+    output.loc[bridged, "y"] = filled.loc[bridged]
+    return output, bridged
+
+
 class KPowerMLForecast:
     """Train and serve optional ML forecasts for energy time series."""
 
@@ -78,6 +119,7 @@ class KPowerMLForecast:
         )
         self.conformal = SplitConformalCalibrator(self.config.interval_levels)
         self._training_end: pd.Timestamp | None = None
+        self.training_bridged_rows: int = 0
         self._restore_existing_manifest()
 
     def _weather_config_with_default_cache(
@@ -121,24 +163,46 @@ class KPowerMLForecast:
             preserve_gaps=self.config.preserve_gaps,
         )
         complete_history = self._prepare_training_data(normalized)
-        complete_features = self.feature_builder.build(complete_history)
+        bridged_history, bridged_mask = bridge_short_target_gaps(
+            complete_history, self.config.max_bridged_gap_intervals
+        )
+        bridged_times = set(
+            pd.to_datetime(bridged_history.loc[bridged_mask, "ds"], utc=True)
+        )
+        complete_features = self.feature_builder.build(bridged_history)
         prepared, prepared_features, train_frame, calibration_frame = (
-            self._gap_safe_training_split(complete_history, complete_features)
+            self._gap_safe_training_split(bridged_history, complete_features)
         )
         train_features = self.feature_builder.build(train_frame)
         calibration_features = self.feature_builder.build(calibration_frame)
         full_features = prepared_features
         self._training_end = pd.to_datetime(prepared["ds"], utc=True).max()
 
-        self.bias_corrector.fit_from_historical_proxy(train_frame)
+        # Bridged rows keep the structural series contiguous, but only measured
+        # rows may calibrate weather bias or prediction intervals.
+        train_measured = ~pd.to_datetime(train_frame["ds"], utc=True).isin(
+            bridged_times
+        )
+        self.bias_corrector.fit_from_historical_proxy(
+            train_frame.loc[train_measured].reset_index(drop=True)
+        )
         self.backend.fit(train_frame, train_features, calibration_frame)
         calibration_predictions = self.backend.predict(
             calibration_features, horizon=len(calibration_frame)
         )
         calibration_predictions = self._sanitize_point_forecast(calibration_predictions)
-        self.conformal.fit(
-            actual=calibration_frame["y"], predicted=calibration_predictions["yhat"]
+        calibration_measured = ~pd.to_datetime(calibration_frame["ds"], utc=True).isin(
+            bridged_times
         )
+        calibration_actual = calibration_frame["y"].reset_index(drop=True)
+        if bool(calibration_measured.any()):
+            calibration_actual = calibration_actual.where(
+                calibration_measured.reset_index(drop=True)
+            )
+        self.conformal.fit(
+            actual=calibration_actual, predicted=calibration_predictions["yhat"]
+        )
+        self.training_bridged_rows = int(bridged_mask.sum())
         self.backend.fit(prepared, full_features, calibration_frame)
 
         self.storage.invalidate_manifest()
@@ -164,6 +228,8 @@ class KPowerMLForecast:
                 "timezone": self.config.timezone,
                 "history_policy_version": HISTORY_POLICY_VERSION,
                 "preserve_gaps": self.config.preserve_gaps,
+                "max_bridged_gap_intervals": self.config.max_bridged_gap_intervals,
+                "bridged_rows": self.training_bridged_rows,
             },
         )
         self.storage.save_training_frame(complete_history)
@@ -417,6 +483,11 @@ class KPowerMLForecast:
             return
         if manifest.metadata.get("preserve_gaps") != self.config.preserve_gaps:
             return
+        if (
+            manifest.metadata.get("max_bridged_gap_intervals", 0)
+            != self.config.max_bridged_gap_intervals
+        ):
+            return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         if (
@@ -454,6 +525,13 @@ class KPowerMLForecast:
             raise ForecastAlignmentError(
                 "stored model gap-preservation mode requires a full retrain"
             )
+        if (
+            manifest.metadata.get("max_bridged_gap_intervals", 0)
+            != self.config.max_bridged_gap_intervals
+        ):
+            raise ForecastAlignmentError(
+                "stored model gap-bridging limit requires a full retrain"
+            )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
                 "stored ML backend does not match configured backend: "
@@ -469,6 +547,7 @@ class KPowerMLForecast:
         if manifest.training_end is None:
             raise ForecastAlignmentError("stored model has no training cutoff")
         self._training_end = pd.to_datetime(manifest.training_end, utc=True)
+        self.training_bridged_rows = int(manifest.metadata.get("bridged_rows", 0))
         self.conformal = SplitConformalCalibrator.from_dict(
             manifest.interval_levels, manifest.conformal_quantiles
         )

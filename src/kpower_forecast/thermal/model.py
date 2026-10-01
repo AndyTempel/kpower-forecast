@@ -50,7 +50,7 @@ class ThermalModelConfig(BaseModel):
 
     min_transition_minutes: float = Field(default=5.0, gt=0)
     max_transition_hours: float = Field(default=6.0, gt=0)
-    min_hvac_coverage_ratio: float = Field(default=0.99, ge=0, le=1)
+    min_hvac_coverage_ratio: float = Field(default=0.90, ge=0, le=1)
     min_transitions: int = Field(default=40, ge=3)
     min_span_hours: float = Field(default=72.0, gt=0)
     min_indoor_range_c: float = Field(default=0.5, gt=0)

@@ -17,7 +17,7 @@ from kpower_forecast.ml.dependencies import (
     MissingMLDependencyError,
     ensure_optional_dependencies,
 )
-from kpower_forecast.ml.forecast import HISTORY_POLICY_VERSION
+from kpower_forecast.ml.forecast import HISTORY_POLICY_VERSION, bridge_short_target_gaps
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 
 
@@ -858,3 +858,92 @@ def test_optional_dependency_boundary_supports_ai_extra_hint(monkeypatch) -> Non
         ensure_optional_dependencies(
             ("neuralforecast",), "NeuralForecast backend", extra="ai"
         )
+
+
+def test_bridge_short_target_gaps_fills_only_short_interior_runs() -> None:
+    nan = float("nan")
+    history = pd.DataFrame(
+        {
+            "ds": pd.date_range("2026-01-01", periods=12, freq="15min", tz="UTC"),
+            "y": [nan, 1.0, nan, 3.0, nan, nan, nan, 4.0, 5.0, nan, nan, nan],
+        }
+    )
+
+    bridged, mask = bridge_short_target_gaps(history, max_intervals=2)
+
+    assert mask.tolist() == [False, False, True] + [False] * 9
+    assert bridged["y"].iloc[2] == pytest.approx(2.0)
+    assert bridged["y"].iloc[[0, 4, 5, 6, 9, 10, 11]].isna().all()
+    assert history["y"].isna().sum() == 8
+    unchanged, none = bridge_short_target_gaps(history, max_intervals=0)
+    assert not none.any()
+    assert unchanged["y"].isna().sum() == 8
+
+
+def test_ml_training_bridges_short_gaps_but_calibrates_on_measured_rows(
+    monkeypatch, tmp_path
+) -> None:
+    forecast = KPowerMLForecast(
+        model_id="bridged-training",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.HVAC,
+        backend=MLBackendType.NEURALFORECAST,
+        preserve_gaps=True,
+        max_bridged_gap_intervals=1,
+        calibration_fraction=0.4,
+    )
+    history = pd.DataFrame(
+        {
+            "ds": pd.date_range("2024-01-01", periods=10, freq="h", tz="UTC"),
+            "y": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, float("nan"), 3.0, 1.0],
+        }
+    )
+    weather = pd.DataFrame(
+        {"ds": history["ds"], "temperature_2m": [10.0] * len(history)}
+    )
+
+    class RecordingBackend:
+        minimum_contiguous_training_rows = 1
+        fitted_lengths: list[int] = []
+
+        def fit(self, history, features, calibration) -> None:
+            self.fitted_lengths.append(len(history))
+
+        def predict(self, features, horizon):
+            return pd.DataFrame({"ds": features["ds"], "yhat": [1.0] * horizon})
+
+        def feature_schema(self):
+            return []
+
+        def save(self, artifact_dir):
+            return {}
+
+    backend = RecordingBackend()
+    forecast.backend = cast(Any, backend)
+    monkeypatch.setattr(
+        forecast.weather_client, "fetch_historical", lambda start, end: weather
+    )
+    monkeypatch.setattr(
+        forecast.weather_client,
+        "resample_weather",
+        lambda frame, interval_minutes: cast(pd.DataFrame, frame),
+    )
+
+    forecast.train(history, force=True)
+
+    # The bridged row joins the latest segment, so all ten rows train.
+    assert backend.fitted_lengths[-1] == 10
+    # Calibration tail is rows 6-9; the bridged row 7 (energy 2.0) is excluded,
+    # leaving residuals 0, 2, 0 rather than 0, 1, 2, 0.
+    assert forecast.conformal.quantiles[50] == pytest.approx(0.0)
+    assert forecast.training_bridged_rows == 1
+    manifest = forecast.storage.load_manifest()
+    assert manifest is not None
+    assert manifest.metadata["max_bridged_gap_intervals"] == 1
+    assert manifest.metadata["bridged_rows"] == 1
+    stored = forecast.storage.load_training_frame()
+    assert stored is not None
+    assert stored["y"].isna().sum() == 1
