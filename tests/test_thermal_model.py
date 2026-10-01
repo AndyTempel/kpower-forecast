@@ -121,8 +121,10 @@ def test_coverage_and_duration_gaps_reject_transitions(tmp_path: object) -> None
     short_row = rows[1].model_copy(
         update={"end_at": rows[1].start_at + timedelta(minutes=2)}
     )
-    uncovered = rows[2].model_copy(update={"hvac_coverage_ratio": 0.8})
-    d = _model(tmp_path).train([long_row, short_row, uncovered, *rows[3:]])
+    uncovered = rows[2].model_copy(update={"hvac_coverage_ratio": 0.89})
+    # A meter timeout costs a few seconds per bucket; such rows stay usable.
+    timeout = rows[3].model_copy(update={"hvac_coverage_ratio": 0.9})
+    d = _model(tmp_path).train([long_row, short_row, uncovered, timeout, *rows[4:]])
     assert d.rejected_long == 1
     assert d.rejected_short == 1
     assert d.rejected_hvac_coverage == 1

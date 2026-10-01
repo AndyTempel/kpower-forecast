@@ -194,11 +194,11 @@ class KPowerMLForecast:
         calibration_measured = ~pd.to_datetime(calibration_frame["ds"], utc=True).isin(
             bridged_times
         )
-        calibration_actual = calibration_frame["y"].reset_index(drop=True)
-        if bool(calibration_measured.any()):
-            calibration_actual = calibration_actual.where(
-                calibration_measured.reset_index(drop=True)
-            )
+        calibration_actual = (
+            calibration_frame["y"]
+            .reset_index(drop=True)
+            .where(calibration_measured.reset_index(drop=True))
+        )
         self.conformal.fit(
             actual=calibration_actual, predicted=calibration_predictions["yhat"]
         )
