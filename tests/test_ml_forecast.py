@@ -947,3 +947,34 @@ def test_ml_training_bridges_short_gaps_but_calibrates_on_measured_rows(
     stored = forecast.storage.load_training_frame()
     assert stored is not None
     assert stored["y"].isna().sum() == 1
+
+
+def test_gap_safe_split_keeps_bridges_on_one_side_of_calibration(tmp_path) -> None:
+    forecast = KPowerMLForecast(
+        model_id="bridge-boundary",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.HVAC,
+        backend=MLBackendType.NEURALFORECAST,
+        preserve_gaps=True,
+        max_bridged_gap_intervals=1,
+    )
+    prepared = pd.DataFrame(
+        {
+            "ds": pd.date_range("2026-01-01", periods=20, freq="h", tz="UTC"),
+            "y": [1.0] * 20,
+        }
+    )
+    # Unconstrained, calibration would start at row 16, right after the
+    # bridged row 15 whose interpolation used row 16 as its right anchor.
+    bridged = pd.Series([False] * 20)
+    bridged.loc[15] = True
+
+    _, _, train, calibration = forecast._gap_safe_training_split(
+        prepared, prepared[["ds"]].copy(), bridged=bridged
+    )
+
+    assert calibration["ds"].iloc[0] == prepared["ds"].iloc[17]
+    assert train["ds"].iloc[-1] == prepared["ds"].iloc[16]

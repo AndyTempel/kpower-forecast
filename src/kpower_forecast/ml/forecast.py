@@ -171,7 +171,9 @@ class KPowerMLForecast:
         )
         complete_features = self.feature_builder.build(bridged_history)
         prepared, prepared_features, train_frame, calibration_frame = (
-            self._gap_safe_training_split(bridged_history, complete_features)
+            self._gap_safe_training_split(
+                bridged_history, complete_features, bridged=bridged_mask
+            )
         )
         train_features = self.feature_builder.build(train_frame)
         calibration_features = self.feature_builder.build(calibration_frame)
@@ -654,9 +656,18 @@ class KPowerMLForecast:
         return prepared.reset_index(drop=True)
 
     def _gap_safe_training_split(
-        self, prepared: pd.DataFrame, features: pd.DataFrame
+        self,
+        prepared: pd.DataFrame,
+        features: pd.DataFrame,
+        bridged: pd.Series | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Keep all observations while reserving a contiguous calibration tail."""
+        """Keep all observations while reserving a contiguous calibration tail.
+
+        When ``bridged`` marks interpolated rows, the calibration boundary is
+        moved forward until both the first calibration row and the row before
+        it are measured, so no bridge interpolates across the split and
+        calibration targets cannot leak into training rows.
+        """
         valid = pd.to_numeric(prepared["y"], errors="coerce").notna()
         if not valid.any():
             raise ValueError("training history has no usable target observations")
@@ -684,6 +695,18 @@ class KPowerMLForecast:
             calibration_size, len(latest_indices) - minimum_training_rows
         )
         calibration_indices = latest_indices[-calibration_size:]
+        if bridged is not None:
+            first = 0
+            while first < len(calibration_indices) and (
+                bool(bridged.loc[calibration_indices[first]])
+                or bool(bridged.get(calibration_indices[first] - 1, False))
+            ):
+                first += 1
+            if first == len(calibration_indices):
+                raise ValueError(
+                    "calibration tail has no measured boundary outside bridged gaps"
+                )
+            calibration_indices = calibration_indices[first:]
         calibration_start = calibration_indices[0]
         train_mask = valid & (prepared.index < calibration_start)
         return (
