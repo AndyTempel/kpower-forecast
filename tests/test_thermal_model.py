@@ -411,6 +411,14 @@ def test_naive_fallback_damps_recent_trend() -> None:
         for item in prediction.intervals
     ]
     assert widths == sorted(widths)
+    with pytest.raises(ValueError, match="positive"):
+        predict_naive(
+            origin=now,
+            initial_temperature_c=20.0,
+            trend_c_per_hour=0.0,
+            periods=4,
+            interval_minutes=0,
+        )
     with pytest.raises(ValueError, match="grid"):
         predict_naive(
             origin=now + timedelta(minutes=1),
@@ -448,3 +456,26 @@ def test_better_holdout_estimator_is_published(
     assert d.fit_method == "transition"
     assert d.quality == "accepted"
     assert d.time_constant_hours == pytest.approx(22, rel=0.3)
+
+
+def test_skill_horizons_must_be_distinct() -> None:
+    """A repeated horizon cannot satisfy the two-horizon acceptance gate."""
+    with pytest.raises(ValueError, match="distinct"):
+        ThermalModelConfig(skill_horizons_hours=(3, 3))
+
+
+def test_holdout_start_is_stored_in_utc(tmp_path: object) -> None:
+    """Diagnostics stay UTC even when transitions carry a local offset."""
+    local = timezone(timedelta(hours=2))
+    rows = [
+        row.model_copy(
+            update={
+                "start_at": row.start_at.astimezone(local),
+                "end_at": row.end_at.astimezone(local),
+            }
+        )
+        for row in _synthetic_transitions()
+    ]
+    d = _model(tmp_path).train(rows)
+    assert d.holdout_start_at is not None
+    assert d.holdout_start_at.utcoffset() == timedelta(0)

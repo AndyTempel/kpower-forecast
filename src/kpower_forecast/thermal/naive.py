@@ -83,6 +83,8 @@ def predict_naive(
     Returns:
         A trajectory labelled with the naive outdoor and drive sources.
     """
+    if interval_minutes <= 0 or damping_hours <= 0:
+        raise ValueError("naive forecast interval and damping must be positive")
     origin_utc = _utc(origin)
     step_seconds = interval_minutes * 60
     if origin_utc.timestamp() % step_seconds != 0:

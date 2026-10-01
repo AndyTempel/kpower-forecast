@@ -122,10 +122,12 @@ class ThermalModelConfig(BaseModel):
             raise ValueError("time-constant prior must lie inside the hard limits")
         if self.min_effective_gain_c_per_kw >= self.max_effective_gain_c_per_kw:
             raise ValueError("minimum gain must be below maximum")
-        if not self.skill_horizons_hours or any(
-            hour <= 0 for hour in self.skill_horizons_hours
+        if (
+            not self.skill_horizons_hours
+            or any(hour <= 0 for hour in self.skill_horizons_hours)
+            or len(set(self.skill_horizons_hours)) != len(self.skill_horizons_hours)
         ):
-            raise ValueError("skill horizons must be positive")
+            raise ValueError("skill horizons must be positive and distinct")
         if self.min_skill_horizons > len(self.skill_horizons_hours):
             raise ValueError("more skill horizons required than evaluated")
         if self.min_regularised_span_hours > self.min_span_hours:
@@ -618,7 +620,7 @@ class KPowerThermalForecast:
         )
         if has_holdout:
             d.holdout_count = holdout_count
-            d.holdout_start_at = good[train_end].start_at
+            d.holdout_start_at = _utc(good[train_end].start_at)
             d.holdout_mae_c = float(np.mean(np.abs(errors)))
             d.holdout_bias_c = float(np.mean(errors))
             d.persistence_mae_c = float(
