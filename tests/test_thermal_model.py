@@ -6,10 +6,14 @@ import numpy as np
 import pytest
 
 from kpower_forecast.thermal import (
+    NAIVE_SOURCE,
     KPowerThermalForecast,
     ThermalModelConfig,
     ThermalTrainingTransition,
+    predict_naive,
+    recent_trend_c_per_hour,
 )
+from kpower_forecast.thermal import model as thermal_model
 from kpower_forecast.weather_client import WeatherClient, WeatherConfig
 
 
@@ -143,8 +147,18 @@ def test_unexcited_and_implausible_fit_fail_closed(tmp_path: object) -> None:
     assert d.unreliable_reason == "insufficient_temperature_variation"
     negative_response = _synthetic_transitions(gain_c_per_kw=-4.0)
     d = _model(tmp_path).train(negative_response)
-    assert not d.fitted
-    assert d.unreliable_reason == "implausible_parameters"
+    # Outdoor forcing still makes the bounded fit useful, but the heating
+    # response is unidentified: published as low quality, never accepted.
+    assert d.fitted
+    assert not d.reliable_on_holdout
+    assert d.quality == "low_identifiability"
+    assert d.unreliable_reason == "low_identifiability"
+    assert "gain_constrained" in d.identifiability_flags
+    assert d.effective_gain_c_per_kw == pytest.approx(
+        ThermalModelConfig().min_effective_gain_c_per_kw
+    )
+    assert d.transition_fit is not None
+    assert d.transition_fit["effective_gain_c_per_kw"] < 0
 
 
 def test_failed_retrain_keeps_live_and_saved_fit(tmp_path: object) -> None:
@@ -243,3 +257,225 @@ def test_injected_weather_location_is_bound_to_artifact(tmp_path: object) -> Non
             longitude=14.0,
             weather_client=other_client,
         )
+
+
+def _quantised(
+    rows: list[ThermalTrainingTransition], step_c: float
+) -> list[ThermalTrainingTransition]:
+    """Round readings like a 0.1-0.2 C sensor that reports on change."""
+    return [
+        row.model_copy(
+            update={
+                "indoor_start_c": round(row.indoor_start_c / step_c) * step_c,
+                "indoor_end_c": round(row.indoor_end_c / step_c) * step_c,
+            }
+        )
+        for row in rows
+    ]
+
+
+def test_quantised_sensor_is_accepted_on_multi_step_skill(tmp_path: object) -> None:
+    """One-step error ties persistence on coarse readings; horizons do not."""
+    d = _model(tmp_path).train(_quantised(_synthetic_transitions(), 0.2))
+    assert d.fitted
+    assert d.quality == "accepted"
+    assert d.reliable_on_holdout
+    assert d.skill_horizons_passed >= 2
+    for key in ("3h", "6h", "12h"):
+        metrics = d.holdout_horizon_metrics[key]
+        assert metrics["mae_c"] < 0.5 * metrics["persistence_mae_c"]
+    assert d.time_constant_hours == pytest.approx(22, rel=0.3)
+
+
+def test_short_lineage_publishes_low_identifiability_fit(tmp_path: object) -> None:
+    """Below the accepted-history gate a fit is labelled, not withheld."""
+    rows = _synthetic_transitions()
+    hours = 0.0
+    short: list[ThermalTrainingTransition] = []
+    for row in rows:
+        hours += row.elapsed_hours
+        if hours > 40:
+            break
+        short.append(row)
+    model = _model(tmp_path)
+    d = model.train(short)
+    assert d.fitted
+    assert d.quality == "low_identifiability"
+    assert d.unreliable_reason == "insufficient_history"
+    assert not d.reliable_on_holdout
+    origin = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    prediction = model.predict(
+        origin=origin,
+        initial_temperature_c=20,
+        outdoor_temperature_c=[0.0],
+        hvac_electric_power_w=[0.0],
+        outdoor_source="weather",
+        hvac_drive_source="heating",
+    )
+    interval = prediction.intervals[0]
+    width = interval.upper_temperature_c - interval.indoor_temperature_c
+    # One step ahead: the one-step residual band, widened for low quality.
+    assert d.residual_p90_c is not None
+    assert width == pytest.approx(
+        ThermalModelConfig().low_identifiability_interval_scale * d.residual_p90_c
+    )
+    assert not _model(tmp_path).train(short[:10]).fitted
+
+
+def test_short_coverage_gaps_are_bridged_on_inputs_only(tmp_path: object) -> None:
+    """A dropped transition does not cut every window that spans it."""
+    rows = _synthetic_transitions()
+    # Drop every 12th row (<= 75 min); 30-minute ones are bridged, longer
+    # ones end a chain. Targets on both sides stay real readings.
+    gapped = [row for index, row in enumerate(rows) if index % 12 != 4]
+    d = _model(tmp_path).train(gapped)
+    assert d.fitted
+    assert d.quality == "accepted"
+    assert d.bridged_hours > 0
+    unbridged = KPowerThermalForecast(
+        model_id="thermal_aggregate",
+        authority_fingerprint="epoch-1",
+        storage_path=tmp_path,
+        config=ThermalModelConfig(max_equilibrium_offset_c=16, max_bridge_minutes=0),
+    ).train(gapped)
+    assert unbridged.bridged_hours == 0
+    assert unbridged.window_count < d.window_count
+
+
+def test_artifact_from_other_package_version_loads_for_retrain(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Package upgrades keep the published fit and request a retrain."""
+    model = _model(tmp_path)
+    assert model.train(_synthetic_transitions()).fitted
+    model.save()
+    same = _model(tmp_path)
+    assert same.load()
+    assert not same.needs_retrain
+    monkeypatch.setattr(thermal_model, "__version__", "9999.0.0")
+    upgraded = _model(tmp_path)
+    assert upgraded.load()
+    assert upgraded.needs_retrain
+    assert upgraded.diagnostics == model.diagnostics
+    monkeypatch.setattr(thermal_model, "THERMAL_CONTRACT_VERSION", 999)
+    assert not _model(tmp_path).load()
+
+
+def test_aggregate_shift_scores_a_zone_offset(tmp_path: object) -> None:
+    """Shifting the equilibrium tracks a zone that runs warmer."""
+    rows = _synthetic_transitions()
+    model = _model(tmp_path)
+    assert model.train(rows).fitted
+    warmer = [
+        row.model_copy(
+            update={
+                "indoor_start_c": row.indoor_start_c + 1.5,
+                "indoor_end_c": row.indoor_end_c + 1.5,
+            }
+        )
+        for row in rows[-60:]
+    ]
+    plain = model.evaluate_horizons(warmer)
+    shifted = model.evaluate_horizons(warmer, equilibrium_shift_c=1.5)
+    assert shifted["12h"]["mae_c"] < 0.5 * plain["12h"]["mae_c"]
+    origin = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    inputs = {
+        "origin": origin,
+        "initial_temperature_c": 20.0,
+        "outdoor_temperature_c": [0.0] * 8,
+        "hvac_electric_power_w": [0.0] * 8,
+        "outdoor_source": "weather",
+        "hvac_drive_source": "heating",
+    }
+    base = model.predict(**inputs).intervals[-1].indoor_temperature_c
+    moved = model.predict(**inputs, equilibrium_shift_c=1.5).intervals[-1]
+    assert moved.indoor_temperature_c > base
+
+
+def test_naive_fallback_damps_recent_trend() -> None:
+    """The model-free fallback holds the reading and fades the trend."""
+    now = datetime(2026, 2, 1, 12, tzinfo=timezone.utc)
+    readings = [(now - timedelta(minutes=15 * i), 20.0 - 0.05 * i) for i in range(12)]
+    trend = recent_trend_c_per_hour(readings, now=now)
+    assert trend == pytest.approx(0.2)
+    assert recent_trend_c_per_hour(readings[:1], now=now) == 0.0
+    prediction = predict_naive(
+        origin=now, initial_temperature_c=20.0, trend_c_per_hour=trend, periods=96
+    )
+    assert prediction.outdoor_source == NAIVE_SOURCE
+    values = [item.indoor_temperature_c for item in prediction.intervals]
+    assert values[0] > 20.0
+    assert values[-1] == pytest.approx(20.0 + 0.2 * 2.0, abs=1e-3)
+    widths = [
+        item.upper_temperature_c - item.lower_temperature_c
+        for item in prediction.intervals
+    ]
+    assert widths == sorted(widths)
+    with pytest.raises(ValueError, match="positive"):
+        predict_naive(
+            origin=now,
+            initial_temperature_c=20.0,
+            trend_c_per_hour=0.0,
+            periods=4,
+            interval_minutes=0,
+        )
+    with pytest.raises(ValueError, match="grid"):
+        predict_naive(
+            origin=now + timedelta(minutes=1),
+            initial_temperature_c=20.0,
+            trend_c_per_hour=0.0,
+            periods=4,
+        )
+
+
+def test_better_holdout_estimator_is_published(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the one-step fit replays the holdout better, it is kept instead."""
+    from kpower_forecast.thermal import fitting
+
+    real = fitting.fit_output_error
+
+    def misfit(*args: object, **kwargs: object) -> fitting.OutputErrorFit | None:
+        fit = real(*args, **kwargs)  # type: ignore[arg-type]
+        assert fit is not None
+        # A plausible but wrong optimum, as on a closed-loop TRV zone.
+        return fitting.OutputErrorFit(
+            tau_hours=5.0,
+            gain_c_per_kw=1.0,
+            offset_c=fit.offset_c,
+            mse_c2=fit.mse_c2,
+            flags=(),
+            profile_relative_range=fit.profile_relative_range,
+            window_count=fit.window_count,
+            reading_count=fit.reading_count,
+        )
+
+    monkeypatch.setattr(thermal_model, "fit_output_error", misfit)
+    d = _model(tmp_path).train(_synthetic_transitions())
+    assert d.fit_method == "transition"
+    assert d.quality == "accepted"
+    assert d.time_constant_hours == pytest.approx(22, rel=0.3)
+
+
+def test_skill_horizons_must_be_distinct() -> None:
+    """A repeated horizon cannot satisfy the two-horizon acceptance gate."""
+    with pytest.raises(ValueError, match="distinct"):
+        ThermalModelConfig(skill_horizons_hours=(3, 3))
+
+
+def test_holdout_start_is_stored_in_utc(tmp_path: object) -> None:
+    """Diagnostics stay UTC even when transitions carry a local offset."""
+    local = timezone(timedelta(hours=2))
+    rows = [
+        row.model_copy(
+            update={
+                "start_at": row.start_at.astimezone(local),
+                "end_at": row.end_at.astimezone(local),
+            }
+        )
+        for row in _synthetic_transitions()
+    ]
+    d = _model(tmp_path).train(rows)
+    assert d.holdout_start_at is not None
+    assert d.holdout_start_at.utcoffset() == timedelta(0)

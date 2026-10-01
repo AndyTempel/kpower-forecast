@@ -175,7 +175,7 @@ model = KPowerThermalForecast(
 )
 # observations: list[ThermalObservedTransition] from genuine indoor endpoints
 # diagnostics = model.train_with_weather(observations)
-# model.save()  # only when fitted; load() checks full compatibility
+# model.save()  # only when fitted; load() checks lineage and contract
 # forecast = model.predict_with_weather(
 #     origin=aligned_utc_origin,
 #     initial_temperature_c=fresh_real_indoor_c,
@@ -184,12 +184,46 @@ model = KPowerThermalForecast(
 # )
 ```
 
+**Fit.** Transitions are linked into chains; a gap of up to 30 minutes
+between two covered transitions (typically one rejected for HVAC coverage) is
+bridged by filling its *inputs* from the neighbouring intervals, while the
+reading that resumes the chain stays the real target. Overlapping 6-24 hour
+windows starting at real readings are simulated with the RC model, and the
+loss covers every real reading in each window (output error). The time constant
+is a grid search with a weak log-normal prior (median 60 h); gain and offset
+are bounded least squares on the simulated response. The one-step transition
+fit is also computed (`transition_fit`). When it is within the hard limits and
+replays the holdout better at the skill horizons, it is published instead and
+`fit_method` reads `transition`; on the reference site this was the case for one
+closed-loop TRV zone.
+
+**Quality.** Acceptance needs the accepted-history gates (72 h, 40
+transitions, excitation) and a holdout MAE at +3/+6/+12 h at least 5 % below
+persistence on two horizons. Sensors quantised to 0.1-0.2 °C make one-step
+error indistinguishable from persistence, so one-step metrics are reported but
+do not decide. A fit with a constrained coefficient, a boundary or flat time
+constant, or less history (at least 24 h) is published as
+`quality="low_identifiability"` with 1.5x wider bands, unless it is worse than
+persistence on the holdout, in which case it is not fitted. Hard limits
+(2-240 h, gain at most 20 °C/kW, |offset| at most 12 °C) still apply.
+
+**Artifacts.** `load()` restores an artifact of the same model ID, lineage
+fingerprint, contract and config. One written by another package version or
+weather configuration loads with `needs_retrain=True`; callers should retrain
+on the same history rather than discard the fit.
+
+**Derived and naive forecasts.** `predict(..., equilibrium_shift_c=...)` and
+`evaluate_with_weather(..., equilibrium_shift_c=...)` let a caller derive a
+zone from the aggregate fit and score that against the zone's own fit.
+`predict_naive` holds the current reading while fading a damped recent trend
+(`recent_trend_c_per_hour`); it is the model-free last fallback.
+
 Training diagnostics include rejected durations/coverage, excitation, fitted
 time constant and gain, chronological holdout replay at 1/3/6/12 hours,
-persistence comparison, and empirical temperature error bands. A valid fit can
-remain unreliable. EMS must additionally validate real future origins before
-granting any electrical forecast authority. The API never chooses HVAC modes
-or an HVAC electrical schedule.
+persistence comparison, and empirical temperature error bands. EMS must
+additionally validate real future origins before granting any electrical
+forecast authority. The API never chooses HVAC modes or an HVAC electrical
+schedule.
 
 ---
 
