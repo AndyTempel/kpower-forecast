@@ -570,6 +570,28 @@ class KPowerThermalForecast:
             return d
         parameters, flags, windows, readings, bridged = primary
         d.fit_method = self.fit_method
+        alternative = (
+            self._accepted_parameters(transition_fit)
+            if self.fit_method == "output_error" and has_holdout
+            else None
+        )
+        if alternative is not None:
+            # Closed-loop zones (TRVs) can suit either estimator. Both are
+            # cheap, so keep the one with the better held-out multi-step skill.
+            # Choosing between two candidates biases the holdout only slightly.
+            primary_score = self._skill_score(
+                self._horizon_metrics(good[train_end:], parameters)
+            )
+            alternative_score = self._skill_score(
+                self._horizon_metrics(good[train_end:], alternative)
+            )
+            if (
+                alternative_score is not None
+                and primary_score is not None
+                and alternative_score < primary_score
+            ):
+                parameters, flags = alternative, ()
+                d.fit_method = "transition"
         d.window_count = windows
         d.window_reading_count = readings
         d.bridged_hours = bridged
@@ -648,6 +670,16 @@ class KPowerThermalForecast:
         d.fitted = True
         self.diagnostics = d
         return d
+
+    def _skill_score(self, metrics: dict[str, dict[str, float | int]]) -> float | None:
+        """Mean MAE relative to persistence over sufficiently sampled horizons."""
+        ratios = [
+            float(item["mae_c"]) / max(float(item["persistence_mae_c"]), 1e-6)
+            for key, item in metrics.items()
+            if int(key.removesuffix("h")) in self.config.skill_horizons_hours
+            and int(item["count"]) >= self.config.min_horizon_origins
+        ]
+        return float(np.mean(ratios)) if ratios else None
 
     # The offline transition-fit diagnostics override this to compare the
     # previous one-step identification under the same acceptance pipeline.

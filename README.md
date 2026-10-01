@@ -191,8 +191,11 @@ reading that resumes the chain stays the real target. Overlapping 6-24 hour
 windows starting at real readings are simulated with the RC model, and the
 loss covers every real reading in each window (output error). The time constant
 is a grid search with a weak log-normal prior (median 60 h); gain and offset
-are bounded least squares on the simulated response. The previous one-step
-transition fit is still reported as `transition_fit` for comparison.
+are bounded least squares on the simulated response. The one-step transition
+fit is also computed (`transition_fit`). When it is within the hard limits and
+replays the holdout better at the skill horizons, it is published instead and
+`fit_method` reads `transition`; on the reference site this was the case for one
+closed-loop TRV zone.
 
 **Quality.** Acceptance needs the accepted-history gates (72 h, 40
 transitions, excitation) and a holdout MAE at +3/+6/+12 h at least 5 % below

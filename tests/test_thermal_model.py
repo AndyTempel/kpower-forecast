@@ -418,3 +418,33 @@ def test_naive_fallback_damps_recent_trend() -> None:
             trend_c_per_hour=0.0,
             periods=4,
         )
+
+
+def test_better_holdout_estimator_is_published(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the one-step fit replays the holdout better, it is kept instead."""
+    from kpower_forecast.thermal import fitting
+
+    real = fitting.fit_output_error
+
+    def misfit(*args: object, **kwargs: object) -> fitting.OutputErrorFit | None:
+        fit = real(*args, **kwargs)  # type: ignore[arg-type]
+        assert fit is not None
+        # A plausible but wrong optimum, as on a closed-loop TRV zone.
+        return fitting.OutputErrorFit(
+            tau_hours=5.0,
+            gain_c_per_kw=1.0,
+            offset_c=fit.offset_c,
+            mse_c2=fit.mse_c2,
+            flags=(),
+            profile_relative_range=fit.profile_relative_range,
+            window_count=fit.window_count,
+            reading_count=fit.reading_count,
+        )
+
+    monkeypatch.setattr(thermal_model, "fit_output_error", misfit)
+    d = _model(tmp_path).train(_synthetic_transitions())
+    assert d.fit_method == "transition"
+    assert d.quality == "accepted"
+    assert d.time_constant_hours == pytest.approx(22, rel=0.3)
