@@ -119,7 +119,8 @@ class MatrixBundle(Evidence):
                     or row.end_at > self.manifest.cutoff
                     or row.elapsed_hours * 60 < minutes
                     or row.elapsed_hours > 6
-                    or row.hvac_coverage_ratio < 0.99
+                    or row.hvac_coverage_ratio
+                    < ThermalModelConfig().min_hvac_coverage_ratio
                 ):
                     raise ValueError("transition is outside admitted export coverage")
                 if previous is not None and row.start_at < previous.end_at:

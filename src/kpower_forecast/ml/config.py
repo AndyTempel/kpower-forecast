@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kpower_forecast.core import DataCategory, MeasurementUnit
 
@@ -35,6 +35,7 @@ class KPowerMLConfig(BaseModel):
     interval_minutes: int = Field(default=15)
     timezone: str = "UTC"
     preserve_gaps: bool = False
+    max_bridged_gap_intervals: int = Field(default=0, ge=0, le=16)
     forecast_type: MLForecastType = MLForecastType.SOLAR
     data_category: DataCategory = DataCategory.INSTANT_ENERGY
     unit: MeasurementUnit = MeasurementUnit.KWH
@@ -78,5 +79,31 @@ class KPowerMLConfig(BaseModel):
             if level <= 0 or level >= 100:
                 raise ValueError("interval levels must be between 1 and 99")
         return unique_levels
+
+    @model_validator(mode="after")
+    def check_gap_bridging(self) -> "KPowerMLConfig":
+        """Reject gap bridging where it would be ineffective or bias the model.
+
+        Returns:
+            The validated configuration.
+
+        Raises:
+            ValueError: If bridging is enabled without ``preserve_gaps``, for
+                cumulative-energy input, or for solar targets.
+        """
+        if self.max_bridged_gap_intervals == 0:
+            return self
+        if not self.preserve_gaps:
+            raise ValueError("max_bridged_gap_intervals requires preserve_gaps=True")
+        if self.data_category == DataCategory.CUMULATIVE_ENERGY:
+            # One dropped meter reading removes two interval deltas, and a
+            # linear bridge would not conserve the known meter delta.
+            raise ValueError(
+                "max_bridged_gap_intervals does not support cumulative_energy input"
+            )
+        if self.forecast_type == MLForecastType.SOLAR:
+            # The solar radiation profile is calibrated from training targets.
+            raise ValueError("max_bridged_gap_intervals is not supported for solar")
+        return self
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

@@ -150,7 +150,8 @@ curtailment. `predict(dynamic_export_limits=...)` also accepts a dataframe with
 `kpower_forecast.thermal` is a separate, lightweight heating-regime API. It
 identifies a stable first-order effective response from pairs of **real** indoor
 observations at arbitrary spacing. Every pair carries coverage-gated HVAC
-electric input. `train_with_weather` obtains historical outdoor temperature
+electric input; by default a transition needs an `hvac_coverage_ratio` of at least 0.90
+(the EMS adapter reports its least-covered five-minute bucket). `train_with_weather` obtains historical outdoor temperature
 from this package's weather client and integrates it across each actual
 observation interval; indoor targets are never interpolated onto a regular
 grid. The effective gain is a building response coefficient, not COP.
@@ -249,6 +250,13 @@ history policy version 2, so incompatible artifacts are retrained before predict
 Callers can enable `preserve_gaps`. Power samples are then converted independently using the fixed
 interval duration, cumulative energy is differenced only across adjacent valid samples, and missing
 target intervals remain missing through normalization and feature construction.
+
+Telemetry with intermittent dropouts can set `max_bridged_gap_intervals` (default `0`, off;
+requires `preserve_gaps=True`, power or instant-energy input and a non-solar target). Interior
+missing runs up to that many intervals are bridged linearly after normalization so a single dropped
+row no longer splits the latest structural segment. Longer, leading and trailing gaps stay missing.
+Bridged rows are excluded from weather-bias fitting and conformal calibration, the persisted
+baseline history keeps the original gaps, and the manifest records the limit and bridged row count.
 
 ---
 

@@ -4,8 +4,10 @@
 
 - Keep canonical forecast timestamps and `ds` in UTC; derive calendar and holiday features from a
   temporary series converted to `KPowerMLConfig.timezone`.
-- Preserve target gaps when `preserve_gaps=True`. Never interpolate, edge-fill, or include target
-  `y` in broad feature filling.
+- Preserve target gaps when `preserve_gaps=True`. Never edge-fill or include target `y` in broad
+  feature filling. The only target interpolation allowed is the explicit, opt-in
+  `max_bridged_gap_intervals` bridge of short interior gaps; bridged rows must stay out of
+  calibration and bias fitting.
 - ML artifacts must match forecast contract 3, timezone, and history policy version 2. Publish the
   completion manifest atomically after every model artifact succeeds.
 
