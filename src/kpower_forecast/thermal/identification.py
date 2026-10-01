@@ -191,6 +191,9 @@ def confidence_weights(
 class _DiagnosticModel(KPowerThermalForecast):
     """Capture the raw optimum while retaining the runtime's acceptance gates."""
 
+    # The matrix characterises one-step transition identification.
+    fit_method = "transition"
+
     def __init__(
         self,
         rows: list[SourceTransition],
