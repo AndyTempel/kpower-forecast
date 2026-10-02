@@ -292,6 +292,26 @@ row no longer splits the latest structural segment. Longer, leading and trailing
 Bridged rows are excluded from weather-bias fitting and conformal calibration, the persisted
 baseline history keeps the original gaps, and the manifest records the limit and bridged row count.
 
+### Holdout candidate selection
+
+Consumption and HVAC targets can set `candidate_selection=True` (default off; not for solar).
+Training then scores three candidates on the calibration holdout, each forecasting it from the
+same origin with the same historical weather, and serves the one with the lowest RMSE:
+
+- `kpower_ml`: the configured ML backend (ties keep it);
+- `degree_hour_regression`: ridge regression with per-local-hour intercepts,
+  `max(0, regression_base_temperature_c − T_out)` (default 16 °C) and
+  `regression_extra_features` (default shortwave radiation);
+- `local_slot_weekday_class_median`: the leakage-safe slot/weekday median.
+
+RMSE, not MAE, decides because MAE rewards an always-off forecast of an on/off load. Prediction
+intervals are calibrated on the winner's holdout residuals. With fewer than
+`min_selection_holdout_rows` measured holdout rows (default 96) the ML model is kept and
+`selection_reason` is `holdout_too_short`. `selected_candidate`, `candidate_metrics` and the
+regression coefficients are persisted in the manifest. An artifact trained with different
+selection settings (`candidate_selection`, `regression_base_temperature_c`,
+`regression_extra_features`) is retrained.
+
 ---
 
 ## 🛠️ Advanced Configuration
