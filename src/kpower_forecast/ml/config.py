@@ -116,17 +116,30 @@ class KPowerMLConfig(BaseModel):
 
     @model_validator(mode="after")
     def check_candidate_selection(self) -> "KPowerMLConfig":
-        """Reject candidate selection for solar targets.
+        """Validate candidate selection and degree-hour regression inputs.
 
         Returns:
             The validated configuration.
 
         Raises:
             ValueError: If selection is enabled for a solar forecast, whose
-                curtailment and night constraints assume the ML output.
+                curtailment and night constraints assume the ML output, or if
+                regression extras repeat or name reserved columns.
         """
         if self.candidate_selection and self.forecast_type == MLForecastType.SOLAR:
             raise ValueError("candidate_selection is not supported for solar")
+        reserved = {"ds", "y", "temperature_2m"}.intersection(
+            self.regression_extra_features
+        )
+        if reserved:
+            # ``y`` would leak the holdout target into selection.
+            raise ValueError(
+                f"regression_extra_features must not include {sorted(reserved)}"
+            )
+        if len(set(self.regression_extra_features)) != len(
+            self.regression_extra_features
+        ):
+            raise ValueError("regression_extra_features must be unique")
         return self
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

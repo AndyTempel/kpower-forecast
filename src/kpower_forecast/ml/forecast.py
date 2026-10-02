@@ -216,15 +216,16 @@ class KPowerMLForecast:
         holdout_predictions = {
             ML_CANDIDATE: calibration_predictions["yhat"].reset_index(drop=True)
         }
-        self._select_candidate(
+        conformal_actual = self._select_candidate(
             train_frame.loc[train_measured].reset_index(drop=True),
             calibration_frame.reset_index(drop=True),
             calibration_actual,
             holdout_predictions,
         )
-        # Prediction intervals describe the forecast that is actually served.
+        # Prediction intervals describe the forecast that is actually served,
+        # calibrated on holdout rows that did not take part in selecting it.
         self.conformal.fit(
-            actual=calibration_actual,
+            actual=conformal_actual,
             predicted=holdout_predictions[self.selected_candidate],
         )
         self.training_bridged_rows = int(bridged_mask.sum())
@@ -649,31 +650,37 @@ class KPowerMLForecast:
         calibration_frame: pd.DataFrame,
         calibration_actual: pd.Series,
         predictions: dict[str, pd.Series],
-    ) -> None:
+    ) -> pd.Series:
         """Score benchmarks on the calibration holdout and pick the winner.
 
         All candidates forecast the holdout from its first row, trained only on
         measured rows before it. ``predictions`` gains each benchmark's holdout
-        values. Without enough measured holdout rows the ML model is kept.
+        values. Selection uses the earlier half of the holdout; the later half
+        is returned for conformal calibration, so the winner's intervals are
+        not fitted on the residuals that selected it. Without enough measured
+        selection rows the ML model is kept and the whole holdout calibrates.
 
         Args:
             train_measured: Measured training rows before the holdout.
             calibration_frame: Contiguous holdout rows with weather columns.
             calibration_actual: Holdout targets, NaN where bridged.
             predictions: Holdout predictions keyed by candidate name.
+
+        Returns:
+            Holdout targets to calibrate prediction intervals on (NaN elsewhere).
         """
         self.selected_candidate = ML_CANDIDATE
         self.candidate_metrics = {}
         self.selection_reason = None
         self._regression = None
         if not self.config.candidate_selection:
-            return
-        if (
-            int(calibration_actual.notna().sum())
-            < self.config.min_selection_holdout_rows
-        ):
+            return calibration_actual
+        position = pd.Series(range(len(calibration_actual)))
+        in_selection = position < len(calibration_actual) // 2
+        selection_actual = calibration_actual.where(in_selection)
+        if int(selection_actual.notna().sum()) < self.config.min_selection_holdout_rows:
             self.selection_reason = "holdout_too_short"
-            return
+            return calibration_actual
         regression = self._new_regression()
         if regression.fit(train_measured):
             predictions[DEGREE_HOUR_CANDIDATE] = regression.predict(
@@ -699,17 +706,18 @@ class KPowerMLForecast:
         scored = {
             name: metrics
             for name, values in predictions.items()
-            if (metrics := score_candidate(calibration_actual, values)) is not None
+            if (metrics := score_candidate(selection_actual, values)) is not None
         }
         if ML_CANDIDATE not in scored:
             self.selection_reason = "ml_holdout_unscored"
-            return
+            return calibration_actual
         self.selected_candidate = select_candidate(scored)
         self.candidate_metrics = {
             name: metrics.as_dict() for name, metrics in scored.items()
         }
         if self.selected_candidate == DEGREE_HOUR_CANDIDATE:
             self._regression = regression
+        return calibration_actual.where(~in_selection)
 
     def _predict_benchmark(
         self, weather: pd.DataFrame, *, start: pd.Timestamp, horizon: int

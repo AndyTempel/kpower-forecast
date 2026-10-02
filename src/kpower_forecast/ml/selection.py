@@ -108,11 +108,10 @@ class DegreeHourRegression:
             )[:, None],
         ]
         for name, scale in zip(self.extra_features, scales[1:], strict=True):
-            values = (
-                pd.to_numeric(frame[name], errors="coerce").fillna(0.0)
-                if name in frame
-                else pd.Series(0.0, index=frame.index)
-            )
+            if name not in frame:
+                # Zero-filling an input the fit used would serve another model.
+                raise ValueError(f"degree-hour regression input {name!r} is missing")
+            values = pd.to_numeric(frame[name], errors="coerce").fillna(0.0)
             columns.append((values.to_numpy(dtype=float) / scale)[:, None])
         return np.hstack(columns)
 
@@ -133,6 +132,13 @@ class DegreeHourRegression:
         ]
         if len(usable) < 24:
             return False
+        # Only inputs with data take part; prediction then requires them.
+        self.extra_features = tuple(
+            name
+            for name in self.extra_features
+            if name in usable
+            and pd.to_numeric(usable[name], errors="coerce").notna().any()
+        )
         scales = [1.0]
         for name in self.extra_features:
             values = (

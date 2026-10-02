@@ -4,7 +4,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from kpower_forecast.ml import KPowerMLForecast, MLBackendType, MLForecastType
+from kpower_forecast.ml import (
+    KPowerMLConfig,
+    KPowerMLForecast,
+    MLBackendType,
+    MLForecastType,
+)
 from kpower_forecast.ml.baselines import BASELINE_NAME
 from kpower_forecast.ml.selection import (
     DEGREE_HOUR_CANDIDATE,
@@ -190,3 +195,43 @@ def test_degree_hour_regression_fits_when_a_local_hour_is_never_observed() -> No
 
     assert regression.fit(frame)
     assert regression.predict(weather).notna().all()
+
+
+def test_selection_and_interval_calibration_use_disjoint_holdout_halves(
+    monkeypatch, tmp_path
+) -> None:
+    weather = _weather("2026-01-05", _HOURS)
+    forecast = _forecast(monkeypatch, tmp_path, _Backend(), weather)
+    frame = weather.assign(y=_heating(weather))
+    train, holdout = frame.iloc[:118], frame.iloc[118:].reset_index(drop=True)
+    actual = holdout["y"]
+    predictions = {ML_CANDIDATE: pd.Series(1.0, index=actual.index)}
+
+    conformal_actual = forecast._select_candidate(train, holdout, actual, predictions)
+
+    half = len(actual) // 2
+    assert forecast.candidate_metrics[ML_CANDIDATE]["rows"] == half
+    assert conformal_actual.iloc[:half].isna().all()
+    pd.testing.assert_series_equal(conformal_actual.iloc[half:], actual.iloc[half:])
+
+
+def test_regression_inputs_reject_target_leakage_and_missing_columns() -> None:
+    with pytest.raises(ValueError, match="must not include"):
+        KPowerMLConfig(
+            model_id="heating",
+            latitude=46.0,
+            longitude=14.0,
+            forecast_type=MLForecastType.HVAC,
+            candidate_selection=True,
+            regression_extra_features=["y"],
+        )
+
+    weather = _weather("2026-01-05", _HOURS)
+    regression = DegreeHourRegression(
+        base_temperature_c=16.0,
+        extra_features=("shortwave_radiation",),
+        timezone="Europe/Ljubljana",
+    )
+    assert regression.fit(weather.assign(y=_heating(weather)))
+    with pytest.raises(ValueError, match="shortwave_radiation"):
+        regression.predict(weather.drop(columns="shortwave_radiation"))
