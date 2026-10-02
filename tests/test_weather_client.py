@@ -368,6 +368,7 @@ def test_fetch_forecast_fills_short_horizon_from_long_model(
 def test_fetch_forecast_fills_empty_best_match_from_long_model(
     monkeypatch, caplog
 ) -> None:
+    caplog.set_level(logging.INFO, logger="kpower_forecast.weather_client")
     client = WeatherClient(
         lat=40.7128,
         lon=-74.0060,
@@ -410,10 +411,15 @@ def test_fetch_forecast_fills_empty_best_match_from_long_model(
     assert len(frame) == 96
     assert frame["temperature_2m"].isna().sum() == 0
     assert frame["temperature_2m"].tolist() == [20.0] * 96
-    assert "no usable required weather data" in caplog.text
+    assert "complete required weather data until none" in caplog.text
 
 
-def test_fetch_forecast_fills_null_padded_tail_from_long_model(monkeypatch) -> None:
+def test_fetch_forecast_fills_null_padded_tail_from_long_model(
+    monkeypatch, caplog
+) -> None:
+    # Live shape: the 15-min primary ends about 2.5 days out and pads the rest
+    # of a longer horizon with nulls. A successful fill is routine, not a warning.
+    caplog.set_level(logging.INFO, logger="kpower_forecast.weather_client")
     client = WeatherClient(
         lat=46.0,
         lon=14.0,
@@ -461,6 +467,46 @@ def test_fetch_forecast_fills_null_padded_tail_from_long_model(monkeypatch) -> N
     assert frame.loc[4, "temperature_2m"] == 20.0
     complete_columns = frame[["temperature_2m", "cloud_cover", "shortwave_radiation"]]
     assert complete_columns.notna().all().all()
+    assert "until 2026-05-01T00:45:00+00:00" in caplog.text
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
+def test_fetch_forecast_warns_when_long_model_leaves_required_gaps(
+    monkeypatch, caplog
+) -> None:
+    client = WeatherClient(
+        lat=46.0,
+        lon=14.0,
+        config=WeatherConfig(cache_enabled=False),
+    )
+    times = [
+        timestamp.strftime("%Y-%m-%dT%H:%M")
+        for timestamp in pd.date_range("2026-05-01T00:00", periods=96, freq="15min")
+    ]
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        # Both models stop after one hour of data.
+        return Response(_weather_payload(times, [10.0] * 4 + [None] * 92))
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+
+    client.fetch_forecast(days=1)
+
+    assert any(
+        record.levelno == logging.WARNING
+        and "did not complete the required weather data" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_process_response_prefers_minutely_15_payload() -> None:

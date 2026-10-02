@@ -481,18 +481,25 @@ class WeatherClient:
             self._warn_partial_forecast(primary, days, request_field)
             return primary
 
+        # Short-range primary models routinely end before a multi-day horizon,
+        # so the fill itself is informational. Only an incomplete result after
+        # the fill is worth a warning.
         if not has_full_horizon:
-            logger.warning(
+            logger.info(
                 "Primary weather forecast returned %s rows for requested "
-                "%s-day horizon. Fetching long-horizon model '%s'.",
+                "%s-day horizon. Filling from long-horizon model '%s'.",
                 self._forecast_row_count(primary),
                 days,
                 long_horizon_model,
             )
         else:
-            logger.warning(
-                "Primary weather forecast returned no usable required weather "
-                "data. Fetching long-horizon model '%s'.",
+            covered_until = self._required_weather_covered_until(primary)
+            logger.info(
+                "Primary weather forecast has complete required weather data "
+                "until %s. Filling the rest of the %s-day horizon from "
+                "long-horizon model '%s'.",
+                "none" if covered_until is None else covered_until.isoformat(),
+                days,
                 long_horizon_model,
             )
         params = self._build_forecast_params(
@@ -510,8 +517,42 @@ class WeatherClient:
         )
         long_horizon = self._process_response(long_data, interpolate=False)
         merged = self._merge_weather_frames(primary=primary, fallback=long_horizon)
+        if not self._has_required_weather_data(merged):
+            logger.warning(
+                "Long-horizon weather model '%s' did not complete the required "
+                "weather data; returning incomplete weather data.",
+                long_horizon_model,
+            )
         self._warn_partial_forecast(merged, days, request_field)
         return merged
+
+    def _required_weather_covered_until(
+        self, df: pd.DataFrame
+    ) -> Optional[pd.Timestamp]:
+        """Return the last timestamp before the first incomplete required row.
+
+        Args:
+            df: Weather dataframe with a ``ds`` column.
+
+        Returns:
+            Last leading timestamp with complete required weather data, or
+            ``None`` when the first row is already incomplete or ``ds`` is absent.
+        """
+        columns = [
+            column
+            for column in self.config.required_hourly_variables
+            if column in df and column not in ZERO_FILLED_REQUIRED_COLUMNS
+        ]
+        if "ds" not in df.columns or not columns:
+            return None
+        ordered = df.assign(ds=pd.to_datetime(df["ds"], utc=True)).sort_values("ds")
+        complete = (
+            ordered[columns].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
+        )
+        leading = complete.astype(int).cumprod().astype(bool)
+        if not bool(leading.any()):
+            return None
+        return pd.Timestamp(ordered.loc[leading, "ds"].iloc[-1])
 
     def _has_required_weather_data(self, df: pd.DataFrame) -> bool:
         """Return whether every row has complete required weather coverage.
