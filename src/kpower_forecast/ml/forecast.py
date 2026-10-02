@@ -263,7 +263,7 @@ class KPowerMLForecast:
                 "max_bridged_gap_intervals": self.config.max_bridged_gap_intervals,
                 "bridged_rows": self.training_bridged_rows,
                 "candidate_selection": {
-                    "enabled": self.config.candidate_selection,
+                    **_selection_settings(self.config),
                     "metric": SELECTION_METRIC,
                     "selected": self.selected_candidate,
                     "reason": self.selection_reason,
@@ -535,7 +535,7 @@ class KPowerMLForecast:
             != self.config.max_bridged_gap_intervals
         ):
             return
-        if _stored_selection_enabled(manifest) != self.config.candidate_selection:
+        if not _selection_settings_match(manifest, self.config):
             return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
@@ -581,9 +581,9 @@ class KPowerMLForecast:
             raise ForecastAlignmentError(
                 "stored model gap-bridging limit requires a full retrain"
             )
-        if _stored_selection_enabled(manifest) != self.config.candidate_selection:
+        if not _selection_settings_match(manifest, self.config):
             raise ForecastAlignmentError(
-                "stored model candidate-selection mode requires a full retrain"
+                "stored model candidate-selection settings require a full retrain"
             )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
@@ -1045,7 +1045,23 @@ class KPowerMLForecast:
         }
 
 
-def _stored_selection_enabled(manifest: MLModelManifest) -> bool:
-    """Return whether a stored artifact was trained with candidate selection."""
-    selection = manifest.metadata.get("candidate_selection")
-    return bool(isinstance(selection, dict) and selection.get("enabled"))
+def _selection_settings(config: KPowerMLConfig) -> dict[str, Any]:
+    """Return the settings that define which candidates are trained."""
+    settings: dict[str, Any] = {"enabled": config.candidate_selection}
+    if config.candidate_selection:
+        settings["regression_base_temperature_c"] = config.regression_base_temperature_c
+        settings["regression_extra_features"] = list(config.regression_extra_features)
+    return settings
+
+
+def _selection_settings_match(
+    manifest: MLModelManifest, config: KPowerMLConfig
+) -> bool:
+    """Return whether a stored artifact was trained with this selection setup."""
+    stored = manifest.metadata.get("candidate_selection")
+    stored = stored if isinstance(stored, dict) else {}
+    expected = _selection_settings(config)
+    return all(
+        stored.get(key, False if key == "enabled" else None) == value
+        for key, value in expected.items()
+    )

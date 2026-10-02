@@ -308,8 +308,9 @@ RMSE, not MAE, decides because MAE rewards an always-off forecast of an on/off l
 intervals are calibrated on the winner's holdout residuals. With fewer than
 `min_selection_holdout_rows` measured holdout rows (default 96) the ML model is kept and
 `selection_reason` is `holdout_too_short`. `selected_candidate`, `candidate_metrics` and the
-regression coefficients are persisted in the manifest. An artifact trained with the other
-`candidate_selection` setting is retrained.
+regression coefficients are persisted in the manifest. An artifact trained with different
+selection settings (`candidate_selection`, `regression_base_temperature_c`,
+`regression_extra_features`) is retrained.
 
 ---
 

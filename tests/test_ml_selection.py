@@ -168,7 +168,7 @@ def test_selection_keeps_ml_when_holdout_is_too_short(monkeypatch, tmp_path) -> 
     assert forecast.candidate_metrics == {}
 
 
-def test_artifact_from_other_selection_mode_is_not_restored(
+def test_artifact_from_other_selection_settings_is_not_restored(
     monkeypatch, tmp_path
 ) -> None:
     weather = _weather("2026-01-05", _HOURS)
@@ -178,8 +178,19 @@ def test_artifact_from_other_selection_mode_is_not_restored(
     legacy = _forecast(
         monkeypatch, tmp_path, _Backend(), weather, candidate_selection=False
     )
-
     assert legacy.training_end is None
+
+    # Changed regression settings must not reuse the stored winner either.
+    retuned = _forecast(
+        monkeypatch,
+        tmp_path,
+        _Backend(),
+        weather,
+        regression_base_temperature_c=18.0,
+    )
+    assert retuned.training_end is None
+    same = _forecast(monkeypatch, tmp_path, _Backend(), weather)
+    assert same.training_end is not None
 
 
 def test_degree_hour_regression_fits_when_a_local_hour_is_never_observed() -> None:
