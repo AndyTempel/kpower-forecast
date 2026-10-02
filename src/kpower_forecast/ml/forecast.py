@@ -17,11 +17,19 @@ from kpower_forecast.ml.alignment import (
     validate_timestamp_grid,
 )
 from kpower_forecast.ml.backends import create_backend
-from kpower_forecast.ml.baselines import local_slot_weekday_class_median
+from kpower_forecast.ml.baselines import BASELINE_NAME, local_slot_weekday_class_median
 from kpower_forecast.ml.bias_correction import WeatherBiasCorrector
 from kpower_forecast.ml.config import KPowerMLConfig, MLBackendType, MLForecastType
 from kpower_forecast.ml.conformal import SplitConformalCalibrator
 from kpower_forecast.ml.features import MLFeatureBuilder
+from kpower_forecast.ml.selection import (
+    DEGREE_HOUR_CANDIDATE,
+    ML_CANDIDATE,
+    SELECTION_METRIC,
+    DegreeHourRegression,
+    score_candidate,
+    select_candidate,
+)
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 from kpower_forecast.utils import calculate_solar_elevation, normalize_to_instant_kwh
 from kpower_forecast.weather_client import WeatherClient, WeatherConfig
@@ -120,6 +128,10 @@ class KPowerMLForecast:
         self.conformal = SplitConformalCalibrator(self.config.interval_levels)
         self._training_end: pd.Timestamp | None = None
         self.training_bridged_rows: int = 0
+        self.selected_candidate: str = ML_CANDIDATE
+        self.candidate_metrics: dict[str, dict[str, float | int]] = {}
+        self.selection_reason: Optional[str] = None
+        self._regression: Optional[DegreeHourRegression] = None
         self._restore_existing_manifest()
 
     def _weather_config_with_default_cache(
@@ -201,11 +213,28 @@ class KPowerMLForecast:
             .reset_index(drop=True)
             .where(calibration_measured.reset_index(drop=True))
         )
+        holdout_predictions = {
+            ML_CANDIDATE: calibration_predictions["yhat"].reset_index(drop=True)
+        }
+        self._select_candidate(
+            train_frame.loc[train_measured].reset_index(drop=True),
+            calibration_frame.reset_index(drop=True),
+            calibration_actual,
+            holdout_predictions,
+        )
+        # Prediction intervals describe the forecast that is actually served.
         self.conformal.fit(
-            actual=calibration_actual, predicted=calibration_predictions["yhat"]
+            actual=calibration_actual,
+            predicted=holdout_predictions[self.selected_candidate],
         )
         self.training_bridged_rows = int(bridged_mask.sum())
         self.backend.fit(prepared, full_features, calibration_frame)
+        if self._regression is not None:
+            prepared_measured = ~pd.to_datetime(prepared["ds"], utc=True).isin(
+                bridged_times
+            )
+            if not self._regression.fit(prepared.loc[prepared_measured]):
+                raise ValueError("degree-hour regression refit failed")
 
         self.storage.invalidate_manifest()
         manifest = MLModelManifest(
@@ -232,6 +261,16 @@ class KPowerMLForecast:
                 "preserve_gaps": self.config.preserve_gaps,
                 "max_bridged_gap_intervals": self.config.max_bridged_gap_intervals,
                 "bridged_rows": self.training_bridged_rows,
+                "candidate_selection": {
+                    "enabled": self.config.candidate_selection,
+                    "metric": SELECTION_METRIC,
+                    "selected": self.selected_candidate,
+                    "reason": self.selection_reason,
+                    "candidates": self.candidate_metrics,
+                },
+                "degree_hour_regression": (
+                    self._regression.to_dict() if self._regression is not None else None
+                ),
             },
         )
         self.storage.save_training_frame(complete_history)
@@ -304,15 +343,20 @@ class KPowerMLForecast:
             start=model_start,
             horizon=model_horizon,
         )
-        features = self.feature_builder.build(aligned_weather)
-        validate_timestamp_grid(
-            features,
-            interval_minutes=interval_minutes,
-            expected_start=model_start,
-            expected_length=model_horizon,
-            label="forecast features",
-        )
-        forecast = self.backend.predict(features, horizon=model_horizon)
+        if self.selected_candidate == ML_CANDIDATE:
+            features = self.feature_builder.build(aligned_weather)
+            validate_timestamp_grid(
+                features,
+                interval_minutes=interval_minutes,
+                expected_start=model_start,
+                expected_length=model_horizon,
+                label="forecast features",
+            )
+            forecast = self.backend.predict(features, horizon=model_horizon)
+        else:
+            forecast = self._predict_benchmark(
+                aligned_weather, start=model_start, horizon=model_horizon
+            )
         validate_timestamp_grid(
             forecast,
             interval_minutes=interval_minutes,
@@ -490,6 +534,8 @@ class KPowerMLForecast:
             != self.config.max_bridged_gap_intervals
         ):
             return
+        if _stored_selection_enabled(manifest) != self.config.candidate_selection:
+            return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         if (
@@ -534,6 +580,10 @@ class KPowerMLForecast:
             raise ForecastAlignmentError(
                 "stored model gap-bridging limit requires a full retrain"
             )
+        if _stored_selection_enabled(manifest) != self.config.candidate_selection:
+            raise ForecastAlignmentError(
+                "stored model candidate-selection mode requires a full retrain"
+            )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
                 "stored ML backend does not match configured backend: "
@@ -550,6 +600,7 @@ class KPowerMLForecast:
             raise ForecastAlignmentError("stored model has no training cutoff")
         self._training_end = pd.to_datetime(manifest.training_end, utc=True)
         self.training_bridged_rows = int(manifest.metadata.get("bridged_rows", 0))
+        self._restore_selection(manifest)
         self.conformal = SplitConformalCalibrator.from_dict(
             manifest.interval_levels, manifest.conformal_quantiles
         )
@@ -583,6 +634,153 @@ class KPowerMLForecast:
             )
             for row in forecast.itertuples(index=False)
         ]
+
+    def _new_regression(self) -> DegreeHourRegression:
+        """Return an unfitted degree-hour regression for this configuration."""
+        return DegreeHourRegression(
+            base_temperature_c=self.config.regression_base_temperature_c,
+            extra_features=tuple(self.config.regression_extra_features),
+            timezone=self.config.timezone,
+        )
+
+    def _select_candidate(
+        self,
+        train_measured: pd.DataFrame,
+        calibration_frame: pd.DataFrame,
+        calibration_actual: pd.Series,
+        predictions: dict[str, pd.Series],
+    ) -> None:
+        """Score benchmarks on the calibration holdout and pick the winner.
+
+        All candidates forecast the holdout from its first row, trained only on
+        measured rows before it. ``predictions`` gains each benchmark's holdout
+        values. Without enough measured holdout rows the ML model is kept.
+
+        Args:
+            train_measured: Measured training rows before the holdout.
+            calibration_frame: Contiguous holdout rows with weather columns.
+            calibration_actual: Holdout targets, NaN where bridged.
+            predictions: Holdout predictions keyed by candidate name.
+        """
+        self.selected_candidate = ML_CANDIDATE
+        self.candidate_metrics = {}
+        self.selection_reason = None
+        self._regression = None
+        if not self.config.candidate_selection:
+            return
+        if (
+            int(calibration_actual.notna().sum())
+            < self.config.min_selection_holdout_rows
+        ):
+            self.selection_reason = "holdout_too_short"
+            return
+        regression = self._new_regression()
+        if regression.fit(train_measured):
+            predictions[DEGREE_HOUR_CANDIDATE] = regression.predict(
+                calibration_frame
+            ).reset_index(drop=True)
+        holdout_times = pd.to_datetime(calibration_frame["ds"], utc=True)
+        try:
+            baseline = local_slot_weekday_class_median(
+                train_measured[["ds", "y"]],
+                origin=holdout_times.iloc[0].to_pydatetime(),
+                periods=len(calibration_frame),
+                interval_minutes=self.config.interval_minutes,
+                timezone=self.config.timezone,
+            )
+        except ForecastAlignmentError:
+            pass
+        else:
+            predictions[BASELINE_NAME] = (
+                baseline.set_index(pd.to_datetime(baseline["ds"], utc=True))["yhat"]
+                .reindex(holdout_times)
+                .reset_index(drop=True)
+            )
+        scored = {
+            name: metrics
+            for name, values in predictions.items()
+            if (metrics := score_candidate(calibration_actual, values)) is not None
+        }
+        if ML_CANDIDATE not in scored:
+            self.selection_reason = "ml_holdout_unscored"
+            return
+        self.selected_candidate = select_candidate(scored)
+        self.candidate_metrics = {
+            name: metrics.as_dict() for name, metrics in scored.items()
+        }
+        if self.selected_candidate == DEGREE_HOUR_CANDIDATE:
+            self._regression = regression
+
+    def _predict_benchmark(
+        self, weather: pd.DataFrame, *, start: pd.Timestamp, horizon: int
+    ) -> pd.DataFrame:
+        """Forecast the model grid with the selected benchmark.
+
+        Args:
+            weather: Bias-corrected weather aligned to the model grid.
+            start: First post-training model timestamp.
+            horizon: Number of model-grid rows.
+
+        Returns:
+            Dataframe with ``ds`` and ``yhat`` on the model grid.
+
+        Raises:
+            ForecastAlignmentError: If the benchmark cannot cover the grid.
+        """
+        grid = pd.date_range(
+            start=start,
+            periods=horizon,
+            freq=f"{self.config.interval_minutes}min",
+            tz="UTC",
+        )
+        if self.selected_candidate == DEGREE_HOUR_CANDIDATE:
+            if self._regression is None:
+                raise ForecastAlignmentError("degree-hour regression is unavailable")
+            values = self._regression.predict(weather.reset_index(drop=True))
+            if values.isna().any():
+                raise ForecastAlignmentError(
+                    "degree-hour regression is missing outdoor temperature"
+                )
+        elif self.selected_candidate == BASELINE_NAME:
+            history = self.storage.load_training_frame()
+            if history is None:
+                raise ForecastAlignmentError("baseline training history is unavailable")
+            values = local_slot_weekday_class_median(
+                history,
+                origin=start.to_pydatetime(),
+                periods=horizon,
+                interval_minutes=self.config.interval_minutes,
+                timezone=self.config.timezone,
+            )["yhat"]
+        else:
+            raise ForecastAlignmentError(
+                f"unknown selected candidate {self.selected_candidate!r}"
+            )
+        return pd.DataFrame({"ds": grid, "yhat": values.to_numpy(dtype=float)})
+
+    def _restore_selection(self, manifest: MLModelManifest) -> None:
+        """Restore the selected candidate and its state from a manifest."""
+        selection = manifest.metadata.get("candidate_selection")
+        selection = selection if isinstance(selection, dict) else {}
+        self.selected_candidate = str(selection.get("selected") or ML_CANDIDATE)
+        candidates = selection.get("candidates")
+        self.candidate_metrics = candidates if isinstance(candidates, dict) else {}
+        reason = selection.get("reason")
+        self.selection_reason = reason if isinstance(reason, str) else None
+        self._regression = None
+        if self.selected_candidate == DEGREE_HOUR_CANDIDATE:
+            payload = manifest.metadata.get("degree_hour_regression")
+            if not isinstance(payload, dict):
+                raise ForecastAlignmentError(
+                    "stored degree-hour regression is missing; a full retrain is "
+                    "required"
+                )
+            self._regression = DegreeHourRegression.from_dict(payload)
+        elif self.selected_candidate not in {ML_CANDIDATE, BASELINE_NAME}:
+            raise ForecastAlignmentError(
+                f"stored candidate {self.selected_candidate!r} is unknown; a full "
+                "retrain is required"
+            )
 
     def predict_baseline(
         self,
@@ -837,3 +1035,9 @@ class KPowerMLForecast:
             "inverter_ac_limit_kw": self.config.inverter_ac_limit_kw,
             "grid_export_limit_kw": self.config.grid_export_limit_kw,
         }
+
+
+def _stored_selection_enabled(manifest: MLModelManifest) -> bool:
+    """Return whether a stored artifact was trained with candidate selection."""
+    selection = manifest.metadata.get("candidate_selection")
+    return bool(isinstance(selection, dict) and selection.get("enabled"))
