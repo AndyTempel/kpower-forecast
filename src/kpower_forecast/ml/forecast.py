@@ -43,7 +43,7 @@ DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
 SANITIZED_CONFORMAL_STATE_VERSION: int = 1
 # The hourly archive's last value is 23:00 while the recent forecast starts at
 # 00:00, so up to one hour between the two sources may be interpolated.
-MAX_WEATHER_SEAM = pd.Timedelta(hours=1)
+MAX_WEATHER_SEAM: pd.Timedelta = pd.Timedelta(hours=1)
 HISTORY_POLICY_VERSION: int = 2
 
 

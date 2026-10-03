@@ -587,7 +587,7 @@ def test_ml_forecast_caps_recent_weather_to_configured_one_day(
 
 @pytest.mark.parametrize("archive_gap_hours", [1, 2])
 def test_ml_forecast_bridges_only_a_short_archive_forecast_seam(
-    monkeypatch, tmp_path, archive_gap_hours: int
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, archive_gap_hours: int
 ) -> None:
     # The hourly archive ends at 23:00 on the day before the recent forecast
     # window, which starts at 00:00: 23:15-23:45 come from neither source.
