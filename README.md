@@ -297,6 +297,24 @@ row no longer splits the latest structural segment. Longer, leading and trailing
 Bridged rows are excluded from weather-bias fitting and conformal calibration, the persisted
 baseline history keeps the original gaps, and the manifest records the limit and bridged row count.
 
+### Hybrid structure (`hybrid_structure`)
+
+The Nixtla hybrid backend has two structures for non-solar targets:
+
+- `recursive_seasonal_naive` (default): a seasonal-naive structural forecast (the last observed
+  day, repeated) corrected by a LightGBM residual model fed its own lags recursively. It suits
+  smooth series. For loads with irregular events, such as an on/off heat pump, it replays one
+  day's events into every future day, and the recursion can oscillate over multi-day horizons.
+- `profile_direct`: a mean profile per local quarter-hour and weekday class over the last
+  `profile_lookback_days` (default 28), plus a regularised LightGBM residual model that predicts
+  every future row directly from weather and calendar features. It uses no lags and no
+  recursion, so a 5-day forecast does not drift or oscillate with lead time. Not available for
+  solar.
+
+On a site with a fixed-speed heat pump (12 rolling origins, RMSE at +24/+120 h), `profile_direct`
+improved whole-site consumption from 1100/1404 W to 976/1027 W and heating from 1046/1170 W to
+832/907 W. Changing the structure retrains stored artifacts.
+
 ### Holdout candidate selection
 
 Consumption and HVAC targets can set `candidate_selection=True` (default off; not for solar).
