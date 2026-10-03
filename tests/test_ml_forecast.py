@@ -585,6 +585,70 @@ def test_ml_forecast_caps_recent_weather_to_configured_one_day(
     assert weather["ds"].min() == model_start
 
 
+@pytest.mark.parametrize("archive_gap_hours", [1, 2])
+def test_ml_forecast_bridges_only_a_short_archive_forecast_seam(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, archive_gap_hours: int
+) -> None:
+    # The hourly archive ends at 23:00 on the day before the recent forecast
+    # window, which starts at 00:00: 23:15-23:45 come from neither source.
+    current_start = pd.Timestamp.now(tz="UTC").ceil("15min")
+    model_start = current_start - pd.Timedelta(days=3)
+    forecast = KPowerMLForecast(
+        model_id="weather-seam",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=15,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+    )
+    recent_start = current_start.floor("D") - pd.Timedelta(days=1)
+    archive_end = recent_start - pd.Timedelta(hours=archive_gap_hours)
+    archive = pd.DataFrame(
+        {
+            "ds": pd.date_range(model_start, archive_end, freq="15min"),
+            "temperature_2m": 10.0,
+        }
+    )
+    recent = pd.DataFrame(
+        {
+            "ds": pd.date_range(
+                recent_start, current_start + pd.Timedelta(days=1), freq="15min"
+            ),
+            "temperature_2m": 14.0,
+        }
+    )
+    monkeypatch.setattr(
+        forecast.weather_client, "fetch_forecast", lambda days, past_days=0: recent
+    )
+    monkeypatch.setattr(
+        forecast.weather_client, "fetch_historical", lambda start, end: archive
+    )
+    monkeypatch.setattr(
+        forecast.weather_client,
+        "resample_weather",
+        lambda frame, requested_interval: cast(pd.DataFrame, frame),
+    )
+
+    weather = forecast._weather_for_model_grid(
+        start=model_start, horizon=4 * 24 * 3, forecast_days=2
+    )
+
+    seam = weather.set_index("ds").loc[
+        archive_end + pd.Timedelta(minutes=15) : recent_start
+        - pd.Timedelta(minutes=15),
+        "temperature_2m",
+    ]
+    if archive_gap_hours == 1:
+        assert seam.tolist() == pytest.approx([11.0, 12.0, 13.0])
+        forecast._align_weather_grid(weather, start=model_start, horizon=4 * 24 * 3)
+    else:
+        # A longer seam is missing data, not a boundary artefact.
+        assert seam.empty
+        with pytest.raises(ForecastAlignmentError, match="missing 7 required"):
+            forecast._align_weather_grid(weather, start=model_start, horizon=4 * 24 * 3)
+
+
 def test_ml_forecast_rejects_missing_weather_grid_timestamp(
     monkeypatch, tmp_path
 ) -> None:
