@@ -5,7 +5,12 @@ import pytest
 
 from kpower_forecast.ml.alignment import ForecastAlignmentError
 from kpower_forecast.ml.backends.nixtla import NixtlaHybridBackend
-from kpower_forecast.ml.config import HybridStructure, KPowerMLConfig, MLForecastType
+from kpower_forecast.ml.config import (
+    HybridStructure,
+    KPowerMLConfig,
+    MLBackendType,
+    MLForecastType,
+)
 from kpower_forecast.ml.forecast import _structure_matches
 
 
@@ -354,13 +359,24 @@ def test_profile_direct_does_not_replay_a_one_off_event_into_future_days(
     )
 
 
-def test_profile_direct_structure_is_rejected_for_solar() -> None:
-    with pytest.raises(ValueError, match="not for solar"):
+@pytest.mark.parametrize(
+    ("forecast_type", "backend", "message"),
+    [
+        (MLForecastType.SOLAR, MLBackendType.NIXTLA_HYBRID, "not for solar"),
+        # Other backends would silently ignore the requested structure.
+        (MLForecastType.CONSUMPTION, MLBackendType.NEURALFORECAST, "nixtla_hybrid"),
+    ],
+)
+def test_profile_direct_structure_is_rejected_where_it_cannot_apply(
+    forecast_type: MLForecastType, backend: MLBackendType, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
         KPowerMLConfig(
-            model_id="solar",
+            model_id="model",
             latitude=46.0,
             longitude=14.0,
-            forecast_type=MLForecastType.SOLAR,
+            forecast_type=forecast_type,
+            backend=backend,
             hybrid_structure=HybridStructure.PROFILE_DIRECT,
         )
 

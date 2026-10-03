@@ -147,12 +147,15 @@ class KPowerMLConfig(BaseModel):
         """
         if self.candidate_selection and self.forecast_type == MLForecastType.SOLAR:
             raise ValueError("candidate_selection is not supported for solar")
-        if (
-            self.hybrid_structure == HybridStructure.PROFILE_DIRECT
-            and self.forecast_type == MLForecastType.SOLAR
-        ):
-            # Solar uses its radiation profile baseline.
-            raise ValueError("profile_direct hybrid structure is not for solar")
+        if self.hybrid_structure == HybridStructure.PROFILE_DIRECT:
+            if self.forecast_type == MLForecastType.SOLAR:
+                # Solar uses its radiation profile baseline.
+                raise ValueError("profile_direct hybrid structure is not for solar")
+            if self.backend != MLBackendType.NIXTLA_HYBRID:
+                # Other backends would silently ignore the requested structure.
+                raise ValueError(
+                    "profile_direct hybrid structure requires the nixtla_hybrid backend"
+                )
         reserved = {"ds", "y", "temperature_2m"}.intersection(
             self.regression_extra_features
         )

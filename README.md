@@ -313,7 +313,9 @@ The Nixtla hybrid backend has two structures for non-solar targets:
 
 On a site with a fixed-speed heat pump (12 rolling origins, RMSE at +24/+120 h), `profile_direct`
 improved whole-site consumption from 1100/1404 W to 976/1027 W and heating from 1046/1170 W to
-832/907 W. Changing the structure retrains stored artifacts.
+832/907 W. The structure and lookback are part of artifact compatibility: a stored artifact
+trained with other values is not restored on construction, `train(force=True)` retrains it, and
+a non-forced `train()` raises "requires a full retrain", like the other compatibility settings.
 
 ### Holdout candidate selection
 
@@ -333,7 +335,7 @@ intervals are calibrated on the winner's holdout residuals. With fewer than
 `selection_reason` is `holdout_too_short`. `selected_candidate`, `candidate_metrics` and the
 regression coefficients are persisted in the manifest. An artifact trained with different
 selection settings (`candidate_selection`, `regression_base_temperature_c`,
-`regression_extra_features`) is retrained.
+`regression_extra_features`) is not restored and needs `train(force=True)`.
 
 ---
 
