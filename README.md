@@ -285,6 +285,11 @@ Callers can enable `preserve_gaps`. Power samples are then converted independent
 interval duration, cumulative energy is differenced only across adjacent valid samples, and missing
 target intervals remain missing through normalization and feature construction.
 
+Prediction weather for an elapsed prefix combines archive and recent-forecast weather. Only the
+seam between the two sources, at most one hour (the hourly archive ends at 23:00 while the recent
+forecast starts at 00:00), is interpolated in time; any other missing weather slot still fails
+grid alignment.
+
 Telemetry with intermittent dropouts can set `max_bridged_gap_intervals` (default `0`, off;
 requires `preserve_gaps=True`, power or instant-energy input and a non-solar target). Interior
 missing runs up to that many intervals are bridged linearly after normalization so a single dropped

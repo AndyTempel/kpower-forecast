@@ -41,6 +41,9 @@ DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "limit_kw",
 )
 SANITIZED_CONFORMAL_STATE_VERSION: int = 1
+# The hourly archive's last value is 23:00 while the recent forecast starts at
+# 00:00, so up to one hour between the two sources may be interpolated.
+MAX_WEATHER_SEAM = pd.Timedelta(hours=1)
 HISTORY_POLICY_VERSION: int = 2
 
 
@@ -466,8 +469,56 @@ class KPowerMLForecast:
         if "ds" not in combined.columns:
             raise ForecastAlignmentError("weather data is missing 'ds'")
         combined["ds"] = pd.to_datetime(combined["ds"], utc=True)
-        return (
+        combined = (
             combined.drop_duplicates(subset="ds", keep="last")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+        if len(frames) == 2:
+            combined = self._fill_weather_seam(
+                combined, seam_end=forecast_start, interval=interval
+            )
+        return combined
+
+    @staticmethod
+    def _fill_weather_seam(
+        weather: pd.DataFrame, *, seam_end: pd.Timestamp, interval: pd.Timedelta
+    ) -> pd.DataFrame:
+        """Interpolate the short gap between archive and forecast weather.
+
+        Only grid slots strictly between the last archive row and the first
+        forecast row are added, and only when that seam is at most
+        ``MAX_WEATHER_SEAM``. Gaps inside either source are left missing so
+        grid alignment still rejects them.
+
+        Args:
+            weather: Combined, de-duplicated weather sorted by ``ds``.
+            seam_end: First timestamp supplied by the forecast source.
+            interval: Model grid interval.
+
+        Returns:
+            Weather with the seam slots interpolated in time, or unchanged.
+        """
+        before = weather.loc[weather["ds"] < seam_end, "ds"]
+        if before.empty:
+            return weather
+        seam_start = before.max()
+        if not interval < seam_end - seam_start <= MAX_WEATHER_SEAM:
+            return weather
+        missing = pd.date_range(
+            seam_start + interval, seam_end - interval, freq=interval, tz="UTC"
+        )
+        indexed = weather.set_index("ds")
+        numeric = indexed.select_dtypes("number").columns
+        bridge = indexed.loc[[seam_start, seam_end], numeric]
+        filled = (
+            bridge.reindex(bridge.index.union(missing))
+            .interpolate(method="time")
+            .loc[missing]
+        )
+        filled.index.name = "ds"
+        return (
+            pd.concat([weather, filled.reset_index()], ignore_index=True)
             .sort_values("ds")
             .reset_index(drop=True)
         )
