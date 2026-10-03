@@ -600,10 +600,12 @@ class NixtlaHybridBackend:
         }
         self._load_profile_mean = float(state.get("load_profile_mean", 0.0))
         self._fitted = bool(state.get("fitted", False))
-        if self._profile_direct and state.get("hybrid_structure") != (
-            HybridStructure.PROFILE_DIRECT.value
-        ):
-            # Stored state from the other structure cannot serve this one.
+        # State saved before the setting existed is recursive. State from the
+        # other structure cannot serve this one, in either direction.
+        stored_structure = state.get(
+            "hybrid_structure", HybridStructure.RECURSIVE_SEASONAL_NAIVE.value
+        )
+        if stored_structure != self.config.hybrid_structure.value:
             self._fitted = False
 
         models_path = path / MODELS_FILE

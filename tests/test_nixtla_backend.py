@@ -358,6 +358,15 @@ def test_profile_direct_does_not_replay_a_one_off_event_into_future_days(
         restored.predict(_calendar_features(future_ds), horizon=5 * 96), forecast
     )
 
+    # A recursive backend must not serve profile_direct state.
+    recursive = NixtlaHybridBackend(
+        backend.config.model_copy(
+            update={"hybrid_structure": HybridStructure.RECURSIVE_SEASONAL_NAIVE}
+        )
+    )
+    recursive.load(tmp_path)
+    assert recursive._fitted is False
+
 
 @pytest.mark.parametrize(
     ("forecast_type", "backend", "message"),
