@@ -5,7 +5,13 @@ import pytest
 
 from kpower_forecast.ml.alignment import ForecastAlignmentError
 from kpower_forecast.ml.backends.nixtla import NixtlaHybridBackend
-from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
+from kpower_forecast.ml.config import (
+    HybridStructure,
+    KPowerMLConfig,
+    MLBackendType,
+    MLForecastType,
+)
+from kpower_forecast.ml.forecast import _structure_matches
 
 
 def test_non_solar_targets_do_not_fit_solar_radiation_baseline() -> None:
@@ -292,3 +298,121 @@ def test_nixtla_backend_does_not_silence_residual_prediction_error() -> None:
 
     with pytest.raises(ForecastAlignmentError, match="rejected the aligned"):
         backend._predict_residual_adjustment(4, future)
+
+
+def _profile_direct_backend(tmp_timezone: str = "UTC") -> NixtlaHybridBackend:
+    return NixtlaHybridBackend(
+        KPowerMLConfig(
+            model_id="consumption",
+            latitude=46.0,
+            longitude=14.0,
+            interval_minutes=15,
+            forecast_type=MLForecastType.CONSUMPTION,
+            timezone=tmp_timezone,
+            hybrid_structure=HybridStructure.PROFILE_DIRECT,
+        )
+    )
+
+
+def _calendar_features(ds: pd.Series) -> pd.DataFrame:
+    hours = ds.dt.hour + ds.dt.minute / 60.0
+    return pd.DataFrame(
+        {"ds": ds, "hour": hours, "temperature_2m": 10.0 + (hours - 12).abs() / 2}
+    )
+
+
+def test_profile_direct_does_not_replay_a_one_off_event_into_future_days(
+    tmp_path,
+) -> None:
+    pytest.importorskip("lightgbm")
+    ds = pd.Series(pd.date_range("2026-09-01", periods=21 * 96, freq="15min", tz="UTC"))
+    y = 0.25 + 0.1 * (ds.dt.hour.between(17, 21)).astype(float)
+    # A heat-pump run at 03:00 on the last day only.
+    spike = ds.dt.date.eq(ds.iloc[-1].date()) & ds.dt.hour.eq(3)
+    y = y.where(~spike, 1.25)
+    history = pd.DataFrame({"ds": ds, "y": y})
+    backend = _profile_direct_backend()
+
+    backend.fit(history, _calendar_features(ds), history.tail(96))
+    future_ds = pd.Series(
+        pd.date_range(
+            ds.iloc[-1] + pd.Timedelta(minutes=15), periods=5 * 96, freq="15min"
+        )
+    )
+    forecast = backend.predict(_calendar_features(future_ds), horizon=5 * 96)
+
+    at_three = forecast.loc[future_ds.dt.hour.eq(3).to_numpy(), "yhat"]
+    # Seasonal-naive would replay 1.25; the mean profile spreads it over 21 days.
+    assert at_three.max() < 0.4
+    assert forecast["yhat"].min() > 0.1
+    # Tuesday-Friday share profile and features: identical days mean the
+    # prediction does not drift with lead time (no recursion).
+    daily = forecast["yhat"].to_numpy().reshape(5, 96)
+    assert future_ds.iloc[0].dayofweek == 1
+    assert abs(daily[0] - daily[3]).max() < 1e-9
+
+    backend.save(tmp_path)
+    restored = _profile_direct_backend()
+    restored.load(tmp_path)
+    pd.testing.assert_frame_equal(
+        restored.predict(_calendar_features(future_ds), horizon=5 * 96), forecast
+    )
+
+    # A recursive backend must not serve profile_direct state.
+    recursive = NixtlaHybridBackend(
+        backend.config.model_copy(
+            update={"hybrid_structure": HybridStructure.RECURSIVE_SEASONAL_NAIVE}
+        )
+    )
+    recursive.load(tmp_path)
+    assert recursive._fitted is False
+
+
+@pytest.mark.parametrize(
+    ("forecast_type", "backend", "message"),
+    [
+        (MLForecastType.SOLAR, MLBackendType.NIXTLA_HYBRID, "not for solar"),
+        # Other backends would silently ignore the requested structure.
+        (MLForecastType.CONSUMPTION, MLBackendType.NEURALFORECAST, "nixtla_hybrid"),
+    ],
+)
+def test_profile_direct_structure_is_rejected_where_it_cannot_apply(
+    forecast_type: MLForecastType, backend: MLBackendType, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        KPowerMLConfig(
+            model_id="model",
+            latitude=46.0,
+            longitude=14.0,
+            forecast_type=forecast_type,
+            backend=backend,
+            hybrid_structure=HybridStructure.PROFILE_DIRECT,
+        )
+
+
+def test_artifact_from_another_hybrid_structure_is_not_reused() -> None:
+    class Manifest:
+        def __init__(self, metadata: dict) -> None:
+            self.metadata = metadata
+
+    direct = KPowerMLConfig(
+        model_id="consumption",
+        latitude=46.0,
+        longitude=14.0,
+        forecast_type=MLForecastType.CONSUMPTION,
+        hybrid_structure=HybridStructure.PROFILE_DIRECT,
+    )
+    recursive = direct.model_copy(
+        update={"hybrid_structure": HybridStructure.RECURSIVE_SEASONAL_NAIVE}
+    )
+    legacy = Manifest({})
+    stored_direct = Manifest(
+        {"hybrid_structure": "profile_direct", "profile_lookback_days": 28}
+    )
+
+    assert _structure_matches(legacy, recursive)
+    assert not _structure_matches(legacy, direct)
+    assert _structure_matches(stored_direct, direct)
+    assert not _structure_matches(
+        stored_direct, direct.model_copy(update={"profile_lookback_days": 14})
+    )

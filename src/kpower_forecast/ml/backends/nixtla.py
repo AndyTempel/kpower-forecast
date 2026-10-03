@@ -11,7 +11,7 @@ from kpower_forecast.ml.alignment import (
     ForecastAlignmentError,
     validate_timestamp_grid,
 )
-from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
+from kpower_forecast.ml.config import HybridStructure, KPowerMLConfig, MLForecastType
 from kpower_forecast.ml.dependencies import ensure_optional_dependencies
 
 STATE_FILE = "state.json"
@@ -83,6 +83,14 @@ class NixtlaHybridBackend:
         self._fitted = False
         self._stats_model: Any = None
         self._residual_model: Any = None
+        # profile_direct state: mean target per (weekend, local minute) slot.
+        self._load_profile: dict[str, float] = {}
+        self._load_profile_by_minute: dict[int, float] = {}
+        self._load_profile_mean: float = 0.0
+
+    @property
+    def _profile_direct(self) -> bool:
+        return self.config.hybrid_structure == HybridStructure.PROFILE_DIRECT
 
     @property
     def minimum_contiguous_training_rows(self) -> int:
@@ -122,6 +130,11 @@ class NixtlaHybridBackend:
 
         self._feature_columns = self._select_feature_columns(features)
         self._last_observed = float(history["y"].iloc[-1])
+        if self._profile_direct:
+            self._last_train_ds = pd.to_datetime(history["ds"], utc=True).max()
+            self._fit_profile_direct(history, features)
+            self._fitted = True
+            return
         self._last_train_ds = pd.to_datetime(history["ds"], utc=True).max()
         ensure_optional_dependencies(
             ("lightgbm", "mlforecast", "statsforecast"), "Nixtla hybrid backend"
@@ -202,6 +215,8 @@ class NixtlaHybridBackend:
             expected_length=horizon,
             label="Nixtla future features",
         )
+        if self._profile_direct:
+            return self._predict_profile_direct(future)
         baseline = self._predict_stats_baseline(future)
         solar_baseline = self._predict_solar_baseline(future)
         if solar_baseline is not None:
@@ -238,6 +253,105 @@ class NixtlaHybridBackend:
             baseline = solar_baseline.reindex(residual_training.index).fillna(0.0)
         residual_training["y"] = residual_training["y"] - baseline
         return residual_training
+
+    def _profile_keys(self, ds: pd.Series) -> tuple[pd.Series, pd.Series]:
+        """Return (weekend flag, local minute of day) for profile lookup."""
+        local = pd.to_datetime(ds, utc=True).dt.tz_convert(self.config.timezone)
+        minute = local.dt.hour * 60 + local.dt.minute
+        weekend = local.dt.dayofweek.ge(5)
+        return weekend, minute
+
+    def _profile_values(self, ds: pd.Series) -> pd.Series:
+        """Look up the fitted mean profile for each timestamp."""
+        weekend, minute = self._profile_keys(ds)
+        values = [
+            self._load_profile.get(
+                f"{int(is_weekend)}:{int(slot)}",
+                self._load_profile_by_minute.get(int(slot), self._load_profile_mean),
+            )
+            for is_weekend, slot in zip(weekend, minute, strict=True)
+        ]
+        return pd.Series(values, index=ds.index, dtype="float64")
+
+    def _fit_profile_direct(
+        self, history: pd.DataFrame, features: pd.DataFrame
+    ) -> None:
+        """Fit the mean slot profile and a direct (non-recursive) residual model.
+
+        The profile is the mean, not the median, of the recent target per local
+        slot and weekday class: the mean is the expected value an RMSE-scored
+        energy plan needs, and it spreads irregular events (heat-pump runs)
+        over the slots where they occur instead of replaying one day's timing.
+        """
+        ensure_optional_dependencies(("lightgbm",), "Nixtla hybrid backend")
+        from lightgbm import LGBMRegressor
+
+        frame = pd.DataFrame(
+            {
+                "ds": pd.to_datetime(history["ds"], utc=True),
+                "y": pd.to_numeric(history["y"], errors="coerce"),
+            }
+        ).dropna()
+        cutoff = frame["ds"].max() - pd.Timedelta(
+            days=self.config.profile_lookback_days
+        )
+        recent = frame.loc[frame["ds"] > cutoff]
+        weekend, minute = self._profile_keys(recent["ds"])
+        grouped = recent.assign(weekend=weekend.astype(int), minute=minute)
+        self._load_profile = {
+            f"{int(key[0])}:{int(key[1])}": float(value)
+            for key, value in grouped.groupby(["weekend", "minute"])["y"].mean().items()
+        }
+        self._load_profile_by_minute = {
+            int(key): float(value)
+            for key, value in grouped.groupby("minute")["y"].mean().items()
+        }
+        self._load_profile_mean = float(recent["y"].mean()) if len(recent) else 0.0
+
+        rows = history.reset_index(drop=True)
+        target = pd.to_numeric(rows["y"], errors="coerce")
+        residual = target - self._profile_values(rows["ds"]).to_numpy()
+        exogenous = self._exogenous_matrix(features.reset_index(drop=True))
+        usable = residual.notna().to_numpy()
+        lgbm_params = {
+            "n_estimators": 200,
+            "learning_rate": 0.05,
+            # Regularised: residuals of an on/off load are mostly timing noise.
+            "num_leaves": 15,
+            "min_child_samples": 50,
+            "subsample": 0.8,
+            "subsample_freq": 1,
+            "colsample_bytree": 0.8,
+            "random_state": 42,
+            "verbosity": -1,
+            **self.config.backend_params.get("lightgbm", {}),
+        }
+        model = LGBMRegressor(**lgbm_params)
+        model.fit(exogenous.loc[usable], residual.loc[usable])
+        self._residual_model = model
+        self._stats_model = None
+
+    def _exogenous_matrix(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Return the learned feature columns as a numeric matrix."""
+        matrix = pd.DataFrame(index=features.index)
+        for column in self._feature_columns:
+            values = features[column] if column in features.columns else 0.0
+            matrix[column] = pd.to_numeric(values, errors="coerce")
+        return matrix.fillna(0.0)
+
+    def _predict_profile_direct(self, future: pd.DataFrame) -> pd.DataFrame:
+        """Predict profile + residual for every future row independently."""
+        if self._residual_model is None:
+            raise ForecastAlignmentError("profile_direct residual model is missing")
+        baseline = self._profile_values(future["ds"]).reset_index(drop=True)
+        residual = pd.Series(
+            self._residual_model.predict(
+                self._exogenous_matrix(future.reset_index(drop=True))
+            ),
+            dtype="float64",
+        )
+        yhat = baseline + residual
+        return pd.DataFrame({"ds": future["ds"].reset_index(drop=True), "yhat": yhat})
 
     def _fit_solar_profile(self, history: pd.DataFrame, features: pd.DataFrame) -> None:
         """Learn interval kWh per W/m2 by minute-of-day for solar forecasts."""
@@ -436,6 +550,10 @@ class NixtlaHybridBackend:
             ),
             "solar_global_factor": self._solar_global_factor,
             "solar_profile": self._solar_profile,
+            "hybrid_structure": self.config.hybrid_structure.value,
+            "load_profile": self._load_profile,
+            "load_profile_by_minute": self._load_profile_by_minute,
+            "load_profile_mean": self._load_profile_mean,
             "fitted": self._fitted,
         }
         with state_path.open("w", encoding="utf-8") as file:
@@ -472,7 +590,23 @@ class NixtlaHybridBackend:
             int(key): float(value)
             for key, value in dict(state.get("solar_profile", {})).items()
         }
+        self._load_profile = {
+            str(key): float(value)
+            for key, value in dict(state.get("load_profile", {})).items()
+        }
+        self._load_profile_by_minute = {
+            int(key): float(value)
+            for key, value in dict(state.get("load_profile_by_minute", {})).items()
+        }
+        self._load_profile_mean = float(state.get("load_profile_mean", 0.0))
         self._fitted = bool(state.get("fitted", False))
+        # State saved before the setting existed is recursive. State from the
+        # other structure cannot serve this one, in either direction.
+        stored_structure = state.get(
+            "hybrid_structure", HybridStructure.RECURSIVE_SEASONAL_NAIVE.value
+        )
+        if stored_structure != self.config.hybrid_structure.value:
+            self._fitted = False
 
         models_path = path / MODELS_FILE
         if models_path.exists():

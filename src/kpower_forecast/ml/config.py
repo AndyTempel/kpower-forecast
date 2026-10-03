@@ -25,6 +25,23 @@ class MLBackendType(str, Enum):
     FOUNDATION = "foundation"
 
 
+class HybridStructure(str, Enum):
+    """How the Nixtla hybrid backend forms its structural forecast.
+
+    ``recursive_seasonal_naive`` repeats the last observed day and corrects it
+    with a LightGBM residual model fed its own lags recursively. That suits
+    smooth series but replays one-off events (e.g. heat-pump runs) into every
+    future day and can oscillate over multi-day horizons.
+
+    ``profile_direct`` uses a multi-day mean profile per local slot and
+    weekday class and predicts the residual directly from weather and
+    calendar features for every future row, with no lags or recursion.
+    """
+
+    RECURSIVE_SEASONAL_NAIVE = "recursive_seasonal_naive"
+    PROFILE_DIRECT = "profile_direct"
+
+
 class KPowerMLConfig(BaseModel):
     """Runtime configuration for the optional ML forecasting model."""
 
@@ -41,6 +58,8 @@ class KPowerMLConfig(BaseModel):
     unit: MeasurementUnit = MeasurementUnit.KWH
     backend: MLBackendType = MLBackendType.NIXTLA_HYBRID
     backend_params: dict[str, Any] = Field(default_factory=dict)
+    hybrid_structure: HybridStructure = HybridStructure.RECURSIVE_SEASONAL_NAIVE
+    profile_lookback_days: int = Field(default=28, ge=1, le=366)
     interval_levels: list[int] = Field(default_factory=lambda: [50, 80, 90])
     holiday_country: Optional[str] = None
     holiday_subdivision: Optional[str] = None
@@ -128,6 +147,15 @@ class KPowerMLConfig(BaseModel):
         """
         if self.candidate_selection and self.forecast_type == MLForecastType.SOLAR:
             raise ValueError("candidate_selection is not supported for solar")
+        if self.hybrid_structure == HybridStructure.PROFILE_DIRECT:
+            if self.forecast_type == MLForecastType.SOLAR:
+                # Solar uses its radiation profile baseline.
+                raise ValueError("profile_direct hybrid structure is not for solar")
+            if self.backend != MLBackendType.NIXTLA_HYBRID:
+                # Other backends would silently ignore the requested structure.
+                raise ValueError(
+                    "profile_direct hybrid structure requires the nixtla_hybrid backend"
+                )
         reserved = {"ds", "y", "temperature_2m"}.intersection(
             self.regression_extra_features
         )

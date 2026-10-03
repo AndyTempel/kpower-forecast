@@ -19,7 +19,12 @@ from kpower_forecast.ml.alignment import (
 from kpower_forecast.ml.backends import create_backend
 from kpower_forecast.ml.baselines import BASELINE_NAME, local_slot_weekday_class_median
 from kpower_forecast.ml.bias_correction import WeatherBiasCorrector
-from kpower_forecast.ml.config import KPowerMLConfig, MLBackendType, MLForecastType
+from kpower_forecast.ml.config import (
+    HybridStructure,
+    KPowerMLConfig,
+    MLBackendType,
+    MLForecastType,
+)
 from kpower_forecast.ml.conformal import SplitConformalCalibrator
 from kpower_forecast.ml.features import MLFeatureBuilder
 from kpower_forecast.ml.selection import (
@@ -264,6 +269,8 @@ class KPowerMLForecast:
                 "history_policy_version": HISTORY_POLICY_VERSION,
                 "preserve_gaps": self.config.preserve_gaps,
                 "max_bridged_gap_intervals": self.config.max_bridged_gap_intervals,
+                "hybrid_structure": self.config.hybrid_structure.value,
+                "profile_lookback_days": self.config.profile_lookback_days,
                 "bridged_rows": self.training_bridged_rows,
                 "candidate_selection": {
                     **_selection_settings(self.config),
@@ -588,6 +595,8 @@ class KPowerMLForecast:
             return
         if not _selection_settings_match(manifest, self.config):
             return
+        if not _structure_matches(manifest, self.config):
+            return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         if (
@@ -635,6 +644,10 @@ class KPowerMLForecast:
         if not _selection_settings_match(manifest, self.config):
             raise ForecastAlignmentError(
                 "stored model candidate-selection settings require a full retrain"
+            )
+        if not _structure_matches(manifest, self.config):
+            raise ForecastAlignmentError(
+                "stored model hybrid structure requires a full retrain"
             )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
@@ -1116,3 +1129,20 @@ def _selection_settings_match(
         stored.get(key, False if key == "enabled" else None) == value
         for key, value in expected.items()
     )
+
+
+def _structure_matches(manifest: MLModelManifest, config: KPowerMLConfig) -> bool:
+    """Return whether a stored artifact was trained with this hybrid structure.
+
+    Artifacts written before the setting existed used the recursive structure.
+    """
+    stored = manifest.metadata.get(
+        "hybrid_structure", HybridStructure.RECURSIVE_SEASONAL_NAIVE.value
+    )
+    if stored != config.hybrid_structure.value:
+        return False
+    if config.hybrid_structure == HybridStructure.PROFILE_DIRECT:
+        return manifest.metadata.get("profile_lookback_days") == (
+            config.profile_lookback_days
+        )
+    return True
