@@ -98,6 +98,8 @@ def _forecast(
         "calibration_fraction": 0.3,
     }
     settings.update(overrides)
+    # The backend itself is stubbed; only the configured type matters.
+    backend_type = settings.pop("backend_type", MLBackendType.NEURALFORECAST)
     forecast = KPowerMLForecast(
         model_id="heating",
         latitude=46.0,
@@ -105,7 +107,7 @@ def _forecast(
         storage_path=str(tmp_path),
         interval_minutes=60,
         forecast_type=MLForecastType.HVAC,
-        backend=MLBackendType.NEURALFORECAST,
+        backend=backend_type,
         timezone="Europe/Ljubljana",
         **settings,
     )
@@ -415,6 +417,7 @@ def test_known_covariates_reach_the_model_and_are_required_to_predict(
         candidate_selection=False,
         known_covariates=["hvac_mode"],
         preserve_gaps=preserve_gaps,
+        backend_type=MLBackendType.NIXTLA_HYBRID,
     )
     with pytest.raises(ValueError, match="known covariates"):
         forecast.train(history.drop(columns="hvac_mode"), force=True)
@@ -449,6 +452,7 @@ def test_known_covariates_reach_the_model_and_are_required_to_predict(
             weather,
             candidate_selection=False,
             preserve_gaps=preserve_gaps,
+            backend_type=MLBackendType.NIXTLA_HYBRID,
         ).training_end
         is None
     )
@@ -516,7 +520,7 @@ def test_backtest_origins_survive_a_skipped_local_midnight(tmp_path) -> None:
 
 
 def test_a_backend_failure_on_an_early_origin_does_not_abort_training(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ) -> None:
     class _Fragile(_Backend):
         def fit(self, history, features, calibration) -> None:
@@ -533,6 +537,9 @@ def test_a_backend_failure_on_an_early_origin_does_not_abort_training(
     # The early origins are skipped; the remaining ones are too few to select.
     assert forecast.selection_reason == "backtest_too_short"
     assert forecast.training_end is not None
+    # Skipping stays visible, with the cause.
+    skipped = [r for r in caplog.records if "Backtest origin skipped" in r.message]
+    assert skipped and skipped[0].exc_info is not None
 
 
 def test_interval_api_forwards_known_future(monkeypatch, tmp_path) -> None:
@@ -544,6 +551,7 @@ def test_interval_api_forwards_known_future(monkeypatch, tmp_path) -> None:
         weather,
         candidate_selection=False,
         known_covariates=["hvac_mode"],
+        backend_type=MLBackendType.NIXTLA_HYBRID,
     )
     known = pd.DataFrame({"ds": weather["ds"], "hvac_mode": 1.0})
     seen: dict[str, Any] = {}
@@ -573,3 +581,54 @@ def test_rmse_1h_stays_finite_without_a_fully_measured_hour() -> None:
 
     assert metrics is not None
     assert metrics.rmse_1h == pytest.approx(metrics.rmse)
+
+
+def test_backtest_origins_land_on_an_hourly_grid_in_a_half_hour_zone(
+    tmp_path,
+) -> None:
+    # Adelaide is UTC+9:30; local midnight is 14:30 UTC, off an hourly grid.
+    forecast = KPowerMLForecast(
+        model_id="heating",
+        latitude=-34.9,
+        longitude=138.6,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.HVAC,
+        timezone="Australia/Adelaide",
+        candidate_selection=True,
+    )
+
+    origins = forecast._backtest_origins(pd.Timestamp("2026-07-10 12:00", tz="UTC"))
+
+    assert len(origins) == 7
+    assert all(origin.minute == 0 for origin in origins)
+    assert all(
+        origin.tz_convert("Australia/Adelaide").strftime("%H:%M") == "00:30"
+        for origin in origins
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"known_covariates": ["unique_id"]}, "must not include"),
+        (
+            {
+                "known_covariates": ["hvac_mode"],
+                "backend": MLBackendType.NEURALFORECAST,
+            },
+            "nixtla_hybrid backend",
+        ),
+    ],
+)
+def test_known_covariates_reject_reserved_names_and_unsupported_backends(
+    overrides: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        KPowerMLConfig(
+            model_id="heating",
+            latitude=46.0,
+            longitude=14.0,
+            forecast_type=MLForecastType.HVAC,
+            **overrides,
+        )

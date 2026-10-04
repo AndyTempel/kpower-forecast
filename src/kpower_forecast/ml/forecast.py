@@ -1,5 +1,6 @@
 """Public ML forecasting API."""
 
+import logging
 from datetime import date, datetime, timedelta
 from math import ceil
 from numbers import Real
@@ -56,6 +57,8 @@ SANITIZED_CONFORMAL_STATE_VERSION: int = 1
 # 00:00, so up to one hour between the two sources may be interpolated.
 MAX_WEATHER_SEAM: pd.Timedelta = pd.Timedelta(hours=1)
 HISTORY_POLICY_VERSION: int = 2
+
+logger = logging.getLogger(__name__)
 
 
 def bridge_short_target_gaps(
@@ -996,10 +999,12 @@ class KPowerMLForecast:
         )
 
     def _backtest_origins(self, last_measured: pd.Timestamp) -> list[pd.Timestamp]:
-        """Local day starts whose full horizon ends at or before the data end.
+        """First model-grid slots of local days whose horizon fits the data.
 
-        Where a DST change skips midnight, the day starts at the first local
-        time that exists; an ambiguous midnight resolves to its first instant.
+        Each origin is the first UTC grid slot at or after local midnight, so
+        zones with a 30/45-minute offset still land on an hourly grid. Where a
+        DST change skips midnight, the day starts at the first local time that
+        exists; an ambiguous midnight resolves to its first instant.
         """
         interval = pd.Timedelta(minutes=self.config.interval_minutes)
         horizon = pd.Timedelta(hours=self.config.selection_horizon_hours)
@@ -1009,9 +1014,13 @@ class KPowerMLForecast:
         origins: list[pd.Timestamp] = []
         for offset in range(self.config.selection_backtest_days):
             day = pd.Timestamp(latest_start.date() - timedelta(days=offset))
-            start = day.tz_localize(
-                self.config.timezone, nonexistent="shift_forward", ambiguous=True
-            ).tz_convert("UTC")
+            start = (
+                day.tz_localize(
+                    self.config.timezone, nonexistent="shift_forward", ambiguous=True
+                )
+                .tz_convert("UTC")
+                .ceil(f"{self.config.interval_minutes}min")
+            )
             if start <= latest_start:
                 origins.append(start)
         return sorted(origins)
@@ -1113,8 +1122,14 @@ class KPowerMLForecast:
             forecast = backend.predict(window_features, horizon=steps)
             forecast = self._sanitize_point_forecast(forecast)
         except Exception:  # noqa: BLE001
-            # An early origin with little history must not abort training; the
-            # final fit on all rows still surfaces genuine backend errors.
+            # An early origin with little history must not abort training, but
+            # an unexpected failure must stay visible.
+            logger.warning(
+                "Backtest origin skipped: %s backend failed on %d training rows",
+                self.config.model_id,
+                len(train),
+                exc_info=True,
+            )
             return None
         values = forecast["yhat"].to_numpy(dtype=float)
         return values if len(values) == steps else None

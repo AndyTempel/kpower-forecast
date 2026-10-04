@@ -208,13 +208,20 @@ class KPowerMLConfig(BaseModel):
             self.regression_extra_features
         ):
             raise ValueError("regression_extra_features must be unique")
-        reserved_covariates = {"ds", "y"}.intersection(self.known_covariates)
+        # unique_id is the Nixtla series key.
+        reserved_covariates = {"ds", "y", "unique_id"}.intersection(
+            self.known_covariates
+        )
         if reserved_covariates:
             raise ValueError(
                 f"known_covariates must not include {sorted(reserved_covariates)}"
             )
         if len(set(self.known_covariates)) != len(self.known_covariates):
             raise ValueError("known_covariates must be unique")
+        if self.known_covariates and self.backend != MLBackendType.NIXTLA_HYBRID:
+            # Other backends do not read exogenous features; the inputs would
+            # be required yet silently ignored.
+            raise ValueError("known_covariates require the nixtla_hybrid backend")
         return self
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

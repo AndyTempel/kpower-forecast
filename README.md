@@ -365,8 +365,9 @@ backtest without configuration changes.
 ### Known covariates
 
 `known_covariates` names numeric columns that the caller knows in advance, such as a scheduled
-HVAC mode or a thermostat target. Training history must contain them, and their names must not
-repeat a weather column or a generated feature (`hour_sin`, `heating_degree`, …). They are
+HVAC mode or a thermostat target. They need the `nixtla_hybrid` backend. Training history must
+contain them, and their names must not be `unique_id` or repeat a weather column or a generated
+feature (`hour_sin`, `heating_degree`, …). They are
 averaged onto the model grid and join the weather and calendar features. Training rows without a
 value count as 0, like other missing features, so supply complete history.
 `predict(known_future=...)` and `get_prediction_intervals(known_future=...)` must then supply
