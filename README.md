@@ -311,31 +311,69 @@ The Nixtla hybrid backend has two structures for non-solar targets:
   recursion, so a 5-day forecast does not drift or oscillate with lead time. Not available for
   solar.
 
+Each weekday-class profile is shrunk toward the all-days profile with weight
+`n / (n + profile_class_prior_days)` (default 4), where `n` is the number of days of that class in
+the lookback. A weekend seen only twice then leans on the all-days profile instead of replaying
+those two days' heat-pump runs, and a class with ample history keeps its own shape (weekday and
+weekend household load differ). `profile_smoothing_minutes` (default 0, a multiple of the
+interval) applies a centred ±minutes circular moving average over local time of day.
+
 On a site with a fixed-speed heat pump (12 rolling origins, RMSE at +24/+120 h), `profile_direct`
 improved whole-site consumption from 1100/1404 W to 976/1027 W and heating from 1046/1170 W to
 832/907 W. The structure and lookback are part of artifact compatibility: a stored artifact
-trained with other values is not restored on construction, `train(force=True)` retrains it, and
+trained with other values (including the shrinkage and smoothing settings) is not restored on construction, `train(force=True)` retrains it, and
 a non-forced `train()` raises "requires a full retrain", like the other compatibility settings.
 
-### Holdout candidate selection
+### Rolling-origin candidate selection
 
 Consumption and HVAC targets can set `candidate_selection=True` (default off; not for solar).
-Training then scores three candidates on the calibration holdout, each forecasting it from the
-same origin with the same historical weather, and serves the one with the lowest RMSE:
+Training then backtests the candidates in `selection_candidates` (default all four) on day-ahead
+windows: from local midnight of each of the last `selection_backtest_days` days (default 7), each
+candidate forecasts the next `selection_horizon_hours` (default 24) after training only on rows
+before that midnight, with the same historical weather for all. This is how load forecasts are
+used and is far less noisy than a single holdout split. The candidates:
 
-- `kpower_ml`: the configured ML backend (ties keep it);
+- `kpower_ml`: the configured ML backend, refitted per origin (always scored; ties keep it);
 - `degree_hour_regression`: ridge regression with per-local-hour intercepts,
   `max(0, regression_base_temperature_c − T_out)` (default 16 °C) and
   `regression_extra_features` (default shortwave radiation);
-- `local_slot_weekday_class_median`: the leakage-safe slot/weekday median.
+- `local_slot_weekday_class_median`: the leakage-safe slot/weekday median;
+- `ml_regression_blend`: `w·ML + (1 − w)·regression`, with `w` in [0, 1] fitted by least squares
+  on the backtest (each origin is scored with a weight fitted on the other origins).
 
-RMSE, not MAE, decides because MAE rewards an always-off forecast of an on/off load. Prediction
-intervals are calibrated on the winner's holdout residuals. With fewer than
-`min_selection_holdout_rows` measured holdout rows (default 96) the ML model is kept and
-`selection_reason` is `holdout_too_short`. `selected_candidate`, `candidate_metrics` and the
+The candidates are ranked by RMSE of 1 h means taken at every step within each window. A run
+forecast 15 minutes early costs a quarter of a run instead of a miss and a phantom run, and no
+bin edge splits a near miss. A candidate whose mean error exceeds `selection_bias_tolerance`
+(default 15 %) of the mean actual load, or `selection_bias_floor_kw` (default 0.05 kW) if that
+is larger, cannot win. RMSE alone can prefer a smooth forecast that misses a third of the energy,
+which an energy planner integrates. If every candidate is outside the guard, the least biased one
+wins and `selection_reason` is `no_candidate_within_bias_guard`. With fewer than
+`selection_min_origins` usable origins (default 3), the ML model is kept and
+`selection_reason` is `backtest_too_short`.
+
+Prediction intervals are calibrated on leave-one-origin-out residuals: each origin's residual
+comes from the candidate the rule picks from the other origins. That calibrates the procedure
+that is served, on residuals that did not choose it. `selected_candidate`, `candidate_metrics`
+(`rmse_1h`, `rmse`, `mae`, `bias`, `mean_actual`, `rows`, `origins`), the blend weight and the
 regression coefficients are persisted in the manifest. An artifact trained with different
-selection settings (`candidate_selection`, `regression_base_temperature_c`,
-`regression_extra_features`) is not restored and needs `train(force=True)`.
+selection settings is not restored and needs `train(force=True)`.
+
+Backtesting refits the ML backend once per origin, so training costs about
+`selection_backtest_days` extra ML fits. As history grows, the ML model improves and wins the
+backtest without configuration changes.
+
+### Known covariates
+
+`known_covariates` names numeric columns that the caller knows in advance, such as a scheduled
+HVAC mode or a thermostat target. Training history must contain them, and their names must not
+repeat a weather column. They are averaged onto the model grid and join the weather and calendar
+features. Training rows without a value count as 0, like other missing features, so supply
+complete history. `predict(known_future=...)` must then
+supply `ds` and every covariate for each model-grid row: from the first slot after training, not
+only from `origin`, through the returned horizon. A missing or non-finite value raises
+`ForecastAlignmentError`, and nothing is zero-filled. To let the degree-hour regression use a
+covariate, add it to `regression_extra_features`. Changing `known_covariates` requires a full
+retrain.
 
 ---
 

@@ -6,6 +6,7 @@ from numbers import Real
 from pathlib import Path
 from typing import Any, Optional, cast
 
+import numpy as np
 import pandas as pd
 
 from kpower_forecast import __version__
@@ -28,11 +29,16 @@ from kpower_forecast.ml.config import (
 from kpower_forecast.ml.conformal import SplitConformalCalibrator
 from kpower_forecast.ml.features import MLFeatureBuilder
 from kpower_forecast.ml.selection import (
+    BLEND_CANDIDATE,
     DEGREE_HOUR_CANDIDATE,
     ML_CANDIDATE,
+    SELECTION_CANDIDATES,
     SELECTION_METRIC,
+    CandidateMetrics,
     DegreeHourRegression,
-    score_candidate,
+    bias_eligible,
+    fit_blend_weight,
+    score_windows,
     select_candidate,
 )
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
@@ -140,6 +146,7 @@ class KPowerMLForecast:
         self.candidate_metrics: dict[str, dict[str, float | int]] = {}
         self.selection_reason: Optional[str] = None
         self._regression: Optional[DegreeHourRegression] = None
+        self._blend_weight: Optional[float] = None
         self._restore_existing_manifest()
 
     def _weather_config_with_default_cache(
@@ -175,6 +182,7 @@ class KPowerMLForecast:
             self._restore_from_manifest(existing_manifest)
             return
 
+        covariates = self._history_covariates(history_df)
         normalized = normalize_to_instant_kwh(
             history_df,
             category=self.config.data_category.value,
@@ -183,6 +191,13 @@ class KPowerMLForecast:
             preserve_gaps=self.config.preserve_gaps,
         )
         complete_history = self._prepare_training_data(normalized)
+        if covariates is not None:
+            clash = set(self.config.known_covariates) & set(complete_history.columns)
+            if clash:
+                raise ValueError(
+                    f"known covariates {sorted(clash)} clash with weather columns"
+                )
+            complete_history = complete_history.merge(covariates, on="ds", how="left")
         bridged_history, bridged_mask = bridge_short_target_gaps(
             complete_history, self.config.max_bridged_gap_intervals
         )
@@ -221,21 +236,16 @@ class KPowerMLForecast:
             .reset_index(drop=True)
             .where(calibration_measured.reset_index(drop=True))
         )
-        holdout_predictions = {
-            ML_CANDIDATE: calibration_predictions["yhat"].reset_index(drop=True)
-        }
-        conformal_actual = self._select_candidate(
-            train_frame.loc[train_measured].reset_index(drop=True),
-            calibration_frame.reset_index(drop=True),
+        conformal_actual, conformal_predicted = self._select_candidate(
+            bridged_history,
+            complete_features,
+            bridged_mask,
             calibration_actual,
-            holdout_predictions,
+            calibration_predictions["yhat"].reset_index(drop=True),
         )
         # Prediction intervals describe the forecast that is actually served,
-        # calibrated on holdout rows that did not take part in selecting it.
-        self.conformal.fit(
-            actual=conformal_actual,
-            predicted=holdout_predictions[self.selected_candidate],
-        )
+        # calibrated on residuals that did not take part in selecting it.
+        self.conformal.fit(actual=conformal_actual, predicted=conformal_predicted)
         self.training_bridged_rows = int(bridged_mask.sum())
         self.backend.fit(prepared, full_features, calibration_frame)
         if self._regression is not None:
@@ -271,6 +281,9 @@ class KPowerMLForecast:
                 "max_bridged_gap_intervals": self.config.max_bridged_gap_intervals,
                 "hybrid_structure": self.config.hybrid_structure.value,
                 "profile_lookback_days": self.config.profile_lookback_days,
+                "profile_class_prior_days": self.config.profile_class_prior_days,
+                "profile_smoothing_minutes": self.config.profile_smoothing_minutes,
+                "known_covariates": list(self.config.known_covariates),
                 "bridged_rows": self.training_bridged_rows,
                 "candidate_selection": {
                     **_selection_settings(self.config),
@@ -278,6 +291,7 @@ class KPowerMLForecast:
                     "selected": self.selected_candidate,
                     "reason": self.selection_reason,
                     "candidates": self.candidate_metrics,
+                    "blend_weight": self._blend_weight,
                 },
                 "degree_hour_regression": (
                     self._regression.to_dict() if self._regression is not None else None
@@ -292,6 +306,7 @@ class KPowerMLForecast:
         days: int = 7,
         dynamic_export_limits: Optional[pd.DataFrame] = None,
         origin: datetime | None = None,
+        known_future: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """Generate an aligned ML forecast for the next ``days`` days.
 
@@ -301,6 +316,9 @@ class KPowerMLForecast:
             origin: Optional timezone-aware first returned timestamp. It must be
                 interval-aligned and cannot precede the first post-training slot.
                 When omitted, prediction starts at the next current interval.
+            known_future: ``ds`` plus every ``known_covariates`` column for each
+                model-grid row, i.e. from the first post-training slot (not
+                only from ``origin``) through the returned horizon.
 
         Returns:
             Forecast dataframe containing exactly ``days`` of future intervals.
@@ -354,7 +372,8 @@ class KPowerMLForecast:
             start=model_start,
             horizon=model_horizon,
         )
-        if self.selected_candidate == ML_CANDIDATE:
+        aligned_weather = self._merge_known_future(aligned_weather, known_future)
+        if self.selected_candidate in (ML_CANDIDATE, BLEND_CANDIDATE):
             features = self.feature_builder.build(aligned_weather)
             validate_timestamp_grid(
                 features,
@@ -364,6 +383,15 @@ class KPowerMLForecast:
                 label="forecast features",
             )
             forecast = self.backend.predict(features, horizon=model_horizon)
+            if self.selected_candidate == BLEND_CANDIDATE:
+                if self._blend_weight is None:
+                    raise ForecastAlignmentError("blend weight is unavailable")
+                forecast = self._sanitize_point_forecast(forecast)
+                regression = self._regression_values(aligned_weather).to_numpy()
+                forecast["yhat"] = (
+                    self._blend_weight * forecast["yhat"].to_numpy()
+                    + (1.0 - self._blend_weight) * regression
+                )
         else:
             forecast = self._predict_benchmark(
                 aligned_weather, start=model_start, horizon=model_horizon
@@ -400,6 +428,66 @@ class KPowerMLForecast:
                 forecast, dynamic_export_limits=dynamic_export_limits
             )
         return forecast
+
+    def _history_covariates(self, history_df: pd.DataFrame) -> pd.DataFrame | None:
+        """Return known covariates averaged onto the model grid, or ``None``.
+
+        Raises:
+            ValueError: If a configured covariate column is missing.
+        """
+        names = list(self.config.known_covariates)
+        if not names:
+            return None
+        missing = [name for name in names if name not in history_df.columns]
+        if missing:
+            raise ValueError(f"history is missing known covariates {missing}")
+        frame = history_df[["ds", *names]].copy()
+        frame["ds"] = pd.to_datetime(frame["ds"], utc=True).dt.floor(
+            f"{self.config.interval_minutes}min"
+        )
+        for name in names:
+            frame[name] = pd.to_numeric(frame[name], errors="coerce")
+        return frame.groupby("ds", as_index=False)[names].mean()
+
+    def _merge_known_future(
+        self, weather: pd.DataFrame, known_future: Optional[pd.DataFrame]
+    ) -> pd.DataFrame:
+        """Add known covariates to the model-grid weather.
+
+        Raises:
+            ForecastAlignmentError: If a configured covariate is missing or
+                not finite on any model-grid row.
+        """
+        names = list(self.config.known_covariates)
+        if not names:
+            return weather
+        if known_future is None:
+            raise ForecastAlignmentError(
+                f"known_future is required for covariates {names}"
+            )
+        missing = [name for name in names if name not in known_future.columns]
+        if missing or "ds" not in known_future.columns:
+            raise ForecastAlignmentError(
+                f"known_future is missing columns {missing or ['ds']}"
+            )
+        future = known_future[["ds", *names]].copy()
+        future["ds"] = pd.to_datetime(future["ds"], utc=True)
+        if future["ds"].duplicated().any():
+            raise ForecastAlignmentError("known_future has duplicate timestamps")
+        grid = pd.to_datetime(weather["ds"], utc=True)
+        values = (
+            future.set_index("ds")[names]
+            .apply(pd.to_numeric, errors="coerce")
+            .reindex(grid)
+        )
+        if not np.isfinite(values.to_numpy(dtype=float)).all():
+            raise ForecastAlignmentError(
+                "known_future does not cover every model-grid row with finite values"
+            )
+        output = weather.copy()
+        for name in names:
+            output[name] = values[name].to_numpy(dtype=float)
+        return output
 
     @staticmethod
     def _sanitize_point_forecast(forecast: pd.DataFrame) -> pd.DataFrame:
@@ -597,6 +685,8 @@ class KPowerMLForecast:
             return
         if not _structure_matches(manifest, self.config):
             return
+        if not _covariates_match(manifest, self.config):
+            return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         if (
@@ -648,6 +738,10 @@ class KPowerMLForecast:
         if not _structure_matches(manifest, self.config):
             raise ForecastAlignmentError(
                 "stored model hybrid structure requires a full retrain"
+            )
+        if not _covariates_match(manifest, self.config):
+            raise ForecastAlignmentError(
+                "stored model known covariates require a full retrain"
             )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
@@ -710,78 +804,290 @@ class KPowerMLForecast:
 
     def _select_candidate(
         self,
-        train_measured: pd.DataFrame,
-        calibration_frame: pd.DataFrame,
+        history: pd.DataFrame,
+        features: pd.DataFrame,
+        bridged: pd.Series,
         calibration_actual: pd.Series,
-        predictions: dict[str, pd.Series],
-    ) -> pd.Series:
-        """Score benchmarks on the calibration holdout and pick the winner.
+        ml_holdout: pd.Series,
+    ) -> tuple[pd.Series, pd.Series]:
+        """Backtest the candidates over recent day-ahead origins and pick one.
 
-        All candidates forecast the holdout from its first row, trained only on
-        measured rows before it. ``predictions`` gains each benchmark's holdout
-        values. Selection uses the earlier half of the holdout; the later half
-        is returned for conformal calibration, so the winner's intervals are
-        not fitted on the residuals that selected it. Without enough measured
-        selection rows the ML model is kept and the whole holdout calibrates.
+        Every candidate forecasts the next ``selection_horizon_hours`` from
+        local midnight of each of the last ``selection_backtest_days`` days,
+        trained only on rows before that origin. Prediction intervals are
+        calibrated on leave-one-origin-out residuals: at each origin, the
+        candidate the rule picks from the *other* origins. That calibrates the
+        selection procedure that is actually served, on residuals that did
+        not choose it. With fewer than ``selection_min_origins`` usable
+        origins the ML model is kept and the calibration tail is used.
 
         Args:
-            train_measured: Measured training rows before the holdout.
-            calibration_frame: Contiguous holdout rows with weather columns.
-            calibration_actual: Holdout targets, NaN where bridged.
-            predictions: Holdout predictions keyed by candidate name.
+            history: Complete bridged history with weather (and covariates).
+            features: Features built from ``history``, row for row.
+            bridged: Rows of ``history`` that were interpolated, not measured.
+            calibration_actual: Measured calibration-tail targets.
+            ml_holdout: The ML model's calibration-tail forecast.
 
         Returns:
-            Holdout targets to calibrate prediction intervals on (NaN elsewhere).
+            Actual and predicted values to calibrate intervals on.
         """
         self.selected_candidate = ML_CANDIDATE
         self.candidate_metrics = {}
         self.selection_reason = None
         self._regression = None
+        self._blend_weight = None
+        default = (calibration_actual, ml_holdout)
         if not self.config.candidate_selection:
-            return calibration_actual
-        position = pd.Series(range(len(calibration_actual)))
-        in_selection = position < len(calibration_actual) // 2
-        selection_actual = calibration_actual.where(in_selection)
-        if int(selection_actual.notna().sum()) < self.config.min_selection_holdout_rows:
-            self.selection_reason = "holdout_too_short"
-            return calibration_actual
-        regression = self._new_regression()
-        if regression.fit(train_measured):
-            predictions[DEGREE_HOUR_CANDIDATE] = regression.predict(
-                calibration_frame
-            ).reset_index(drop=True)
-        holdout_times = pd.to_datetime(calibration_frame["ds"], utc=True)
+            return default
+        backtest = self._backtest(history, features, bridged)
+        minimum = self.config.selection_min_origins
+
+        def covered(name: str) -> bool:
+            return sum(name in window for window in backtest.values()) >= minimum
+
+        names = [
+            name
+            for name in self.config.selection_candidates
+            if name != BLEND_CANDIDATE and (name == ML_CANDIDATE or covered(name))
+        ]
+        # The blend needs regression forecasts even when the regression alone
+        # is not a candidate.
+        blend = BLEND_CANDIDATE in self.config.selection_candidates and covered(
+            DEGREE_HOUR_CANDIDATE
+        )
+        required = names + ([DEGREE_HOUR_CANDIDATE] if blend else [])
+        origins = [
+            origin
+            for origin, window in backtest.items()
+            if all(name in window for name in required)
+        ]
+        if len(origins) < minimum:
+            self.selection_reason = "backtest_too_short"
+            return default
+        windows = {origin: dict(backtest[origin]) for origin in origins}
+        if blend:
+            for origin in origins:
+                others = [o for o in origins if o != origin]
+                weight = self._window_blend_weight(windows, others)
+                windows[origin][BLEND_CANDIDATE] = (
+                    weight * windows[origin][ML_CANDIDATE]
+                    + (1.0 - weight) * windows[origin][DEGREE_HOUR_CANDIDATE]
+                )
+            names.append(BLEND_CANDIDATE)
+
+        metrics = self._score_backtest(windows, names, origins)
+        winner = self._select(metrics)
+        choices = self._leave_one_out_choices(windows, names, origins, winner)
+        conformal_actual = [windows[o]["actual"] for o in origins]
+        conformal_predicted = [windows[o][choices[o]] for o in origins]
+
+        self.selected_candidate = winner
+        self.candidate_metrics = {name: m.as_dict() for name, m in metrics.items()}
+        if not any(
+            bias_eligible(
+                m,
+                tolerance=self.config.selection_bias_tolerance,
+                floor=self._bias_floor(),
+            )
+            for m in metrics.values()
+        ):
+            self.selection_reason = "no_candidate_within_bias_guard"
+        if winner in (DEGREE_HOUR_CANDIDATE, BLEND_CANDIDATE):
+            # Refit on all measured rows after selection.
+            self._regression = self._new_regression()
+        if winner == BLEND_CANDIDATE:
+            self._blend_weight = self._window_blend_weight(windows, origins)
+        return (
+            pd.Series(np.concatenate(conformal_actual)),
+            pd.Series(np.concatenate(conformal_predicted)),
+        )
+
+    def _leave_one_out_choices(
+        self,
+        windows: dict[pd.Timestamp, dict[str, np.ndarray]],
+        names: list[str],
+        origins: list[pd.Timestamp],
+        winner: str,
+    ) -> dict[pd.Timestamp, str]:
+        """Return, per origin, the candidate chosen from the other origins.
+
+        With a single origin there is nothing to leave out; it keeps ``winner``.
+        """
+        choices: dict[pd.Timestamp, str] = {}
+        for origin in origins:
+            others = [o for o in origins if o != origin]
+            choices[origin] = (
+                self._select(self._score_backtest(windows, names, others))
+                if others
+                else winner
+            )
+        return choices
+
+    def _bias_floor(self) -> float:
+        """Return the bias floor in target units (kWh) per interval."""
+        return self.config.selection_bias_floor_kw * self.config.interval_minutes / 60
+
+    def _select(self, metrics: dict[str, CandidateMetrics]) -> str:
+        return select_candidate(
+            metrics,
+            bias_tolerance=self.config.selection_bias_tolerance,
+            bias_floor=self._bias_floor(),
+        )
+
+    def _score_backtest(
+        self,
+        windows: dict[pd.Timestamp, dict[str, np.ndarray]],
+        names: list[str],
+        origins: list[pd.Timestamp],
+    ) -> dict[str, CandidateMetrics]:
+        steps = max(1, 60 // self.config.interval_minutes)
+        scored: dict[str, CandidateMetrics] = {}
+        for name in names:
+            metrics = score_windows(
+                [(windows[o]["actual"], windows[o][name]) for o in origins],
+                window_steps=steps,
+            )
+            if metrics is not None:
+                scored[name] = metrics
+        return scored
+
+    @staticmethod
+    def _window_blend_weight(
+        windows: dict[pd.Timestamp, dict[str, np.ndarray]],
+        origins: list[pd.Timestamp],
+    ) -> float:
+        if not origins:
+            return 1.0
+        return fit_blend_weight(
+            [windows[o]["actual"] for o in origins],
+            [windows[o][ML_CANDIDATE] for o in origins],
+            [windows[o][DEGREE_HOUR_CANDIDATE] for o in origins],
+        )
+
+    def _backtest_origins(self, last_measured: pd.Timestamp) -> list[pd.Timestamp]:
+        """Local midnights whose full horizon ends at or before the data end."""
+        interval = pd.Timedelta(minutes=self.config.interval_minutes)
+        horizon = pd.Timedelta(hours=self.config.selection_horizon_hours)
+        latest_start = (last_measured + interval - horizon).tz_convert(
+            self.config.timezone
+        )
+        latest = latest_start.normalize()
+        return sorted(
+            (latest - pd.DateOffset(days=offset)).tz_convert("UTC")
+            for offset in range(self.config.selection_backtest_days)
+        )
+
+    def _backtest(
+        self,
+        history: pd.DataFrame,
+        features: pd.DataFrame,
+        bridged: pd.Series,
+    ) -> dict[pd.Timestamp, dict[str, np.ndarray]]:
+        """Forecast each backtest origin with every enabled candidate.
+
+        Origins whose window is not on the grid, has under 90 % measured rows,
+        or cannot be forecast by the ML model are left out. Benchmarks that
+        cannot forecast an origin are missing from that origin's entry.
+
+        Returns:
+            Per origin: ``actual`` (NaN where not measured) and one array per
+            candidate that produced a forecast.
+        """
+        frame = history.reset_index(drop=True).copy()
+        frame["ds"] = pd.to_datetime(frame["ds"], utc=True)
+        feature_rows = features.reset_index(drop=True)
+        bridged_rows = bridged.reset_index(drop=True).astype(bool)
+        target = pd.to_numeric(frame["y"], errors="coerce")
+        measured = target.where(~bridged_rows)
+        if not measured.notna().any():
+            return {}
+        interval = pd.Timedelta(minutes=self.config.interval_minutes)
+        steps = self.config.selection_horizon_hours * 60 // self.config.interval_minutes
+        position = pd.Series(frame.index, index=frame["ds"])
+        last_measured = frame.loc[measured.notna(), "ds"].max()
+        wanted = set(self.config.selection_candidates)
+        results: dict[pd.Timestamp, dict[str, np.ndarray]] = {}
+        for origin in self._backtest_origins(last_measured):
+            grid = pd.date_range(origin, periods=steps, freq=interval, tz="UTC")
+            rows = position.reindex(grid)
+            if rows.isna().any():
+                continue
+            index = rows.astype(int).to_numpy()
+            window = frame.iloc[index].reset_index(drop=True)
+            actual = measured.iloc[index].to_numpy(dtype=float)
+            if np.isfinite(actual).mean() < 0.9:
+                continue
+            train_mask = (frame["ds"] < origin) & target.notna()
+            train = frame.loc[train_mask].reset_index(drop=True)
+            if train.empty or train["ds"].iloc[-1] != origin - interval:
+                continue
+            ml = self._backtest_ml(
+                train,
+                feature_rows.loc[train_mask].reset_index(drop=True),
+                feature_rows.iloc[index].reset_index(drop=True),
+                steps,
+            )
+            if ml is None:
+                continue
+            entry: dict[str, np.ndarray] = {"actual": actual, ML_CANDIDATE: ml}
+            train_measured = frame.loc[train_mask & ~bridged_rows].reset_index(
+                drop=True
+            )
+            if wanted & {DEGREE_HOUR_CANDIDATE, BLEND_CANDIDATE}:
+                regression = self._new_regression()
+                if regression.fit(train_measured):
+                    values = regression.predict(window).to_numpy(dtype=float)
+                    if np.isfinite(values).all():
+                        entry[DEGREE_HOUR_CANDIDATE] = values
+            if BASELINE_NAME in wanted:
+                try:
+                    baseline = local_slot_weekday_class_median(
+                        train_measured[["ds", "y"]],
+                        origin=origin.to_pydatetime(),
+                        periods=steps,
+                        interval_minutes=self.config.interval_minutes,
+                        timezone=self.config.timezone,
+                    )
+                except ForecastAlignmentError:
+                    pass
+                else:
+                    entry[BASELINE_NAME] = baseline["yhat"].to_numpy(dtype=float)
+            results[origin] = entry
+        return results
+
+    def _backtest_ml(
+        self,
+        train: pd.DataFrame,
+        train_features: pd.DataFrame,
+        window_features: pd.DataFrame,
+        steps: int,
+    ) -> np.ndarray | None:
+        """Fit a fresh backend on ``train`` and forecast the next ``steps`` rows.
+
+        Returns:
+            Non-negative predictions, or ``None`` when the backend cannot be
+            trained this early or produces non-finite values.
+        """
+        backend = create_backend(self.config)
         try:
-            baseline = local_slot_weekday_class_median(
-                train_measured[["ds", "y"]],
-                origin=holdout_times.iloc[0].to_pydatetime(),
-                periods=len(calibration_frame),
-                interval_minutes=self.config.interval_minutes,
-                timezone=self.config.timezone,
+            backend.fit(train, train_features, train.iloc[0:0])
+            forecast = backend.predict(window_features, horizon=steps)
+            forecast = self._sanitize_point_forecast(forecast)
+        except (ValueError, ForecastAlignmentError):
+            return None
+        values = forecast["yhat"].to_numpy(dtype=float)
+        return values if len(values) == steps else None
+
+    def _regression_values(self, weather: pd.DataFrame) -> pd.Series:
+        """Predict the fitted degree-hour regression on the model grid."""
+        if self._regression is None:
+            raise ForecastAlignmentError("degree-hour regression is unavailable")
+        values = self._regression.predict(weather.reset_index(drop=True))
+        if values.isna().any():
+            raise ForecastAlignmentError(
+                "degree-hour regression is missing outdoor temperature"
             )
-        except ForecastAlignmentError:
-            pass
-        else:
-            predictions[BASELINE_NAME] = (
-                baseline.set_index(pd.to_datetime(baseline["ds"], utc=True))["yhat"]
-                .reindex(holdout_times)
-                .reset_index(drop=True)
-            )
-        scored = {
-            name: metrics
-            for name, values in predictions.items()
-            if (metrics := score_candidate(selection_actual, values)) is not None
-        }
-        if ML_CANDIDATE not in scored:
-            self.selection_reason = "ml_holdout_unscored"
-            return calibration_actual
-        self.selected_candidate = select_candidate(scored)
-        self.candidate_metrics = {
-            name: metrics.as_dict() for name, metrics in scored.items()
-        }
-        if self.selected_candidate == DEGREE_HOUR_CANDIDATE:
-            self._regression = regression
-        return calibration_actual.where(~in_selection)
+        return values
 
     def _predict_benchmark(
         self, weather: pd.DataFrame, *, start: pd.Timestamp, horizon: int
@@ -806,13 +1112,7 @@ class KPowerMLForecast:
             tz="UTC",
         )
         if self.selected_candidate == DEGREE_HOUR_CANDIDATE:
-            if self._regression is None:
-                raise ForecastAlignmentError("degree-hour regression is unavailable")
-            values = self._regression.predict(weather.reset_index(drop=True))
-            if values.isna().any():
-                raise ForecastAlignmentError(
-                    "degree-hour regression is missing outdoor temperature"
-                )
+            values = self._regression_values(weather)
         elif self.selected_candidate == BASELINE_NAME:
             history = self.storage.load_training_frame()
             if history is None:
@@ -840,7 +1140,13 @@ class KPowerMLForecast:
         reason = selection.get("reason")
         self.selection_reason = reason if isinstance(reason, str) else None
         self._regression = None
-        if self.selected_candidate == DEGREE_HOUR_CANDIDATE:
+        self._blend_weight = None
+        if self.selected_candidate not in SELECTION_CANDIDATES:
+            raise ForecastAlignmentError(
+                f"stored candidate {self.selected_candidate!r} is unknown; a full "
+                "retrain is required"
+            )
+        if self.selected_candidate in (DEGREE_HOUR_CANDIDATE, BLEND_CANDIDATE):
             payload = manifest.metadata.get("degree_hour_regression")
             if not isinstance(payload, dict):
                 raise ForecastAlignmentError(
@@ -848,11 +1154,17 @@ class KPowerMLForecast:
                     "required"
                 )
             self._regression = DegreeHourRegression.from_dict(payload)
-        elif self.selected_candidate not in {ML_CANDIDATE, BASELINE_NAME}:
-            raise ForecastAlignmentError(
-                f"stored candidate {self.selected_candidate!r} is unknown; a full "
-                "retrain is required"
-            )
+        if self.selected_candidate == BLEND_CANDIDATE:
+            weight = selection.get("blend_weight")
+            if (
+                isinstance(weight, bool)
+                or not isinstance(weight, int | float)
+                or not 0.0 <= float(weight) <= 1.0
+            ):
+                raise ForecastAlignmentError(
+                    "stored blend weight is invalid; a full retrain is required"
+                )
+            self._blend_weight = float(weight)
 
     def predict_baseline(
         self,
@@ -1115,6 +1427,12 @@ def _selection_settings(config: KPowerMLConfig) -> dict[str, Any]:
     if config.candidate_selection:
         settings["regression_base_temperature_c"] = config.regression_base_temperature_c
         settings["regression_extra_features"] = list(config.regression_extra_features)
+        settings["enabled_candidates"] = list(config.selection_candidates)
+        settings["backtest_days"] = config.selection_backtest_days
+        settings["horizon_hours"] = config.selection_horizon_hours
+        settings["min_origins"] = config.selection_min_origins
+        settings["bias_tolerance"] = config.selection_bias_tolerance
+        settings["bias_floor_kw"] = config.selection_bias_floor_kw
     return settings
 
 
@@ -1142,7 +1460,19 @@ def _structure_matches(manifest: MLModelManifest, config: KPowerMLConfig) -> boo
     if stored != config.hybrid_structure.value:
         return False
     if config.hybrid_structure == HybridStructure.PROFILE_DIRECT:
-        return manifest.metadata.get("profile_lookback_days") == (
-            config.profile_lookback_days
+        return (
+            manifest.metadata.get("profile_lookback_days")
+            == config.profile_lookback_days
+            and manifest.metadata.get("profile_class_prior_days")
+            == config.profile_class_prior_days
+            and manifest.metadata.get("profile_smoothing_minutes")
+            == config.profile_smoothing_minutes
         )
     return True
+
+
+def _covariates_match(manifest: MLModelManifest, config: KPowerMLConfig) -> bool:
+    """Return whether a stored artifact was trained on these known covariates."""
+    return bool(
+        manifest.metadata.get("known_covariates", []) == list(config.known_covariates)
+    )

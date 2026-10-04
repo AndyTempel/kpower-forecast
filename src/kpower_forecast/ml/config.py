@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kpower_forecast.core import DataCategory, MeasurementUnit
+from kpower_forecast.ml.selection import ML_CANDIDATE, SELECTION_CANDIDATES
 
 
 class MLForecastType(str, Enum):
@@ -60,6 +61,14 @@ class KPowerMLConfig(BaseModel):
     backend_params: dict[str, Any] = Field(default_factory=dict)
     hybrid_structure: HybridStructure = HybridStructure.RECURSIVE_SEASONAL_NAIVE
     profile_lookback_days: int = Field(default=28, ge=1, le=366)
+    # profile_direct: each weekday-class profile is shrunk toward the all-days
+    # profile with weight n / (n + prior), n = days of that class in the
+    # lookback, so a class seen on few days cannot replay their events.
+    profile_class_prior_days: float = Field(default=4.0, ge=0.0, le=366.0)
+    # profile_direct: half-width of a centred circular moving average over the
+    # profile's local time of day (± minutes; 0 = off), a multiple of the
+    # interval. Compressor runs do not repeat to the minute.
+    profile_smoothing_minutes: int = Field(default=0, ge=0, le=180)
     interval_levels: list[int] = Field(default_factory=lambda: [50, 80, 90])
     holiday_country: Optional[str] = None
     holiday_subdivision: Optional[str] = None
@@ -68,14 +77,29 @@ class KPowerMLConfig(BaseModel):
     min_weather_correction_samples: int = Field(default=8, gt=0)
     inverter_ac_limit_kw: Optional[float] = Field(default=None, gt=0)
     grid_export_limit_kw: Optional[float] = Field(default=None, gt=0)
-    # Holdout selection between the ML model, a degree-hour regression and the
-    # slot/weekday median (see kpower_forecast.ml.selection). Off by default.
+    # Rolling-origin selection between the ML model and transparent
+    # benchmarks (see kpower_forecast.ml.selection). Off by default.
     candidate_selection: bool = False
-    min_selection_holdout_rows: int = Field(default=96, gt=0)
+    # Candidates that may be served; the ML model is always scored.
+    selection_candidates: list[str] = Field(
+        default_factory=lambda: list(SELECTION_CANDIDATES)
+    )
+    # Day-ahead origins at local midnight over the most recent days.
+    selection_backtest_days: int = Field(default=7, ge=1, le=60)
+    selection_horizon_hours: int = Field(default=24, ge=1, le=168)
+    selection_min_origins: int = Field(default=3, ge=1, le=60)
+    # A candidate whose mean error exceeds this share of mean actual load (or
+    # the floor, whichever is larger) is not eligible to win.
+    selection_bias_tolerance: float = Field(default=0.15, gt=0.0, le=1.0)
+    selection_bias_floor_kw: float = Field(default=0.05, ge=0.0)
     regression_base_temperature_c: float = 16.0
     regression_extra_features: list[str] = Field(
         default_factory=lambda: ["shortwave_radiation"]
     )
+    # Caller-supplied numeric columns known in advance (e.g. a scheduled HVAC
+    # mode). Required in training history and, for every model-grid row, in
+    # ``known_future`` at prediction.
+    known_covariates: list[str] = Field(default_factory=list)
 
     @field_validator("interval_minutes")
     @classmethod
@@ -147,6 +171,22 @@ class KPowerMLConfig(BaseModel):
         """
         if self.candidate_selection and self.forecast_type == MLForecastType.SOLAR:
             raise ValueError("candidate_selection is not supported for solar")
+        unknown = set(self.selection_candidates) - set(SELECTION_CANDIDATES)
+        if unknown:
+            raise ValueError(f"unknown selection_candidates: {sorted(unknown)}")
+        if ML_CANDIDATE not in self.selection_candidates:
+            # The ML model is the reference every benchmark must beat.
+            raise ValueError(f"selection_candidates must include {ML_CANDIDATE!r}")
+        if len(set(self.selection_candidates)) != len(self.selection_candidates):
+            raise ValueError("selection_candidates must be unique")
+        if self.selection_min_origins > self.selection_backtest_days:
+            raise ValueError(
+                "selection_min_origins must not exceed selection_backtest_days"
+            )
+        if self.profile_smoothing_minutes % self.interval_minutes:
+            raise ValueError(
+                "profile_smoothing_minutes must be a multiple of interval_minutes"
+            )
         if self.hybrid_structure == HybridStructure.PROFILE_DIRECT:
             if self.forecast_type == MLForecastType.SOLAR:
                 # Solar uses its radiation profile baseline.
@@ -168,6 +208,13 @@ class KPowerMLConfig(BaseModel):
             self.regression_extra_features
         ):
             raise ValueError("regression_extra_features must be unique")
+        reserved_covariates = {"ds", "y"}.intersection(self.known_covariates)
+        if reserved_covariates:
+            raise ValueError(
+                f"known_covariates must not include {sorted(reserved_covariates)}"
+            )
+        if len(set(self.known_covariates)) != len(self.known_covariates):
+            raise ValueError("known_covariates must be unique")
         return self
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
