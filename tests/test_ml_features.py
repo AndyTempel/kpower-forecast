@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
-from kpower_forecast.ml.features import MLFeatureBuilder
+from kpower_forecast.ml.features import GENERATED_FEATURE_COLUMNS, MLFeatureBuilder
 
 
 def test_feature_builder_adds_calendar_physics_and_rolling_features() -> None:
@@ -43,6 +43,22 @@ def test_feature_builder_adds_calendar_physics_and_rolling_features() -> None:
     }
     assert expected.issubset(features.columns)
     assert features["wind_speed_10m"].tolist() == [5.0, 5.0, 5.0, 5.0]
+    # The reserved names that known covariates may not use are exactly what
+    # the builder generates.
+    assert set(features.columns) - set(df.columns) == GENERATED_FEATURE_COLUMNS
+
+
+def test_known_covariate_named_like_a_generated_feature_is_rejected() -> None:
+    config = KPowerMLConfig(
+        model_id="features",
+        latitude=46.0,
+        longitude=14.0,
+        forecast_type=MLForecastType.HVAC,
+        known_covariates=["hvac_mode", "heating_degree"],
+    )
+
+    with pytest.raises(ValueError, match="heating_degree"):
+        MLFeatureBuilder(config)
 
 
 @pytest.mark.parametrize(

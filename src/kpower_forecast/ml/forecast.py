@@ -1,6 +1,6 @@
 """Public ML forecasting API."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from math import ceil
 from numbers import Real
 from pathlib import Path
@@ -776,10 +776,17 @@ class KPowerMLForecast:
         return cast(datetime, self._training_end.to_pydatetime())
 
     def get_prediction_intervals(
-        self, days: int = 7, level: int = 90
+        self,
+        days: int = 7,
+        level: int = 90,
+        known_future: Optional[pd.DataFrame] = None,
     ) -> list[PredictionInterval]:
-        """Return EMS-compatible prediction intervals for an ML forecast."""
-        forecast = self.predict(days=days)
+        """Return EMS-compatible prediction intervals for an ML forecast.
+
+        ``known_future`` is passed to :meth:`predict`; it is required when
+        ``known_covariates`` is configured.
+        """
+        forecast = self.predict(days=days, known_future=known_future)
         lower_column = f"yhat_lower_{level}"
         upper_column = f"yhat_upper_{level}"
         if lower_column not in forecast.columns or upper_column not in forecast.columns:
@@ -989,17 +996,25 @@ class KPowerMLForecast:
         )
 
     def _backtest_origins(self, last_measured: pd.Timestamp) -> list[pd.Timestamp]:
-        """Local midnights whose full horizon ends at or before the data end."""
+        """Local day starts whose full horizon ends at or before the data end.
+
+        Where a DST change skips midnight, the day starts at the first local
+        time that exists; an ambiguous midnight resolves to its first instant.
+        """
         interval = pd.Timedelta(minutes=self.config.interval_minutes)
         horizon = pd.Timedelta(hours=self.config.selection_horizon_hours)
         latest_start = (last_measured + interval - horizon).tz_convert(
             self.config.timezone
         )
-        latest = latest_start.normalize()
-        return sorted(
-            (latest - pd.DateOffset(days=offset)).tz_convert("UTC")
-            for offset in range(self.config.selection_backtest_days)
-        )
+        origins: list[pd.Timestamp] = []
+        for offset in range(self.config.selection_backtest_days):
+            day = pd.Timestamp(latest_start.date() - timedelta(days=offset))
+            start = day.tz_localize(
+                self.config.timezone, nonexistent="shift_forward", ambiguous=True
+            ).tz_convert("UTC")
+            if start <= latest_start:
+                origins.append(start)
+        return sorted(origins)
 
     def _backtest(
         self,
@@ -1097,7 +1112,9 @@ class KPowerMLForecast:
             backend.fit(train, train_features, train.iloc[0:0])
             forecast = backend.predict(window_features, horizon=steps)
             forecast = self._sanitize_point_forecast(forecast)
-        except (ValueError, ForecastAlignmentError):
+        except Exception:  # noqa: BLE001
+            # An early origin with little history must not abort training; the
+            # final fit on all rows still surfaces genuine backend errors.
             return None
         values = forecast["yhat"].to_numpy(dtype=float)
         return values if len(values) == steps else None

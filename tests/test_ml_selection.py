@@ -490,3 +490,86 @@ def test_regression_inputs_reject_target_leakage_and_missing_columns() -> None:
     assert regression.fit(weather.assign(y=_heating(weather)))
     with pytest.raises(ValueError, match="shortwave_radiation"):
         regression.predict(weather.drop(columns="shortwave_radiation"))
+
+
+def test_backtest_origins_survive_a_skipped_local_midnight(tmp_path) -> None:
+    # Chile skips 00:00 on 2026-09-06; that day starts at 01:00 local. It is
+    # the latest origin here, which normalize() cannot represent.
+    forecast = KPowerMLForecast(
+        model_id="heating",
+        latitude=-33.4,
+        longitude=-70.6,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.HVAC,
+        timezone="America/Santiago",
+        candidate_selection=True,
+    )
+    last_measured = pd.Timestamp("2026-09-07 12:00", tz="America/Santiago")
+
+    origins = forecast._backtest_origins(last_measured.tz_convert("UTC"))
+
+    local = [origin.tz_convert("America/Santiago") for origin in origins]
+    assert len(local) == 7
+    assert local[-1] == pd.Timestamp("2026-09-06 01:00", tz="America/Santiago")
+    assert all(origin.hour == 0 for origin in local if origin.day != 6)
+
+
+def test_a_backend_failure_on_an_early_origin_does_not_abort_training(
+    monkeypatch, tmp_path
+) -> None:
+    class _Fragile(_Backend):
+        def fit(self, history, features, calibration) -> None:
+            if len(history) < 100:
+                raise RuntimeError("too little data for this backend")
+            super().fit(history, features, calibration)
+
+    weather = _weather("2026-01-05", _HOURS)
+    history = pd.DataFrame({"ds": weather["ds"], "y": _heating(weather)})
+    forecast = _forecast(monkeypatch, tmp_path, _Fragile(), weather)
+
+    forecast.train(history, force=True)
+
+    # The early origins are skipped; the remaining ones are too few to select.
+    assert forecast.selection_reason == "backtest_too_short"
+    assert forecast.training_end is not None
+
+
+def test_interval_api_forwards_known_future(monkeypatch, tmp_path) -> None:
+    weather = _weather("2026-01-05", _HOURS)
+    forecast = _forecast(
+        monkeypatch,
+        tmp_path,
+        _Backend(),
+        weather,
+        candidate_selection=False,
+        known_covariates=["hvac_mode"],
+    )
+    known = pd.DataFrame({"ds": weather["ds"], "hvac_mode": 1.0})
+    seen: dict[str, Any] = {}
+
+    def predict(**kwargs: Any) -> pd.DataFrame:
+        seen.update(kwargs)
+        return pd.DataFrame(
+            {
+                "ds": weather["ds"].iloc[:1],
+                "yhat": [1.0],
+                "yhat_lower_90": [0.5],
+                "yhat_upper_90": [1.5],
+            }
+        )
+
+    monkeypatch.setattr(forecast, "predict", predict)
+
+    assert len(forecast.get_prediction_intervals(days=1, known_future=known)) == 1
+    assert seen["known_future"] is known
+
+
+def test_rmse_1h_stays_finite_without_a_fully_measured_hour() -> None:
+    actual = np.ones(24)
+    actual[::3] = np.nan
+
+    metrics = score_windows([(actual, np.full(24, 1.5))], window_steps=4)
+
+    assert metrics is not None
+    assert metrics.rmse_1h == pytest.approx(metrics.rmse)

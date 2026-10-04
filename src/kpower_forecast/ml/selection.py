@@ -109,7 +109,13 @@ def score_windows(
         rmse=float(np.sqrt(np.mean(error**2))),
         mae=float(np.mean(np.abs(error))),
         bias=float(np.mean(error)),
-        rmse_1h=float(np.sqrt(np.mean(hourly**2))) if hourly.size else float("nan"),
+        # Without a fully measured hour, rank on per-interval RMSE so stored
+        # metrics stay finite (they are published as JSON).
+        rmse_1h=(
+            float(np.sqrt(np.mean(hourly**2)))
+            if hourly.size
+            else float(np.sqrt(np.mean(error**2)))
+        ),
         mean_actual=float(np.mean(np.concatenate(actuals))),
         origins=origins,
     )

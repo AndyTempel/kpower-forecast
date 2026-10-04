@@ -366,11 +366,12 @@ backtest without configuration changes.
 
 `known_covariates` names numeric columns that the caller knows in advance, such as a scheduled
 HVAC mode or a thermostat target. Training history must contain them, and their names must not
-repeat a weather column. They are averaged onto the model grid and join the weather and calendar
-features. Training rows without a value count as 0, like other missing features, so supply
-complete history. `predict(known_future=...)` must then
-supply `ds` and every covariate for each model-grid row: from the first slot after training, not
-only from `origin`, through the returned horizon. A missing or non-finite value raises
+repeat a weather column or a generated feature (`hour_sin`, `heating_degree`, …). They are
+averaged onto the model grid and join the weather and calendar features. Training rows without a
+value count as 0, like other missing features, so supply complete history.
+`predict(known_future=...)` and `get_prediction_intervals(known_future=...)` must then supply
+`ds` and every covariate for each model-grid row: from the first slot after training, not only
+from `origin`, through the returned horizon. A missing or non-finite value raises
 `ForecastAlignmentError`, and nothing is zero-filled. To let the degree-hour regression use a
 covariate, add it to `regression_extra_features`. Changing `known_covariates` requires a full
 retrain.
