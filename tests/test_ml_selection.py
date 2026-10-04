@@ -284,6 +284,36 @@ def test_interval_calibration_uses_the_choice_made_without_each_origin(
     assert choices[origins[1]] == DEGREE_HOUR_CANDIDATE
 
 
+def test_held_out_actuals_do_not_steer_their_own_blend_choice(
+    monkeypatch, tmp_path
+) -> None:
+    # Blend weights fitted on the other origins must also leave out the
+    # origin being calibrated, or its actuals pick its own candidate.
+    weather = _weather("2026-01-05", _HOURS)
+    forecast = _forecast(monkeypatch, tmp_path, _Backend(), weather)
+    origins = list(pd.date_range("2026-01-05", periods=3, freq="D", tz="UTC"))
+    names = [ML_CANDIDATE, DEGREE_HOUR_CANDIDATE, BLEND_CANDIDATE]
+    rng = np.random.default_rng(11)
+    windows = {
+        origin: {
+            "actual": rng.uniform(0, 2, 24),
+            ML_CANDIDATE: rng.uniform(0, 2, 24),
+            DEGREE_HOUR_CANDIDATE: rng.uniform(0, 2, 24),
+        }
+        for origin in origins
+    }
+    changed = {origin: dict(window) for origin, window in windows.items()}
+    changed[origins[0]]["actual"] = rng.uniform(0, 6, 24)
+
+    def choice(source: dict) -> str:
+        blended = forecast._with_blend(source, origins, held_out=None)
+        return forecast._leave_one_out_choices(
+            blended, names, origins, ML_CANDIDATE, blend=True
+        )[origins[0]]
+
+    assert choice(windows) == choice(changed)
+
+
 def test_bias_guard_rejects_a_low_rmse_candidate_that_misses_energy() -> None:
     metrics = {
         ML_CANDIDATE: CandidateMetrics(
@@ -362,8 +392,9 @@ def test_blend_is_served_when_ml_and_regression_err_in_opposite_directions(
     )
 
 
+@pytest.mark.parametrize("preserve_gaps", [True, False])
 def test_known_covariates_reach_the_model_and_are_required_to_predict(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, preserve_gaps: bool
 ) -> None:
     weather = _weather("2026-01-05", _HOURS + 24)
     past = weather.iloc[:_HOURS]
@@ -383,6 +414,7 @@ def test_known_covariates_reach_the_model_and_are_required_to_predict(
         weather,
         candidate_selection=False,
         known_covariates=["hvac_mode"],
+        preserve_gaps=preserve_gaps,
     )
     with pytest.raises(ValueError, match="known covariates"):
         forecast.train(history.drop(columns="hvac_mode"), force=True)
@@ -411,7 +443,12 @@ def test_known_covariates_reach_the_model_and_are_required_to_predict(
     # A model trained without the covariate is not restored for one with it.
     assert (
         _forecast(
-            monkeypatch, tmp_path, _Backend(), weather, candidate_selection=False
+            monkeypatch,
+            tmp_path,
+            _Backend(),
+            weather,
+            candidate_selection=False,
+            preserve_gaps=preserve_gaps,
         ).training_end
         is None
     )

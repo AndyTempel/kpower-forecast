@@ -183,8 +183,9 @@ class KPowerMLForecast:
             return
 
         covariates = self._history_covariates(history_df)
+        # Only the target is normalized; covariates are merged separately.
         normalized = normalize_to_instant_kwh(
-            history_df,
+            history_df[["ds", "y"]],
             category=self.config.data_category.value,
             unit=self.config.unit.value,
             target_interval_min=self.config.interval_minutes,
@@ -866,18 +867,12 @@ class KPowerMLForecast:
             return default
         windows = {origin: dict(backtest[origin]) for origin in origins}
         if blend:
-            for origin in origins:
-                others = [o for o in origins if o != origin]
-                weight = self._window_blend_weight(windows, others)
-                windows[origin][BLEND_CANDIDATE] = (
-                    weight * windows[origin][ML_CANDIDATE]
-                    + (1.0 - weight) * windows[origin][DEGREE_HOUR_CANDIDATE]
-                )
+            windows = self._with_blend(windows, origins, held_out=None)
             names.append(BLEND_CANDIDATE)
 
         metrics = self._score_backtest(windows, names, origins)
         winner = self._select(metrics)
-        choices = self._leave_one_out_choices(windows, names, origins, winner)
+        choices = self._leave_one_out_choices(windows, names, origins, winner, blend)
         conformal_actual = [windows[o]["actual"] for o in origins]
         conformal_predicted = [windows[o][choices[o]] for o in origins]
 
@@ -902,25 +897,54 @@ class KPowerMLForecast:
             pd.Series(np.concatenate(conformal_predicted)),
         )
 
+    def _with_blend(
+        self,
+        windows: dict[pd.Timestamp, dict[str, np.ndarray]],
+        origins: list[pd.Timestamp],
+        *,
+        held_out: pd.Timestamp | None,
+    ) -> dict[pd.Timestamp, dict[str, np.ndarray]]:
+        """Add blend predictions, each weighted without its own origin.
+
+        With ``held_out`` set, that origin's actuals are excluded from every
+        weight too, so it cannot influence a choice made for it.
+        """
+        output = {origin: dict(window) for origin, window in windows.items()}
+        for origin in origins:
+            fit_on = [o for o in origins if o not in (origin, held_out)]
+            weight = self._window_blend_weight(windows, fit_on)
+            output[origin][BLEND_CANDIDATE] = (
+                weight * windows[origin][ML_CANDIDATE]
+                + (1.0 - weight) * windows[origin][DEGREE_HOUR_CANDIDATE]
+            )
+        return output
+
     def _leave_one_out_choices(
         self,
         windows: dict[pd.Timestamp, dict[str, np.ndarray]],
         names: list[str],
         origins: list[pd.Timestamp],
         winner: str,
+        blend: bool = False,
     ) -> dict[pd.Timestamp, str]:
         """Return, per origin, the candidate chosen from the other origins.
 
-        With a single origin there is nothing to leave out; it keeps ``winner``.
+        Blend predictions are rebuilt per held-out origin so its actuals take
+        no part in the weights. With a single origin there is nothing to leave
+        out; it keeps ``winner``.
         """
         choices: dict[pd.Timestamp, str] = {}
         for origin in origins:
             others = [o for o in origins if o != origin]
-            choices[origin] = (
-                self._select(self._score_backtest(windows, names, others))
-                if others
-                else winner
+            if not others:
+                choices[origin] = winner
+                continue
+            fold = (
+                self._with_blend(windows, origins, held_out=origin)
+                if blend
+                else windows
             )
+            choices[origin] = self._select(self._score_backtest(fold, names, others))
         return choices
 
     def _bias_floor(self) -> float:
