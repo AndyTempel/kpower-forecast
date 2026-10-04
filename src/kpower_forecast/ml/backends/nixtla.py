@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 
 from kpower_forecast.ml.alignment import (
@@ -296,17 +297,7 @@ class NixtlaHybridBackend:
             days=self.config.profile_lookback_days
         )
         recent = frame.loc[frame["ds"] > cutoff]
-        weekend, minute = self._profile_keys(recent["ds"])
-        grouped = recent.assign(weekend=weekend.astype(int), minute=minute)
-        self._load_profile = {
-            f"{int(key[0])}:{int(key[1])}": float(value)
-            for key, value in grouped.groupby(["weekend", "minute"])["y"].mean().items()
-        }
-        self._load_profile_by_minute = {
-            int(key): float(value)
-            for key, value in grouped.groupby("minute")["y"].mean().items()
-        }
-        self._load_profile_mean = float(recent["y"].mean()) if len(recent) else 0.0
+        self._fit_load_profile(recent)
 
         rows = history.reset_index(drop=True)
         target = pd.to_numeric(rows["y"], errors="coerce")
@@ -330,6 +321,61 @@ class NixtlaHybridBackend:
         model.fit(exogenous.loc[usable], residual.loc[usable])
         self._residual_model = model
         self._stats_model = None
+
+    def _fit_load_profile(self, recent: pd.DataFrame) -> None:
+        """Fit the shrunk, optionally smoothed slot profile from recent rows.
+
+        Each weekday-class mean is shrunk toward the all-days mean of the same
+        slot with weight ``n / (n + profile_class_prior_days)``, where ``n`` is
+        the number of local days of that class in the lookback. A weekend seen
+        twice therefore leans on the all-days profile instead of replaying two
+        days of heat-pump runs, and a class with ample history keeps its own
+        shape.
+        """
+        weekend, minute = self._profile_keys(recent["ds"])
+        local_date = (
+            pd.to_datetime(recent["ds"], utc=True)
+            .dt.tz_convert(self.config.timezone)
+            .dt.date
+        )
+        grouped = recent.assign(
+            weekend=weekend.astype(int), minute=minute, date=local_date
+        )
+        pooled = grouped.groupby("minute")["y"].mean()
+        pooled = self._smooth_profile(pooled)
+        profile: dict[str, float] = {}
+        prior = self.config.profile_class_prior_days
+        for is_weekend, rows in grouped.groupby("weekend"):
+            days = rows["date"].nunique()
+            weight = days / (days + prior) if days + prior > 0 else 1.0
+            class_mean = self._smooth_profile(rows.groupby("minute")["y"].mean())
+            flag = int(cast(int, is_weekend))
+            for slot, value in class_mean.items():
+                shrunk = weight * value + (1.0 - weight) * pooled.get(slot, value)
+                profile[f"{flag}:{int(cast(int, slot))}"] = float(shrunk)
+        self._load_profile = profile
+        self._load_profile_by_minute = {
+            int(cast(int, key)): float(value) for key, value in pooled.items()
+        }
+        self._load_profile_mean = float(recent["y"].mean()) if len(recent) else 0.0
+
+    def _smooth_profile(self, profile: pd.Series) -> pd.Series:
+        """Centred circular moving average over local time of day.
+
+        Slots missing from ``profile`` are not invented; the window averages
+        the slots that exist within ``± profile_smoothing_minutes``.
+        """
+        half_width = self.config.profile_smoothing_minutes
+        if half_width <= 0 or profile.empty:
+            return profile
+        day = 24 * 60
+        minutes = profile.index.to_numpy(dtype=int)
+        values = profile.to_numpy(dtype=float)
+        smoothed = []
+        for slot in minutes:
+            distance = np.abs((minutes - slot + day // 2) % day - day // 2)
+            smoothed.append(float(values[distance <= half_width].mean()))
+        return pd.Series(smoothed, index=profile.index, dtype="float64")
 
     def _exogenous_matrix(self, features: pd.DataFrame) -> pd.DataFrame:
         """Return the learned feature columns as a numeric matrix."""

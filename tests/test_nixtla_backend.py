@@ -407,7 +407,12 @@ def test_artifact_from_another_hybrid_structure_is_not_reused() -> None:
     )
     legacy = Manifest({})
     stored_direct = Manifest(
-        {"hybrid_structure": "profile_direct", "profile_lookback_days": 28}
+        {
+            "hybrid_structure": "profile_direct",
+            "profile_lookback_days": 28,
+            "profile_class_prior_days": 4.0,
+            "profile_smoothing_minutes": 0,
+        }
     )
 
     assert _structure_matches(legacy, recursive)
@@ -416,3 +421,34 @@ def test_artifact_from_another_hybrid_structure_is_not_reused() -> None:
     assert not _structure_matches(
         stored_direct, direct.model_copy(update={"profile_lookback_days": 14})
     )
+    assert not _structure_matches(
+        stored_direct, direct.model_copy(update={"profile_smoothing_minutes": 30})
+    )
+
+
+def test_profile_shrinks_a_sparsely_seen_weekday_class_toward_all_days() -> None:
+    # Two weeks: weekends (4 days) run at 08:00, weekdays (10 days) never do.
+    ds = pd.Series(pd.date_range("2026-09-07", periods=14 * 96, freq="15min", tz="UTC"))
+    weekend = ds.dt.dayofweek.ge(5)
+    y = pd.Series(0.0, index=ds.index).where(
+        ~(weekend & ds.dt.hour.eq(8) & ds.dt.minute.eq(0)), 2.0
+    )
+    backend = _profile_direct_backend()
+
+    backend._fit_load_profile(pd.DataFrame({"ds": ds, "y": y}))
+
+    pooled = 2.0 * 4 / 14
+    weight = 4 / (4 + 4)  # four weekend days, prior of four days
+    assert backend._load_profile["1:480"] == pytest.approx(
+        weight * 2.0 + (1 - weight) * pooled
+    )
+    assert backend._load_profile["0:480"] == pytest.approx((1 - 10 / 14) * pooled)
+
+    # ±30 min smoothing spreads the run over the five slots around it.
+    backend.config = backend.config.model_copy(
+        update={"profile_smoothing_minutes": 30, "profile_class_prior_days": 0.0}
+    )
+    backend._fit_load_profile(pd.DataFrame({"ds": ds, "y": y}))
+    assert backend._load_profile["1:450"] == pytest.approx(2.0 / 5)
+    assert backend._load_profile["1:510"] == pytest.approx(2.0 / 5)
+    assert backend._load_profile["1:420"] == pytest.approx(0.0)

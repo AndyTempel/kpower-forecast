@@ -7,11 +7,45 @@ import pandas as pd
 from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
 from kpower_forecast.utils import calculate_solar_elevation, get_clear_sky_ghi
 
+_ROLLING_STD_SOURCES: tuple[str, ...] = ("temperature_2m", "shortwave_radiation")
+_ROLLING_STD_HOURS: tuple[int, ...] = (3, 6)
+# Columns build() writes; a caller-supplied covariate with one of these names
+# would be silently overwritten.
+GENERATED_FEATURE_COLUMNS: frozenset[str] = frozenset(
+    {
+        "hour_sin",
+        "hour_cos",
+        "dow_sin",
+        "dow_cos",
+        "doy_sin",
+        "doy_cos",
+        "is_weekend",
+        "is_holiday",
+        "clear_sky_ghi",
+        "solar_elevation",
+        "clear_sky_index",
+        "wind_speed_10m",
+        "heating_degree",
+        "cooling_degree",
+        "hvac_temperature_delta",
+    }
+    | {
+        f"{column}_std_{hours}h"
+        for column in _ROLLING_STD_SOURCES
+        for hours in _ROLLING_STD_HOURS
+    }
+)
+
 
 class MLFeatureBuilder:
     """Build weather, calendar, and physics features for ML backends."""
 
     def __init__(self, config: KPowerMLConfig):
+        clash = GENERATED_FEATURE_COLUMNS.intersection(config.known_covariates)
+        if clash:
+            raise ValueError(
+                f"known covariates {sorted(clash)} clash with generated features"
+            )
         self.config = config
 
     def build(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -74,8 +108,8 @@ class MLFeatureBuilder:
                 lower=0.0
             )
 
-        self._add_rolling_std(features, "temperature_2m")
-        self._add_rolling_std(features, "shortwave_radiation")
+        for column in _ROLLING_STD_SOURCES:
+            self._add_rolling_std(features, column)
         if self.config.forecast_type == MLForecastType.HVAC:
             features["hvac_temperature_delta"] = features.get(
                 "heating_degree", 0.0
@@ -113,7 +147,7 @@ class MLFeatureBuilder:
         if column not in features.columns:
             return
 
-        for hours in (3, 6):
+        for hours in _ROLLING_STD_HOURS:
             window = max(1, int((hours * 60) / self.config.interval_minutes))
             features[f"{column}_std_{hours}h"] = (
                 features[column].rolling(window=window, min_periods=1).std().fillna(0.0)

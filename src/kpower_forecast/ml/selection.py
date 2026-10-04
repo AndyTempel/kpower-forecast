@@ -1,82 +1,197 @@
-"""Holdout selection between the ML model and transparent benchmarks.
+"""Rolling-origin selection between the ML model and transparent benchmarks.
 
-Every candidate forecasts the same calibration holdout from the same origin
-and with the same (historical) weather, so their errors are comparable. The
-lowest RMSE wins: for on/off loads such as a heat pump, MAE rewards an
-always-off forecast, while RMSE penalises missed runs and favours unbiased
-energy, which is what an energy planner integrates.
+Every candidate forecasts the same day-ahead windows, each from a model trained
+only on history before the window's origin and with the same historical
+weather, so their errors are comparable and match how forecasts are used.
+
+Candidates are ranked by RMSE of 1 h means taken at every step (a sliding
+window inside each origin's window). A run forecast 15 minutes early then costs
+a quarter of a run instead of a missed and a phantom run, and no bin edge
+splits a near miss. MAE is not used: it rewards an always-off forecast of an
+on/off load. RMSE alone can still prefer a smooth forecast that misses a large
+share of the energy, which an energy planner integrates, so a candidate whose
+mean error exceeds ``bias_tolerance`` of the mean actual load (or
+``bias_floor``) is not eligible. If no candidate is eligible, the least
+biased wins.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
+from kpower_forecast.ml.baselines import BASELINE_NAME
+
 ML_CANDIDATE = "kpower_ml"
 DEGREE_HOUR_CANDIDATE = "degree_hour_regression"
-SELECTION_METRIC = "rmse"
-# Relative RMSE margin a benchmark must beat ML by. Ties keep the ML model.
-SELECTION_MARGIN = 0.0
+BLEND_CANDIDATE = "ml_regression_blend"
+SELECTION_CANDIDATES: tuple[str, ...] = (
+    ML_CANDIDATE,
+    DEGREE_HOUR_CANDIDATE,
+    BASELINE_NAME,
+    BLEND_CANDIDATE,
+)
+SELECTION_METRIC = "rmse_1h_sliding"
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateMetrics:
-    """Holdout errors of one candidate, in target units per interval."""
+    """Backtest errors of one candidate, in target units per interval.
+
+    ``rmse`` and ``mae`` are per interval; ``rmse_1h`` uses sliding 1 h means
+    and ranks candidates. ``bias`` is the mean signed error and
+    ``mean_actual`` the mean measured target over the same rows.
+    """
 
     rows: int
     rmse: float
     mae: float
     bias: float
+    rmse_1h: float = float("nan")
+    mean_actual: float = float("nan")
+    origins: int = 0
 
     def as_dict(self) -> dict[str, float | int]:
         """Return JSON-serializable metric values."""
         return asdict(self)
 
 
-def score_candidate(
-    actual: pd.Series, predicted: pd.Series
+def _sliding_mean(values: np.ndarray, steps: int) -> np.ndarray:
+    """Mean over every ``steps``-long window; NaN where any value is missing."""
+    if steps <= 1:
+        return values
+    if len(values) < steps:
+        return np.array([], dtype=float)
+    windows = np.lib.stride_tricks.sliding_window_view(values, steps)
+    return np.asarray(windows.mean(axis=1), dtype=float)
+
+
+def score_windows(
+    windows: Sequence[tuple[np.ndarray, np.ndarray]], *, window_steps: int
 ) -> Optional[CandidateMetrics]:
-    """Score one candidate on rows where both values are finite.
+    """Score a candidate over backtest windows.
+
+    Sliding means never cross from one window into the next.
 
     Args:
-        actual: Measured target values (NaN for unmeasured rows).
-        predicted: Candidate values on the same index.
+        windows: ``(actual, predicted)`` arrays per origin, NaN where missing.
+        window_steps: Intervals per sliding mean (4 for 1 h at 15 minutes).
 
     Returns:
         Metrics, or ``None`` when no row can be scored.
     """
-    actual_values = pd.to_numeric(actual, errors="coerce").to_numpy(dtype=float)
-    predicted_values = pd.to_numeric(predicted, errors="coerce").to_numpy(dtype=float)
-    mask = np.isfinite(actual_values) & np.isfinite(predicted_values)
-    if not mask.any():
+    errors: list[np.ndarray] = []
+    actuals: list[np.ndarray] = []
+    sliding: list[np.ndarray] = []
+    origins = 0
+    for actual, predicted in windows:
+        actual = np.asarray(actual, dtype=float)
+        predicted = np.asarray(predicted, dtype=float)
+        mask = np.isfinite(actual) & np.isfinite(predicted)
+        if not mask.any():
+            continue
+        origins += 1
+        errors.append(predicted[mask] - actual[mask])
+        actuals.append(actual[mask])
+        difference = _sliding_mean(predicted, window_steps) - _sliding_mean(
+            actual, window_steps
+        )
+        sliding.append(difference[np.isfinite(difference)])
+    if not errors:
         return None
-    errors = predicted_values[mask] - actual_values[mask]
+    error = np.concatenate(errors)
+    hourly = np.concatenate(sliding)
     return CandidateMetrics(
-        rows=int(mask.sum()),
-        rmse=float(np.sqrt(np.mean(errors**2))),
-        mae=float(np.mean(np.abs(errors))),
-        bias=float(np.mean(errors)),
+        rows=int(error.size),
+        rmse=float(np.sqrt(np.mean(error**2))),
+        mae=float(np.mean(np.abs(error))),
+        bias=float(np.mean(error)),
+        # Without a fully measured hour, rank on per-interval RMSE so stored
+        # metrics stay finite (they are published as JSON).
+        rmse_1h=(
+            float(np.sqrt(np.mean(hourly**2)))
+            if hourly.size
+            else float(np.sqrt(np.mean(error**2)))
+        ),
+        mean_actual=float(np.mean(np.concatenate(actuals))),
+        origins=origins,
     )
 
 
-def select_candidate(metrics: dict[str, CandidateMetrics]) -> str:
-    """Return the candidate with the lowest RMSE; ties keep the ML model.
+def bias_eligible(metrics: CandidateMetrics, *, tolerance: float, floor: float) -> bool:
+    """Return whether a candidate's mean error is within the bias guard."""
+    limit = max(tolerance * abs(metrics.mean_actual), floor)
+    return abs(metrics.bias) <= limit
+
+
+def _ranking_error(metrics: CandidateMetrics) -> float:
+    return metrics.rmse_1h if np.isfinite(metrics.rmse_1h) else metrics.rmse
+
+
+def select_candidate(
+    metrics: dict[str, CandidateMetrics],
+    *,
+    bias_tolerance: float = float("inf"),
+    bias_floor: float = 0.0,
+) -> str:
+    """Return the winning candidate; ties keep the ML model.
+
+    Among candidates within the bias guard, the lowest sliding 1 h RMSE wins.
+    If none is within it, the smallest absolute bias wins.
 
     Args:
         metrics: Scored candidates. Must contain :data:`ML_CANDIDATE`.
+        bias_tolerance: Allowed share of mean actual load.
+        bias_floor: Allowed absolute bias in target units per interval.
 
     Returns:
         Winning candidate name.
     """
-    winner = ML_CANDIDATE
-    best = metrics[ML_CANDIDATE].rmse * (1.0 - SELECTION_MARGIN)
-    for name, candidate in sorted(metrics.items()):
-        if name != ML_CANDIDATE and candidate.rmse < best:
-            winner, best = name, candidate.rmse
+    eligible = {
+        name: candidate
+        for name, candidate in metrics.items()
+        if bias_eligible(candidate, tolerance=bias_tolerance, floor=bias_floor)
+    }
+    if not eligible:
+        key = {name: abs(candidate.bias) for name, candidate in metrics.items()}
+    else:
+        key = {name: _ranking_error(candidate) for name, candidate in eligible.items()}
+    winner = ML_CANDIDATE if ML_CANDIDATE in key else min(key, key=key.__getitem__)
+    best = key[winner]
+    for name in sorted(key):
+        if name != winner and key[name] < best:
+            winner, best = name, key[name]
     return winner
+
+
+def fit_blend_weight(
+    actual: Sequence[np.ndarray],
+    ml: Sequence[np.ndarray],
+    regression: Sequence[np.ndarray],
+) -> float:
+    """Least-squares weight ``w`` of ``w·ml + (1 − w)·regression``, in [0, 1].
+
+    Args:
+        actual: Measured values per window.
+        ml: ML predictions per window.
+        regression: Regression predictions per window.
+
+    Returns:
+        The weight; 1.0 (pure ML) when the two forecasts never differ.
+    """
+    a = np.concatenate([np.asarray(x, dtype=float) for x in actual])
+    m = np.concatenate([np.asarray(x, dtype=float) for x in ml])
+    r = np.concatenate([np.asarray(x, dtype=float) for x in regression])
+    mask = np.isfinite(a) & np.isfinite(m) & np.isfinite(r)
+    spread = (m - r)[mask]
+    denominator = float(np.dot(spread, spread))
+    if denominator <= 0.0:
+        return 1.0
+    weight = float(np.dot(spread, (a - r)[mask])) / denominator
+    return float(np.clip(weight, 0.0, 1.0))
 
 
 @dataclass(slots=True)
