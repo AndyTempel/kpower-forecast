@@ -12,7 +12,7 @@ def test_ml_storage_round_trips_manifest(tmp_path) -> None:
         target_type="solar",
         interval_levels=[50, 80, 90],
         feature_columns=["temperature_2m"],
-        conformal_quantiles={"90": 0.2},
+        conformal_bands={"edges": [], "levels": {"90": {"bands": [[-0.2, 0.3]]}}},
     )
 
     storage.save_manifest(manifest)

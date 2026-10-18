@@ -377,6 +377,26 @@ from `origin`, through the returned horizon. A missing or non-finite value raise
 covariate, add it to `regression_extra_features`. Changing `known_covariates` requires a full
 retrain.
 
+### Prediction intervals
+
+`yhat_lower_<L>` / `yhat_upper_<L>` for each of `interval_levels` come from split conformal
+calibration on the calibration tail (the last `calibration_fraction` of history), against the
+forecast that is actually served:
+
+- Residuals are signed (`actual - yhat`), so a band can be wider above the forecast than below
+  it, as for load that spikes above a smooth forecast. For level `L` the band is the residuals'
+  `(1 - L/100) / 2` and `1 - (1 - L/100) / 2` quantiles added to `yhat`.
+- Residuals are binned by `yhat`, so the band follows the error size at that output: narrow at
+  dawn and dusk, wide at a cloudy noon. Zero forecasts (solar at night) form their own bin; the
+  positive forecasts are split into quartiles. A bin with fewer than 96 calibration rows uses the
+  band of all residuals.
+- The band always contains `yhat`, and its lower edge is never negative. Solar bands are zero at
+  night and capped by the PV limits like `yhat`.
+
+The manifest stores the bins and bands as `conformal_bands`. A model saved before 2026.10.7, or
+one whose stored bands are unusable, is not restored, and `train(force=False)` raises
+`ForecastAlignmentError` with the conformal-state retrain message so the caller retrains it.
+
 ---
 
 ## 🛠️ Advanced Configuration
