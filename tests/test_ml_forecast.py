@@ -17,7 +17,11 @@ from kpower_forecast.ml.dependencies import (
     MissingMLDependencyError,
     ensure_optional_dependencies,
 )
-from kpower_forecast.ml.forecast import HISTORY_POLICY_VERSION, bridge_short_target_gaps
+from kpower_forecast.ml.forecast import (
+    HISTORY_POLICY_VERSION,
+    SANITIZED_CONFORMAL_STATE_VERSION,
+    bridge_short_target_gaps,
+)
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 
 
@@ -213,7 +217,10 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     assert manifest is not None
     assert manifest.contract_version == FORECAST_CONTRACT_VERSION
     assert manifest.package_version == __version__
-    assert manifest.metadata["sanitized_conformal_state_version"] == 1
+    assert (
+        manifest.metadata["sanitized_conformal_state_version"]
+        == SANITIZED_CONFORMAL_STATE_VERSION
+    )
     assert manifest.metadata["preserve_gaps"] is False
     assert forecast.training_end == datetime(2024, 1, 1, 7, tzinfo=timezone.utc)
 
@@ -304,7 +311,8 @@ def test_ml_forecast_calibrates_against_sanitized_predictions(
 
     forecast.train(history, force=True)
 
-    assert set(forecast.conformal.quantiles.values()) == {1.0}
+    # Sanitized forecasts are 0 against actuals of 1: every residual is 1.
+    assert set(forecast.conformal.global_bands.values()) == {(1.0, 1.0)}
 
 
 def test_ml_forecast_aligns_backend_grid_and_slices_explicit_origin(
@@ -767,8 +775,22 @@ def test_ml_forecast_permits_forced_retrain_of_legacy_manifest(
     assert manifest.contract_version == FORECAST_CONTRACT_VERSION
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        # Saved before the current conformal state version.
+        {},
+        # Current version, but the stored bands cannot be used.
+        {
+            "timezone": "UTC",
+            "history_policy_version": HISTORY_POLICY_VERSION,
+            "preserve_gaps": False,
+            "sanitized_conformal_state_version": SANITIZED_CONFORMAL_STATE_VERSION,
+        },
+    ],
+)
 def test_ml_forecast_invalidates_conformal_state_from_before_point_sanitation(
-    tmp_path,
+    tmp_path, metadata
 ) -> None:
     storage = MLModelStorage(str(tmp_path), "pre-sanitized")
     storage.save_manifest(
@@ -779,9 +801,10 @@ def test_ml_forecast_invalidates_conformal_state_from_before_point_sanitation(
             target_type=MLForecastType.CONSUMPTION.value,
             interval_levels=[50, 80, 90],
             feature_columns=[],
-            conformal_quantiles={"90": 2.0},
+            conformal_bands={},
             training_end="2026-08-12T08:30:00Z",
             package_version="2026.8.0",
+            metadata=metadata,
         )
     )
 
@@ -813,7 +836,7 @@ def test_ml_forecast_rejects_incompatible_gap_preservation_mode(
     metadata = {
         "timezone": "UTC",
         "history_policy_version": HISTORY_POLICY_VERSION,
-        "sanitized_conformal_state_version": 1,
+        "sanitized_conformal_state_version": SANITIZED_CONFORMAL_STATE_VERSION,
     }
     if stored_mode is not None:
         metadata["preserve_gaps"] = stored_mode
@@ -1001,8 +1024,9 @@ def test_ml_training_bridges_short_gaps_but_calibrates_on_measured_rows(
     # The bridged row joins the latest segment, so all ten rows train.
     assert backend.fitted_lengths[-1] == 10
     # Calibration tail is rows 6-9; the bridged row 7 (energy 2.0) is excluded,
-    # leaving residuals 0, 2, 0 rather than 0, 1, 2, 0.
-    assert forecast.conformal.quantiles[50] == pytest.approx(0.0)
+    # leaving residuals 0, 2, 0 (upper quartile 1.0) rather than 0, 1, 2, 0
+    # (1.25).
+    assert forecast.conformal.global_bands[50][1] == pytest.approx(1.0)
     assert forecast.training_bridged_rows == 1
     manifest = forecast.storage.load_manifest()
     assert manifest is not None

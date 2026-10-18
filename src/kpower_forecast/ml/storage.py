@@ -19,7 +19,7 @@ class MLModelManifest(BaseModel):
     interval_levels: list[int]
     feature_columns: list[str]
     artifact_paths: dict[str, str] = Field(default_factory=dict)
-    conformal_quantiles: dict[str, float] = Field(default_factory=dict)
+    conformal_bands: dict[str, Any] = Field(default_factory=dict)
     weather_bias_source: Optional[str] = None
     training_start: Optional[str] = None
     training_end: Optional[str] = None

@@ -52,7 +52,14 @@ DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "curtailment_limit_kw",
     "limit_kw",
 )
-SANITIZED_CONFORMAL_STATE_VERSION: int = 1
+# 2: signed residual bands binned by predicted value. A stored model with an
+# older version is refit, which callers detect by the retrain error message.
+SANITIZED_CONFORMAL_STATE_VERSION: int = 2
+# Callers match this message exactly to delete the model and retrain it.
+CONFORMAL_RETRAIN_REQUIRED = (
+    "stored model conformal state predates point-forecast sanitation; "
+    "a full retrain is required"
+)
 # The hourly archive's last value is 23:00 while the recent forecast starts at
 # 00:00, so up to one hour between the two sources may be interpolated.
 MAX_WEATHER_SEAM: pd.Timedelta = pd.Timedelta(hours=1)
@@ -268,7 +275,7 @@ class KPowerMLForecast:
             interval_levels=self.config.interval_levels,
             feature_columns=self.backend.feature_schema(),
             artifact_paths=self.backend.save(self.storage.artifact_dir),
-            conformal_quantiles=self.conformal.to_dict(),
+            conformal_bands=self.conformal.to_dict(),
             weather_bias_source=self.bias_corrector.source,
             training_start=pd.Timestamp(prepared["ds"].min()).isoformat(),
             training_end=pd.Timestamp(prepared["ds"].max()).isoformat(),
@@ -698,7 +705,13 @@ class KPowerMLForecast:
             != SANITIZED_CONFORMAL_STATE_VERSION
         ):
             return
-        self._restore_from_manifest(manifest)
+        try:
+            self._restore_from_manifest(manifest)
+        except ForecastAlignmentError as exc:
+            # Unusable stored bands leave the model untrained, like outdated
+            # ones; the next train() then raises the retrain error.
+            if str(exc) != CONFORMAL_RETRAIN_REQUIRED:
+                raise
 
     def _restore_from_manifest(self, manifest: MLModelManifest) -> None:
         """Restore backend, interval, and correction state from a manifest."""
@@ -712,10 +725,7 @@ class KPowerMLForecast:
             manifest.metadata.get("sanitized_conformal_state_version")
             != SANITIZED_CONFORMAL_STATE_VERSION
         ):
-            raise ForecastAlignmentError(
-                "stored model conformal state predates point-forecast sanitation; "
-                "a full retrain is required"
-            )
+            raise ForecastAlignmentError(CONFORMAL_RETRAIN_REQUIRED)
         if manifest.metadata.get("timezone") != self.config.timezone:
             raise ForecastAlignmentError(
                 "stored model timezone requires a full retrain"
@@ -758,15 +768,21 @@ class KPowerMLForecast:
                 f"{manifest.target_type} != {self.config.forecast_type.value}"
             )
 
+        try:
+            conformal = SplitConformalCalibrator.from_dict(
+                manifest.interval_levels, manifest.conformal_bands
+            )
+        except ValueError as exc:
+            # Unusable stored bands are recovered like outdated ones, before
+            # any state is restored.
+            raise ForecastAlignmentError(CONFORMAL_RETRAIN_REQUIRED) from exc
         self.backend.load(self.storage.artifact_dir)
         if manifest.training_end is None:
             raise ForecastAlignmentError("stored model has no training cutoff")
         self._training_end = pd.to_datetime(manifest.training_end, utc=True)
         self.training_bridged_rows = int(manifest.metadata.get("bridged_rows", 0))
         self._restore_selection(manifest)
-        self.conformal = SplitConformalCalibrator.from_dict(
-            manifest.interval_levels, manifest.conformal_quantiles
-        )
+        self.conformal = conformal
         weather_bias = manifest.metadata.get("weather_bias")
         if isinstance(weather_bias, dict):
             self.bias_corrector.load_dict(weather_bias)
