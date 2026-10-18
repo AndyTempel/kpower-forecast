@@ -160,10 +160,21 @@ class SplitConformalCalibrator:
             The restored calibrator.
 
         Raises:
-            ValueError: If the edges are not finite and strictly ascending, or
-                the payload does not describe every configured level with one
-                band per bin.
+            ValueError: If the payload is malformed: wrong types, edges that
+                are not finite and strictly ascending, or a configured level
+                without one band per bin.
         """
+        try:
+            return cls._from_payload(interval_levels, payload)
+        except (TypeError, AttributeError) as exc:
+            # A manifest only checks that the payload is a dict; any nested
+            # shape error means the stored state is unusable, like any other.
+            raise ValueError(f"conformal state is malformed: {exc}") from exc
+
+    @classmethod
+    def _from_payload(
+        cls, interval_levels: list[int], payload: dict[str, Any]
+    ) -> "SplitConformalCalibrator":
         calibrator = cls(
             interval_levels=interval_levels,
             bins=int(payload.get("bins", DEFAULT_INTERVAL_BINS)),

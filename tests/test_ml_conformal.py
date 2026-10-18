@@ -100,6 +100,21 @@ def test_state_round_trips_and_rejects_a_wrong_bin_count() -> None:
         SplitConformalCalibrator.from_dict([50, 90], payload)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"levels": None},
+        {"edges": None},
+        {"edges": [], "levels": {"90": {"bands": None, "global": [0.0, 1.0]}}},
+        {"edges": [], "levels": {"90": {"bands": [[None, 1.0]], "global": [0, 1]}}},
+    ],
+)
+def test_malformed_state_is_a_value_error(payload: dict) -> None:
+    # The forecast turns ValueError into the retrain error callers recover.
+    with pytest.raises(ValueError):
+        SplitConformalCalibrator.from_dict([90], payload)
+
+
 def test_split_conformal_requires_residuals() -> None:
     calibrator = SplitConformalCalibrator(interval_levels=[90])
 
