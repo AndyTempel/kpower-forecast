@@ -156,6 +156,11 @@ from this package's weather client and integrates it across each actual
 observation interval; indoor targets are never interpolated onto a regular
 grid. The effective gain is a building response coefficient, not COP.
 
+`THERMAL_ESTIMATOR_VERSION` names the release that last changed thermal fitting,
+prediction or its weather handling. Score prediction evidence per estimator
+version rather than per package version: a release that changes only the ML
+models leaves it unchanged.
+
 Training weather combines archive dates with the forecast endpoint's recent
 `past_days` window (one day by default, plus today). Future date padding never
 reaches the archive endpoint. Strict thermal callers preserve missing weather

@@ -37,6 +37,11 @@ from .weather import (
 
 # 2: multi-step output-error fit, quality labels and regularised fits.
 THERMAL_CONTRACT_VERSION = 2
+# The release that last changed how this package fits or predicts temperature.
+# Callers judge prediction evidence per estimator, so a release that changes
+# only other models keeps it; bump this to the new release version whenever
+# thermal fitting, prediction or their weather handling changes.
+THERMAL_ESTIMATOR_VERSION = "2026.10.1"
 
 ThermalFitQuality = Literal["accepted", "low_identifiability"]
 
