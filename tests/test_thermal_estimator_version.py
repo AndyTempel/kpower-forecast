@@ -26,5 +26,5 @@ def test_thermal_sources_match_the_estimator_version() -> None:
     # update the digest below.
     assert (THERMAL_ESTIMATOR_VERSION, _digest()) == (
         "2026.10.1",
-        "93296a33444016b23c905e912cbb0ff5f684bc6adb3c97f6c09f65bbfd6e3e28",
+        "f75af289564c062c8698d6e45d9216b5f74479c7115344fd4c1cc347c7fb5aab",
     )

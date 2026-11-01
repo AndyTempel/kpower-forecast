@@ -162,7 +162,14 @@ version rather than per package version: a release that changes only the ML
 models leaves it unchanged.
 
 Training weather combines archive dates with the forecast endpoint's recent
-`past_days` window (one day by default, plus today). Future date padding never
+`past_days` window (one day by default, plus today). With
+`WeatherConfig(training_weather_source="historical_forecast")` the elapsed dates
+come from Open-Meteo's archived forecasts (`historical_forecast_url`) instead, so
+a model learns from the same kind of weather it is later given to predict; rows or
+required values the archived forecasts lack are filled from the archive, and if
+they cannot be fetched at all the archive is used alone. The source is recorded in
+the ML manifest: a model trained on another source requires a full retrain. The
+default stays `archive`, which thermal fitting uses. Future date padding never
 reaches the archive endpoint. Strict thermal callers preserve missing weather
 and reject uncovered observation intervals. Recent weather uses the forecast
 cache expiry rather than the long-lived archive cache; relative forecast
@@ -304,7 +311,8 @@ baseline history keeps the original gaps, and the manifest records the limit and
 
 ### Hybrid structure (`hybrid_structure`)
 
-The Nixtla hybrid backend has two structures for non-solar targets:
+The Nixtla hybrid backend has two structures for non-solar targets and two for solar
+(`recursive_seasonal_naive` and `irradiance_direct`):
 
 - `recursive_seasonal_naive` (default): a seasonal-naive structural forecast (the last observed
   day, repeated) corrected by a LightGBM residual model fed its own lags recursively. It suits
@@ -323,6 +331,42 @@ those two days' heat-pump runs, and a class with ample history keeps its own sha
 weekend household load differ). `profile_smoothing_minutes` (default 0, a multiple of the
 interval) applies a centred ±minutes circular moving average over local time of day.
 
+For solar, `recursive_seasonal_naive` uses a radiation baseline (shortwave radiation times a
+learned factor per time of day) and a LightGBM residual fed its own lags 1 and 96. The lag-96
+input replays the previous day's error, so a sunny day inflates the forecast of the next
+overcast one. `irradiance_direct` (solar only) removes that:
+
+- **Plane of array.** Radiation is transposed to the panel plane with an isotropic sky model,
+  using the weather's direct/diffuse split (Erbs decomposition when absent). Tilt, azimuth and
+  the alignment of the radiation rows to the target interval (`lag_steps`, −2…+2) are fitted
+  from clear, high-sun history by a coarse grid and a pattern search; with too little history
+  the plane is horizontal.
+- **Yield per sun position.** Interval energy per unit of plane irradiance is learned per
+  15° azimuth × 5° elevation bin, shrunk toward the global yield. It captures horizon and
+  near shading, incidence losses and clipping, which matter most at the low late-autumn sun.
+- **Direct residual.** A strongly regularised LightGBM model (120 trees, 7 leaves, at least 300
+  rows per leaf) predicts the remaining error from weather and physical inputs for every row
+  independently: no lags, no recursion, no calendar inputs.
+
+Day-ahead backtest on one site (58 daily origins, 3 Sep – 31 Oct 2026, each model refitted on the
+history before local midnight and predicting from archived forecasts; daily MAE, overall bias,
+MAE of overcast hours per day, overcast bias):
+
+| Model | Daily MAE | Bias | Overcast MAE | Overcast bias |
+| :--- | ---: | ---: | ---: | ---: |
+| `recursive_seasonal_naive`, archive-trained | 3.82 kWh | +4.0 % | 4.40 kWh | +10.5 % |
+| `irradiance_direct`, archive-trained | 3.67 kWh | −6.7 % | 3.89 kWh | −15.5 % |
+| `irradiance_direct`, physical baseline only | 3.30 kWh | −0.8 % | 3.73 kWh | +2.0 % |
+| `irradiance_direct`, archived-forecast-trained | 3.07 kWh | −0.3 % | 3.68 kWh | −0.6 % |
+
+Training on archived forecasts matters as much as the structure. A less regularised residual
+(300 trees, 31 leaves) was worse than the physical baseline alone, and a multiplicative bias
+factor per weather regime fitted on a held-out tail made every variant worse (it corrected a
+seasonal error of the held-out fit that the final fit does not have), so neither is used.
+
+`predict_physics` on the backend (and the `solar_physics` selection candidate) returns the
+physical baseline alone.
+
 On a site with a fixed-speed heat pump (12 rolling origins, RMSE at +24/+120 h), `profile_direct`
 improved whole-site consumption from 1100/1404 W to 976/1027 W and heating from 1046/1170 W to
 832/907 W. The structure and lookback are part of artifact compatibility: a stored artifact
@@ -331,7 +375,9 @@ a non-forced `train()` raises "requires a full retrain", like the other compatib
 
 ### Rolling-origin candidate selection
 
-Consumption and HVAC targets can set `candidate_selection=True` (default off; not for solar).
+Consumption and HVAC targets can set `candidate_selection=True` (default off). Solar targets can
+too, with the `irradiance_direct` structure and only the candidates `kpower_ml` and
+`solar_physics`; load targets cannot use `solar_physics`.
 Training then backtests the candidates in `selection_candidates` (default all four) on day-ahead
 windows: from local midnight of each of the last `selection_backtest_days` days (default 7), each
 candidate forecasts the next `selection_horizon_hours` (default 24) after training only on rows

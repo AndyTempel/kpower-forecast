@@ -3,7 +3,7 @@ import math
 import pandas as pd
 import pytest
 
-from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
+from kpower_forecast.ml.config import HybridStructure, KPowerMLConfig, MLForecastType
 from kpower_forecast.ml.features import GENERATED_FEATURE_COLUMNS, MLFeatureBuilder
 
 
@@ -44,8 +44,19 @@ def test_feature_builder_adds_calendar_physics_and_rolling_features() -> None:
     assert expected.issubset(features.columns)
     assert features["wind_speed_10m"].tolist() == [5.0, 5.0, 5.0, 5.0]
     # The reserved names that known covariates may not use are exactly what
-    # the builder generates.
-    assert set(features.columns) - set(df.columns) == GENERATED_FEATURE_COLUMNS
+    # the builder generates for some target type.
+    solar_config = config.model_copy(update={"forecast_type": MLForecastType.SOLAR})
+    irradiance = MLFeatureBuilder(
+        solar_config.model_copy(
+            update={"hybrid_structure": HybridStructure.IRRADIANCE_DIRECT}
+        )
+    ).build(df)
+    generated = (set(features.columns) | set(irradiance.columns)) - set(df.columns)
+    assert generated == GENERATED_FEATURE_COLUMNS
+    # Only irradiance_direct gets the sun-direction and diffuse-share inputs;
+    # a recursive solar model keeps the inputs it was validated with.
+    recursive = MLFeatureBuilder(solar_config).build(df)
+    assert {"solar_azimuth", "diffuse_fraction"}.isdisjoint(recursive.columns)
 
 
 def test_known_covariate_named_like_a_generated_feature_is_rejected() -> None:

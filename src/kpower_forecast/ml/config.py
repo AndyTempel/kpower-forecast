@@ -7,7 +7,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kpower_forecast.core import DataCategory, MeasurementUnit
-from kpower_forecast.ml.selection import ML_CANDIDATE, SELECTION_CANDIDATES
+from kpower_forecast.ml.selection import (
+    ALL_SELECTION_CANDIDATES,
+    ML_CANDIDATE,
+    SELECTION_CANDIDATES,
+    SOLAR_PHYSICS_CANDIDATE,
+    SOLAR_SELECTION_CANDIDATES,
+)
 
 
 class MLForecastType(str, Enum):
@@ -37,10 +43,17 @@ class HybridStructure(str, Enum):
     ``profile_direct`` uses a multi-day mean profile per local slot and
     weekday class and predicts the residual directly from weather and
     calendar features for every future row, with no lags or recursion.
+
+    ``irradiance_direct`` (solar only) uses a physical baseline, plane-of-array
+    irradiance times a yield learned per sun position, with the plane and the
+    radiation alignment fitted from history, and predicts the residual
+    directly from weather features. Nothing is carried over from the previous
+    day, so a sunny day does not inflate the forecast of an overcast one.
     """
 
     RECURSIVE_SEASONAL_NAIVE = "recursive_seasonal_naive"
     PROFILE_DIRECT = "profile_direct"
+    IRRADIANCE_DIRECT = "irradiance_direct"
 
 
 class KPowerMLConfig(BaseModel):
@@ -165,13 +178,31 @@ class KPowerMLConfig(BaseModel):
             The validated configuration.
 
         Raises:
-            ValueError: If selection is enabled for a solar forecast, whose
-                curtailment and night constraints assume the ML output, or if
-                regression extras repeat or name reserved columns.
+            ValueError: If selection is enabled for a solar forecast without
+                the ``irradiance_direct`` structure or with load candidates, if
+                a load forecast lists the solar candidate, or if regression
+                extras repeat or name reserved columns.
         """
-        if self.candidate_selection and self.forecast_type == MLForecastType.SOLAR:
-            raise ValueError("candidate_selection is not supported for solar")
-        unknown = set(self.selection_candidates) - set(SELECTION_CANDIDATES)
+        solar = self.forecast_type == MLForecastType.SOLAR
+        if self.candidate_selection and solar:
+            if self.hybrid_structure != HybridStructure.IRRADIANCE_DIRECT:
+                # Only that structure provides the physical solar candidate.
+                raise ValueError(
+                    "solar candidate_selection requires the irradiance_direct "
+                    "hybrid structure"
+                )
+            wrong = set(self.selection_candidates) - set(SOLAR_SELECTION_CANDIDATES)
+            if wrong:
+                raise ValueError(
+                    f"selection_candidates {sorted(wrong)} are not solar candidates"
+                )
+        if (
+            self.candidate_selection
+            and not solar
+            and SOLAR_PHYSICS_CANDIDATE in self.selection_candidates
+        ):
+            raise ValueError(f"{SOLAR_PHYSICS_CANDIDATE!r} is a solar-only candidate")
+        unknown = set(self.selection_candidates) - set(ALL_SELECTION_CANDIDATES)
         if unknown:
             raise ValueError(f"unknown selection_candidates: {sorted(unknown)}")
         if ML_CANDIDATE not in self.selection_candidates:
@@ -187,6 +218,14 @@ class KPowerMLConfig(BaseModel):
             raise ValueError(
                 "profile_smoothing_minutes must be a multiple of interval_minutes"
             )
+        if self.hybrid_structure == HybridStructure.IRRADIANCE_DIRECT:
+            if not solar:
+                raise ValueError("irradiance_direct hybrid structure is solar-only")
+            if self.backend != MLBackendType.NIXTLA_HYBRID:
+                raise ValueError(
+                    "irradiance_direct hybrid structure requires the nixtla_hybrid "
+                    "backend"
+                )
         if self.hybrid_structure == HybridStructure.PROFILE_DIRECT:
             if self.forecast_type == MLForecastType.SOLAR:
                 # Solar uses its radiation profile baseline.

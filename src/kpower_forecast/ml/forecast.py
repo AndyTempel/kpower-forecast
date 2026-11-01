@@ -30,11 +30,12 @@ from kpower_forecast.ml.config import (
 from kpower_forecast.ml.conformal import SplitConformalCalibrator
 from kpower_forecast.ml.features import MLFeatureBuilder
 from kpower_forecast.ml.selection import (
+    ALL_SELECTION_CANDIDATES,
     BLEND_CANDIDATE,
     DEGREE_HOUR_CANDIDATE,
     ML_CANDIDATE,
-    SELECTION_CANDIDATES,
     SELECTION_METRIC,
+    SOLAR_PHYSICS_CANDIDATE,
     CandidateMetrics,
     DegreeHourRegression,
     bias_eligible,
@@ -44,7 +45,11 @@ from kpower_forecast.ml.selection import (
 )
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
 from kpower_forecast.utils import calculate_solar_elevation, normalize_to_instant_kwh
-from kpower_forecast.weather_client import WeatherClient, WeatherConfig
+from kpower_forecast.weather_client import (
+    TrainingWeatherSource,
+    WeatherClient,
+    WeatherConfig,
+)
 
 DYNAMIC_EXPORT_LIMIT_COLUMNS: tuple[str, ...] = (
     "grid_export_limit_kw",
@@ -295,6 +300,9 @@ class KPowerMLForecast:
                 "profile_class_prior_days": self.config.profile_class_prior_days,
                 "profile_smoothing_minutes": self.config.profile_smoothing_minutes,
                 "known_covariates": list(self.config.known_covariates),
+                "training_weather_source": (
+                    self.weather_client.config.training_weather_source.value
+                ),
                 "bridged_rows": self.training_bridged_rows,
                 "candidate_selection": {
                     **_selection_settings(self.config),
@@ -384,7 +392,11 @@ class KPowerMLForecast:
             horizon=model_horizon,
         )
         aligned_weather = self._merge_known_future(aligned_weather, known_future)
-        if self.selected_candidate in (ML_CANDIDATE, BLEND_CANDIDATE):
+        if self.selected_candidate in (
+            ML_CANDIDATE,
+            BLEND_CANDIDATE,
+            SOLAR_PHYSICS_CANDIDATE,
+        ):
             features = self.feature_builder.build(aligned_weather)
             validate_timestamp_grid(
                 features,
@@ -393,7 +405,10 @@ class KPowerMLForecast:
                 expected_length=model_horizon,
                 label="forecast features",
             )
-            forecast = self.backend.predict(features, horizon=model_horizon)
+            if self.selected_candidate == SOLAR_PHYSICS_CANDIDATE:
+                forecast = self._predict_physics(features, model_horizon)
+            else:
+                forecast = self.backend.predict(features, horizon=model_horizon)
             if self.selected_candidate == BLEND_CANDIDATE:
                 if self._blend_weight is None:
                     raise ForecastAlignmentError("blend weight is unavailable")
@@ -439,6 +454,15 @@ class KPowerMLForecast:
                 forecast, dynamic_export_limits=dynamic_export_limits
             )
         return forecast
+
+    def _predict_physics(self, features: pd.DataFrame, horizon: int) -> pd.DataFrame:
+        """Forecast with the backend's physical solar baseline alone."""
+        predict_physics = getattr(self.backend, "predict_physics", None)
+        if predict_physics is None:
+            raise ForecastAlignmentError(
+                f"backend {self.config.backend.value} has no physical solar baseline"
+            )
+        return cast(pd.DataFrame, predict_physics(features, horizon=horizon))
 
     def _history_covariates(self, history_df: pd.DataFrame) -> pd.DataFrame | None:
         """Return known covariates averaged onto the model grid, or ``None``.
@@ -698,6 +722,8 @@ class KPowerMLForecast:
             return
         if not _covariates_match(manifest, self.config):
             return
+        if not self._weather_source_matches(manifest):
+            return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         if (
@@ -757,6 +783,10 @@ class KPowerMLForecast:
             raise ForecastAlignmentError(
                 "stored model known covariates require a full retrain"
             )
+        if not self._weather_source_matches(manifest):
+            raise ForecastAlignmentError(
+                "stored model training weather source requires a full retrain"
+            )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
                 "stored ML backend does not match configured backend: "
@@ -786,6 +816,17 @@ class KPowerMLForecast:
         weather_bias = manifest.metadata.get("weather_bias")
         if isinstance(weather_bias, dict):
             self.bias_corrector.load_dict(weather_bias)
+
+    def _weather_source_matches(self, manifest: MLModelManifest) -> bool:
+        """Whether a stored artifact was trained on this weather source.
+
+        Artifacts written before the setting existed were trained on the
+        archive.
+        """
+        stored = manifest.metadata.get(
+            "training_weather_source", TrainingWeatherSource.ARCHIVE.value
+        )
+        return bool(stored == self.weather_client.config.training_weather_source.value)
 
     @property
     def training_end(self) -> datetime | None:
@@ -1085,15 +1126,15 @@ class KPowerMLForecast:
             train = frame.loc[train_mask].reset_index(drop=True)
             if train.empty or train["ds"].iloc[-1] != origin - interval:
                 continue
-            ml = self._backtest_ml(
+            forecasts = self._backtest_ml(
                 train,
                 feature_rows.loc[train_mask].reset_index(drop=True),
                 feature_rows.iloc[index].reset_index(drop=True),
                 steps,
             )
-            if ml is None:
+            if forecasts is None:
                 continue
-            entry: dict[str, np.ndarray] = {"actual": actual, ML_CANDIDATE: ml}
+            entry: dict[str, np.ndarray] = {"actual": actual, **forecasts}
             train_measured = frame.loc[train_mask & ~bridged_rows].reset_index(
                 drop=True
             )
@@ -1125,18 +1166,26 @@ class KPowerMLForecast:
         train_features: pd.DataFrame,
         window_features: pd.DataFrame,
         steps: int,
-    ) -> np.ndarray | None:
+    ) -> dict[str, np.ndarray] | None:
         """Fit a fresh backend on ``train`` and forecast the next ``steps`` rows.
 
         Returns:
-            Non-negative predictions, or ``None`` when the backend cannot be
-            trained this early or produces non-finite values.
+            Non-negative predictions of the ML model, and of the physical
+            solar baseline when it is a wanted candidate, or ``None`` when the
+            backend cannot be trained this early or produces non-finite values.
         """
         backend = create_backend(self.config)
+        physics: pd.DataFrame | None = None
         try:
             backend.fit(train, train_features, train.iloc[0:0])
             forecast = backend.predict(window_features, horizon=steps)
             forecast = self._sanitize_point_forecast(forecast)
+            if SOLAR_PHYSICS_CANDIDATE in self.config.selection_candidates and hasattr(
+                backend, "predict_physics"
+            ):
+                physics = self._sanitize_point_forecast(
+                    backend.predict_physics(window_features, horizon=steps)
+                )
         except Exception:  # noqa: BLE001
             # An early origin with little history must not abort training, but
             # an unexpected failure must stay visible.
@@ -1148,7 +1197,12 @@ class KPowerMLForecast:
             )
             return None
         values = forecast["yhat"].to_numpy(dtype=float)
-        return values if len(values) == steps else None
+        if len(values) != steps:
+            return None
+        output = {ML_CANDIDATE: values}
+        if physics is not None and len(physics) == steps:
+            output[SOLAR_PHYSICS_CANDIDATE] = physics["yhat"].to_numpy(dtype=float)
+        return output
 
     def _regression_values(self, weather: pd.DataFrame) -> pd.Series:
         """Predict the fitted degree-hour regression on the model grid."""
@@ -1213,7 +1267,7 @@ class KPowerMLForecast:
         self.selection_reason = reason if isinstance(reason, str) else None
         self._regression = None
         self._blend_weight = None
-        if self.selected_candidate not in SELECTION_CANDIDATES:
+        if self.selected_candidate not in ALL_SELECTION_CANDIDATES:
             raise ForecastAlignmentError(
                 f"stored candidate {self.selected_candidate!r} is unknown; a full "
                 "retrain is required"

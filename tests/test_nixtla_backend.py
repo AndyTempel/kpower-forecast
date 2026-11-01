@@ -452,3 +452,101 @@ def test_profile_shrinks_a_sparsely_seen_weekday_class_toward_all_days() -> None
     assert backend._load_profile["1:450"] == pytest.approx(2.0 / 5)
     assert backend._load_profile["1:510"] == pytest.approx(2.0 / 5)
     assert backend._load_profile["1:420"] == pytest.approx(0.0)
+
+
+def _irradiance_backend() -> NixtlaHybridBackend:
+    return NixtlaHybridBackend(
+        KPowerMLConfig(
+            model_id="solar",
+            latitude=46.0,
+            longitude=14.3,
+            interval_minutes=15,
+            forecast_type=MLForecastType.SOLAR,
+            hybrid_structure=HybridStructure.IRRADIANCE_DIRECT,
+        )
+    )
+
+
+def test_irradiance_direct_does_not_carry_a_sunny_day_into_an_overcast_one(
+    tmp_path,
+) -> None:
+    pytest.importorskip("lightgbm")
+    from test_ml_solar_physics import clear_sky_weather, plane_energy
+
+    # Every fourth day overcast (days 1, 5, ..., 41); day 40, the last
+    # training day, is sunny.
+    weather = clear_sky_weather("2026-09-02", 42, overcast_every=4)
+    target = plane_energy(weather, tilt=35.0, azimuth=190.0)
+    train = 40 * 96
+    history = pd.DataFrame({"ds": weather["ds"], "y": target}).iloc[:train]
+    backend = _irradiance_backend()
+    backend.fit(history, weather.iloc[:train], history.tail(96))
+
+    future = weather.iloc[train:].reset_index(drop=True)
+    forecast = backend.predict(future, horizon=len(future))
+
+    # Day 41 is overcast, day 42 sunny; a carried-over sunny day would put the
+    # overcast forecast near the sunny one.
+    daily = forecast["yhat"].to_numpy().reshape(2, 96).sum(axis=1)
+    truth = target.iloc[train:].to_numpy().reshape(2, 96).sum(axis=1)
+    assert daily[0] < 0.3 * daily[1]
+    assert daily == pytest.approx(truth, rel=0.15)
+    physics = backend.predict_physics(future, horizon=len(future))
+    assert physics["yhat"].sum() == pytest.approx(truth.sum(), rel=0.15)
+
+    backend.save(tmp_path)
+    restored = _irradiance_backend()
+    restored.load(tmp_path)
+    pd.testing.assert_frame_equal(
+        restored.predict(future, horizon=len(future)), forecast
+    )
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"forecast_type": MLForecastType.CONSUMPTION}, "solar-only"),
+        ({"backend": MLBackendType.NEURALFORECAST}, "nixtla_hybrid"),
+        (
+            {
+                "candidate_selection": True,
+                "selection_candidates": ["kpower_ml", "degree_hour_regression"],
+            },
+            "not solar candidates",
+        ),
+    ],
+)
+def test_irradiance_direct_settings_are_rejected_where_they_cannot_apply(
+    update: dict, message: str
+) -> None:
+    settings = {
+        "model_id": "solar",
+        "latitude": 46.0,
+        "longitude": 14.0,
+        "forecast_type": MLForecastType.SOLAR,
+        "hybrid_structure": HybridStructure.IRRADIANCE_DIRECT,
+        **update,
+    }
+    with pytest.raises(ValueError, match=message):
+        KPowerMLConfig(**settings)
+
+
+def test_solar_selection_needs_irradiance_structure_and_load_cannot_use_it() -> None:
+    with pytest.raises(ValueError, match="irradiance_direct"):
+        KPowerMLConfig(
+            model_id="solar",
+            latitude=46.0,
+            longitude=14.0,
+            forecast_type=MLForecastType.SOLAR,
+            candidate_selection=True,
+            selection_candidates=["kpower_ml", "solar_physics"],
+        )
+    with pytest.raises(ValueError, match="solar-only candidate"):
+        KPowerMLConfig(
+            model_id="consumption",
+            latitude=46.0,
+            longitude=14.0,
+            forecast_type=MLForecastType.CONSUMPTION,
+            candidate_selection=True,
+            selection_candidates=["kpower_ml", "solar_physics"],
+        )

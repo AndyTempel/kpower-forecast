@@ -23,6 +23,7 @@ from kpower_forecast.ml.forecast import (
     bridge_short_target_gaps,
 )
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
+from kpower_forecast.weather_client import WeatherConfig
 
 
 def test_ml_constructor_preserves_legacy_positional_argument_order(tmp_path) -> None:
@@ -870,6 +871,50 @@ def test_ml_forecast_rejects_incompatible_gap_preservation_mode(
     with pytest.raises(
         ForecastAlignmentError,
         match="gap-preservation mode requires a full retrain",
+    ):
+        forecast.train(pd.DataFrame(), force=False)
+
+
+def test_ml_forecast_retrains_a_model_from_another_training_weather_source(
+    tmp_path,
+) -> None:
+    # Saved before the setting existed: trained on the archive.
+    storage = MLModelStorage(str(tmp_path), "weather-source")
+    storage.save_manifest(
+        MLModelManifest(
+            contract_version=FORECAST_CONTRACT_VERSION,
+            model_id="weather-source",
+            backend_type=MLBackendType.NEURALFORECAST.value,
+            target_type=MLForecastType.CONSUMPTION.value,
+            interval_levels=[50, 80, 90],
+            feature_columns=[],
+            training_end="2026-08-12T08:30:00Z",
+            package_version="2026.10.8",
+            metadata={
+                "timezone": "UTC",
+                "history_policy_version": HISTORY_POLICY_VERSION,
+                "preserve_gaps": False,
+                "sanitized_conformal_state_version": (
+                    SANITIZED_CONFORMAL_STATE_VERSION
+                ),
+            },
+        )
+    )
+
+    forecast = KPowerMLForecast(
+        model_id="weather-source",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=60,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NEURALFORECAST,
+        weather_config=WeatherConfig(training_weather_source="historical_forecast"),
+    )
+
+    assert forecast.training_end is None
+    with pytest.raises(
+        ForecastAlignmentError, match="training weather source requires a full retrain"
     ):
         forecast.train(pd.DataFrame(), force=False)
 

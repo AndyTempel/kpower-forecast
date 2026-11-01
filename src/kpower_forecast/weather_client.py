@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import uuid
+from enum import Enum
 from pathlib import Path
 from typing import Optional, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -48,12 +49,27 @@ PHYSICAL_LOWER_BOUNDED_COLUMNS: tuple[str, ...] = (
 ZERO_FILLED_REQUIRED_COLUMNS: frozenset[str] = frozenset({"snow_depth", "snowfall"})
 
 
+class TrainingWeatherSource(str, Enum):
+    """Where training history weather comes from.
+
+    ``archive`` is reanalysis: what the weather was. ``historical_forecast``
+    is what the forecast said at the time, the same kind of input the model
+    sees when it predicts; gaps fall back to the archive.
+    """
+
+    ARCHIVE = "archive"
+    HISTORICAL_FORECAST = "historical_forecast"
+
+
 class WeatherConfig(BaseModel):
     """Configuration for Open-Meteo-compatible weather requests.
 
     Args:
         base_url: Forecast API URL.
         archive_url: Historical archive API URL.
+        historical_forecast_url: Archived-forecast API URL, used for training
+            history when ``training_weather_source`` is ``historical_forecast``.
+        training_weather_source: Source of training history weather.
         forecast_model: Optional primary forecast model identifier. When unset,
             Open-Meteo chooses the best matching model.
         long_horizon_model: Optional model used to fill a short primary forecast.
@@ -70,6 +86,10 @@ class WeatherConfig(BaseModel):
 
     base_url: str = "https://api.open-meteo.com/v1/forecast"
     archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
+    historical_forecast_url: str = (
+        "https://historical-forecast-api.open-meteo.com/v1/forecast"
+    )
+    training_weather_source: TrainingWeatherSource = TrainingWeatherSource.ARCHIVE
     forecast_model: Optional[str] = None
     long_horizon_model: Optional[str] = "ecmwf_ifs"
     cache_enabled: bool = True
@@ -188,12 +208,14 @@ class WeatherClient:
             days=self.config.recent_forecast_past_days
         )
         if end_date < recent_start:
-            return self._fetch_archive(start_date, end_date, strict=strict)
+            return self._fetch_training_history(start_date, end_date, strict=strict)
 
         frames: list[pd.DataFrame] = []
         archive_end = recent_start - datetime.timedelta(days=1)
         if start_date <= archive_end:
-            frames.append(self._fetch_archive(start_date, archive_end, strict=True))
+            frames.append(
+                self._fetch_training_history(start_date, archive_end, strict=True)
+            )
         recent = self.fetch_forecast(
             days=1,
             past_days=(today - max(start_date, recent_start)).days,
@@ -214,16 +236,106 @@ class WeatherClient:
             return self._clip_physical_bounds(combined)
         return self._finalize_weather_frame(combined)
 
-    def _fetch_archive(
+    def _fetch_training_history(
         self,
         start_date: datetime.date,
         end_date: datetime.date,
         *,
         strict: bool,
     ) -> pd.DataFrame:
-        """Fetch only archive dates, retaining resolution and variable fallback."""
+        """Fetch elapsed training weather from the configured source.
+
+        With ``historical_forecast`` the archived forecasts are primary and the
+        archive fills rows or required values they lack; if the archived
+        forecasts cannot be fetched at all, the archive is used alone.
+
+        Args:
+            start_date: First requested UTC date.
+            end_date: Last requested UTC date, inclusive.
+            strict: Preserve missing weather values for coverage validation.
+
+        Returns:
+            Weather rows for the requested elapsed dates.
+
+        Raises:
+            requests.RequestException: If the archive request fails.
+        """
+        if self.config.training_weather_source == TrainingWeatherSource.ARCHIVE:
+            return self._fetch_archive(start_date, end_date, strict=strict)
+        try:
+            primary = self._fetch_archive(
+                start_date,
+                end_date,
+                strict=True,
+                url=self.config.historical_forecast_url,
+                endpoint="historical_forecast",
+                model=self.config.forecast_model,
+            )
+        except (requests.RequestException, ValueError):
+            logger.warning(
+                "Archived forecasts unavailable for %s..%s; using the archive",
+                start_date,
+                end_date,
+                exc_info=True,
+            )
+            return self._fetch_archive(start_date, end_date, strict=strict)
+        if not self._covers_dates(primary, start_date, end_date):
+            archive = self._fetch_archive(start_date, end_date, strict=True)
+            primary = self._merge_weather_frames(primary=primary, fallback=archive)
+        if strict:
+            return self._clip_physical_bounds(primary)
+        return self._finalize_weather_frame(primary)
+
+    def _covers_dates(
+        self,
+        frame: pd.DataFrame,
+        start_date: datetime.date,
+        end_date: datetime.date,
+    ) -> bool:
+        """Whether ``frame`` has every required value from start to end of day."""
+        if frame.empty or "ds" not in frame.columns:
+            return False
+        required = [
+            column
+            for column in self.config.required_hourly_variables
+            if column not in ZERO_FILLED_REQUIRED_COLUMNS
+        ]
+        if any(
+            column not in frame.columns or frame[column].isna().any()
+            for column in required
+        ):
+            return False
+        timestamps = pd.to_datetime(frame["ds"], utc=True)
+        first = pd.Timestamp(start_date, tz="UTC")
+        last = pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(hours=23)
+        return bool(timestamps.min() <= first and timestamps.max() >= last)
+
+    def _fetch_archive(
+        self,
+        start_date: datetime.date,
+        end_date: datetime.date,
+        *,
+        strict: bool,
+        url: Optional[str] = None,
+        endpoint: str = "historical",
+        model: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Fetch only elapsed dates, retaining resolution and variable fallback.
+
+        Args:
+            start_date: First requested UTC date.
+            end_date: Last requested UTC date, inclusive.
+            strict: Preserve missing weather values.
+            url: Date-range API URL; the archive when unset.
+            endpoint: Logical endpoint name for cache-key separation.
+            model: Optional weather model requested from ``url``.
+
+        Returns:
+            Weather rows for the requested dates.
+        """
         weather_variables = list(self.config.hourly_variables)
         request_field = MINUTELY_15
+        target_url = url or self.config.archive_url
 
         while True:
             params: dict[str, str | float | list[str]] = {
@@ -234,14 +346,14 @@ class WeatherClient:
                 request_field: weather_variables,
                 "timezone": "UTC",
             }
+            if model:
+                params["models"] = model
 
             try:
-                logger.info(
-                    f"Fetching historical weather from {self.config.archive_url}"
-                )
+                logger.info(f"Fetching historical weather from {target_url}")
                 data = self._request_json(
-                    endpoint="historical",
-                    url=self.config.archive_url,
+                    endpoint=endpoint,
+                    url=target_url,
                     params=params,
                     ttl_hours=self.config.historical_cache_ttl_hours,
                 )
