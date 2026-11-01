@@ -28,11 +28,20 @@ from kpower_forecast.ml.baselines import BASELINE_NAME
 ML_CANDIDATE = "kpower_ml"
 DEGREE_HOUR_CANDIDATE = "degree_hour_regression"
 BLEND_CANDIDATE = "ml_regression_blend"
+# Solar only: the ``irradiance_direct`` physical baseline without its learned
+# residual (plane irradiance times the fitted yield).
+SOLAR_PHYSICS_CANDIDATE = "solar_physics"
+# Load-target candidates (callers list these for consumption and HVAC).
 SELECTION_CANDIDATES: tuple[str, ...] = (
     ML_CANDIDATE,
     DEGREE_HOUR_CANDIDATE,
     BASELINE_NAME,
     BLEND_CANDIDATE,
+)
+SOLAR_SELECTION_CANDIDATES: tuple[str, ...] = (ML_CANDIDATE, SOLAR_PHYSICS_CANDIDATE)
+ALL_SELECTION_CANDIDATES: tuple[str, ...] = (
+    *SELECTION_CANDIDATES,
+    SOLAR_PHYSICS_CANDIDATE,
 )
 SELECTION_METRIC = "rmse_1h_sliding"
 

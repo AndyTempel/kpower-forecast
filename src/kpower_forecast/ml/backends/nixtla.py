@@ -14,6 +14,17 @@ from kpower_forecast.ml.alignment import (
 )
 from kpower_forecast.ml.config import HybridStructure, KPowerMLConfig, MLForecastType
 from kpower_forecast.ml.dependencies import ensure_optional_dependencies
+from kpower_forecast.ml.features import CALENDAR_FEATURE_COLUMNS
+from kpower_forecast.ml.solar_physics import (
+    PanelGeometry,
+    baseline_energy,
+    clear_rows,
+    fit_geometry,
+    fit_yield_map,
+    irradiance_components,
+    plane_of_array,
+    sun_position,
+)
 
 STATE_FILE = "state.json"
 MODELS_FILE = "models.joblib"
@@ -88,10 +99,18 @@ class NixtlaHybridBackend:
         self._load_profile: dict[str, float] = {}
         self._load_profile_by_minute: dict[int, float] = {}
         self._load_profile_mean: float = 0.0
+        # irradiance_direct state.
+        self._geometry = PanelGeometry()
+        self._solar_global_yield: float = 0.0
+        self._solar_yields: dict[str, float] = {}
 
     @property
     def _profile_direct(self) -> bool:
         return self.config.hybrid_structure == HybridStructure.PROFILE_DIRECT
+
+    @property
+    def _irradiance_direct(self) -> bool:
+        return self.config.hybrid_structure == HybridStructure.IRRADIANCE_DIRECT
 
     @property
     def minimum_contiguous_training_rows(self) -> int:
@@ -131,9 +150,12 @@ class NixtlaHybridBackend:
 
         self._feature_columns = self._select_feature_columns(features)
         self._last_observed = float(history["y"].iloc[-1])
-        if self._profile_direct:
+        if self._profile_direct or self._irradiance_direct:
             self._last_train_ds = pd.to_datetime(history["ds"], utc=True).max()
-            self._fit_profile_direct(history, features)
+            if self._irradiance_direct:
+                self._fit_irradiance_direct(history, features)
+            else:
+                self._fit_profile_direct(history, features)
             self._fitted = True
             return
         self._last_train_ds = pd.to_datetime(history["ds"], utc=True).max()
@@ -199,6 +221,53 @@ class NixtlaHybridBackend:
 
     def predict(self, future_features: pd.DataFrame, horizon: int) -> pd.DataFrame:
         """Predict future values with the fitted backend."""
+        future = self._aligned_future(future_features, horizon)
+        if self._profile_direct:
+            return self._predict_profile_direct(future)
+        if self._irradiance_direct:
+            return self._predict_irradiance_direct(future, physics_only=False)
+        baseline = self._predict_stats_baseline(future)
+        solar_baseline = self._predict_solar_baseline(future)
+        if solar_baseline is not None:
+            baseline = solar_baseline
+        residual = self._predict_residual_adjustment(
+            horizon=len(future), future_features=future
+        )
+        yhat = baseline.reset_index(drop=True) + residual.reset_index(drop=True)
+
+        output = pd.DataFrame({"ds": future["ds"], "yhat": yhat})
+        output["yhat"] = pd.to_numeric(output["yhat"], errors="coerce").fillna(
+            self._last_observed
+        )
+        return output
+
+    def predict_physics(
+        self, future_features: pd.DataFrame, horizon: int
+    ) -> pd.DataFrame:
+        """Predict the irradiance_direct physical baseline alone.
+
+        Args:
+            future_features: Feature rows from the first post-training slot.
+            horizon: Number of rows to predict.
+
+        Returns:
+            Dataframe with ``ds`` and ``yhat``.
+
+        Raises:
+            ForecastAlignmentError: If the structure has no physical baseline or
+                the rows are not aligned.
+        """
+        if not self._irradiance_direct:
+            raise ForecastAlignmentError(
+                "the physical solar baseline needs the irradiance_direct structure"
+            )
+        future = self._aligned_future(future_features, horizon)
+        return self._predict_irradiance_direct(future, physics_only=True)
+
+    def _aligned_future(
+        self, future_features: pd.DataFrame, horizon: int
+    ) -> pd.DataFrame:
+        """Validate that ``horizon`` rows start at the first post-training slot."""
         if not self._fitted:
             raise RuntimeError("backend has not been fitted")
 
@@ -216,22 +285,7 @@ class NixtlaHybridBackend:
             expected_length=horizon,
             label="Nixtla future features",
         )
-        if self._profile_direct:
-            return self._predict_profile_direct(future)
-        baseline = self._predict_stats_baseline(future)
-        solar_baseline = self._predict_solar_baseline(future)
-        if solar_baseline is not None:
-            baseline = solar_baseline
-        residual = self._predict_residual_adjustment(
-            horizon=len(future), future_features=future
-        )
-        yhat = baseline.reset_index(drop=True) + residual.reset_index(drop=True)
-
-        output = pd.DataFrame({"ds": future["ds"], "yhat": yhat})
-        output["yhat"] = pd.to_numeric(output["yhat"], errors="coerce").fillna(
-            self._last_observed
-        )
-        return output
+        return future
 
     def _build_residual_training_frame(
         self, history: pd.DataFrame, features: pd.DataFrame, seasonal_length: int
@@ -399,6 +453,119 @@ class NixtlaHybridBackend:
         yhat = baseline + residual
         return pd.DataFrame({"ds": future["ds"].reset_index(drop=True), "yhat": yhat})
 
+    def _solar_physics(
+        self, features: pd.DataFrame
+    ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+        """Sun position, plane irradiance and physical baseline per row."""
+        rows = features.reset_index(drop=True)
+        sun = sun_position(
+            rows["ds"],
+            self.config.latitude,
+            self.config.longitude,
+            self.config.interval_minutes,
+        )
+        components = irradiance_components(rows, sun, self._geometry.lag_steps)
+        poa = plane_of_array(
+            components, sun, self._geometry.tilt_deg, self._geometry.azimuth_deg
+        )
+        baseline = baseline_energy(
+            poa, sun, self._solar_global_yield, self._solar_yields
+        )
+        return sun, poa, baseline
+
+    def _irradiance_matrix(
+        self, features: pd.DataFrame, poa: np.ndarray, baseline: np.ndarray
+    ) -> pd.DataFrame:
+        """Residual-model inputs: feature columns plus the physical baseline."""
+        matrix = self._exogenous_matrix(features.reset_index(drop=True))
+        matrix["plane_irradiance"] = poa
+        matrix["physical_baseline"] = baseline
+        return matrix
+
+    def _new_solar_regressor(self) -> Any:
+        from lightgbm import LGBMRegressor
+
+        # Strongly regularised: day-ahead weather errors dominate the residual,
+        # and a flexible model fits them as signal (worse than the physical
+        # baseline alone in a 59-day backtest; these settings beat it).
+        params = {
+            "n_estimators": 120,
+            "learning_rate": 0.03,
+            "num_leaves": 7,
+            "min_child_samples": 300,
+            "subsample": 0.8,
+            "subsample_freq": 1,
+            "colsample_bytree": 0.8,
+            "random_state": 42,
+            "verbosity": -1,
+            **self.config.backend_params.get("lightgbm", {}),
+        }
+        return LGBMRegressor(**params)
+
+    def _fit_irradiance_direct(
+        self, history: pd.DataFrame, features: pd.DataFrame
+    ) -> None:
+        """Fit the plane, the yield map and the direct residual model."""
+        ensure_optional_dependencies(("lightgbm",), "Nixtla hybrid backend")
+        if "shortwave_radiation" not in features.columns:
+            raise ValueError("irradiance_direct needs shortwave_radiation")
+        rows = features.reset_index(drop=True)
+        target = pd.to_numeric(history["y"], errors="coerce").reset_index(drop=True)
+        sun = sun_position(
+            rows["ds"],
+            self.config.latitude,
+            self.config.longitude,
+            self.config.interval_minutes,
+        )
+        clear_sky = (
+            rows["clear_sky_ghi"]
+            if "clear_sky_ghi" in rows.columns
+            else pd.Series(0.0, index=rows.index)
+        )
+        mask = clear_rows(rows, sun, clear_sky)
+        self._geometry = fit_geometry(target, rows, sun, mask)
+        components = irradiance_components(rows, sun, self._geometry.lag_steps)
+        poa = plane_of_array(
+            components, sun, self._geometry.tilt_deg, self._geometry.azimuth_deg
+        )
+        self._solar_global_yield, self._solar_yields = fit_yield_map(
+            target, poa, sun, mask
+        )
+        baseline = baseline_energy(
+            poa, sun, self._solar_global_yield, self._solar_yields
+        )
+        matrix = self._irradiance_matrix(rows, poa, baseline)
+        residual = target - baseline
+        daylight = (sun["elevation"].to_numpy() > 0.0) & residual.notna().to_numpy()
+        self._residual_model = None
+        self._stats_model = None
+        if daylight.any():
+            model = self._new_solar_regressor()
+            model.fit(matrix.loc[daylight], residual.loc[daylight])
+            self._residual_model = model
+
+    def _predict_irradiance_direct(
+        self, future: pd.DataFrame, *, physics_only: bool
+    ) -> pd.DataFrame:
+        """Physical baseline, plus the learned residual unless physics only.
+
+        A history without daylight rows has no residual model; the baseline
+        then stands alone.
+        """
+        rows = future.reset_index(drop=True)
+        sun, poa, baseline = self._solar_physics(rows)
+        if physics_only or self._residual_model is None:
+            yhat = baseline
+        else:
+            residual = self._residual_model.predict(
+                self._irradiance_matrix(rows, poa, baseline)
+            )
+            yhat = np.clip(baseline + residual, 0.0, None)
+        yhat = np.where(sun["elevation"].to_numpy() > 0.0, yhat, 0.0)
+        return pd.DataFrame(
+            {"ds": rows["ds"], "yhat": pd.Series(yhat, dtype="float64")}
+        )
+
     def _fit_solar_profile(self, history: pd.DataFrame, features: pd.DataFrame) -> None:
         """Learn interval kWh per W/m2 by minute-of-day for solar forecasts."""
         if self.config.forecast_type != MLForecastType.SOLAR:
@@ -467,9 +634,13 @@ class NixtlaHybridBackend:
 
     def _select_feature_columns(self, features: pd.DataFrame) -> list[str]:
         """Select numeric dynamic exogenous feature columns for residual learning."""
+        excluded = {"ds", "y"}
+        if self._irradiance_direct:
+            # Calendar inputs only let the residual fit weather noise to weekdays.
+            excluded |= CALENDAR_FEATURE_COLUMNS
         feature_columns: list[str] = []
         for column in features.columns:
-            if column in {"ds", "y"}:
+            if column in excluded:
                 continue
             numeric = pd.to_numeric(features[column], errors="coerce")
             if numeric.notna().any():
@@ -600,6 +771,9 @@ class NixtlaHybridBackend:
             "load_profile": self._load_profile,
             "load_profile_by_minute": self._load_profile_by_minute,
             "load_profile_mean": self._load_profile_mean,
+            "solar_geometry": self._geometry.to_dict(),
+            "solar_global_yield": self._solar_global_yield,
+            "solar_yields": self._solar_yields,
             "fitted": self._fitted,
         }
         with state_path.open("w", encoding="utf-8") as file:
@@ -645,6 +819,12 @@ class NixtlaHybridBackend:
             for key, value in dict(state.get("load_profile_by_minute", {})).items()
         }
         self._load_profile_mean = float(state.get("load_profile_mean", 0.0))
+        self._geometry = PanelGeometry.from_dict(dict(state.get("solar_geometry", {})))
+        self._solar_global_yield = float(state.get("solar_global_yield", 0.0))
+        self._solar_yields = {
+            str(key): float(value)
+            for key, value in dict(state.get("solar_yields", {})).items()
+        }
         self._fitted = bool(state.get("fitted", False))
         # State saved before the setting existed is recursive. State from the
         # other structure cannot serve this one, in either direction.

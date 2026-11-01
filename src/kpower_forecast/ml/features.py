@@ -4,11 +4,16 @@ import math
 
 import pandas as pd
 
-from kpower_forecast.ml.config import KPowerMLConfig, MLForecastType
+from kpower_forecast.ml.config import HybridStructure, KPowerMLConfig, MLForecastType
+from kpower_forecast.ml.solar_physics import diffuse_fraction, sun_position
 from kpower_forecast.utils import calculate_solar_elevation, get_clear_sky_ghi
 
 _ROLLING_STD_SOURCES: tuple[str, ...] = ("temperature_2m", "shortwave_radiation")
 _ROLLING_STD_HOURS: tuple[int, ...] = (3, 6)
+# Calendar columns build() writes; they say nothing about PV output.
+CALENDAR_FEATURE_COLUMNS: frozenset[str] = frozenset(
+    {"dow_sin", "dow_cos", "is_weekend", "is_holiday"}
+)
 # Columns build() writes; a caller-supplied covariate with one of these names
 # would be silently overwritten.
 GENERATED_FEATURE_COLUMNS: frozenset[str] = frozenset(
@@ -28,6 +33,8 @@ GENERATED_FEATURE_COLUMNS: frozenset[str] = frozenset(
         "heating_degree",
         "cooling_degree",
         "hvac_temperature_delta",
+        "solar_azimuth",
+        "diffuse_fraction",
     }
     | {
         f"{column}_std_{hours}h"
@@ -110,6 +117,17 @@ class MLFeatureBuilder:
 
         for column in _ROLLING_STD_SOURCES:
             self._add_rolling_std(features, column)
+        if self.config.hybrid_structure == HybridStructure.IRRADIANCE_DIRECT:
+            # Sun direction and the diffuse share separate a bright overcast
+            # sky from direct sun at the same horizontal irradiance. Only this
+            # structure uses them, so other solar models keep their inputs.
+            features["solar_azimuth"] = sun_position(
+                features["ds"],
+                self.config.latitude,
+                self.config.longitude,
+                self.config.interval_minutes,
+            )["azimuth"].to_numpy()
+            features["diffuse_fraction"] = diffuse_fraction(features)
         if self.config.forecast_type == MLForecastType.HVAC:
             features["hvac_temperature_delta"] = features.get(
                 "heating_degree", 0.0
