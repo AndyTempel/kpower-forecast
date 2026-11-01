@@ -292,7 +292,7 @@ class WeatherClient:
         start_date: datetime.date,
         end_date: datetime.date,
     ) -> bool:
-        """Whether ``frame`` has every required value from start to end of day."""
+        """Whether ``frame`` has every required value for every requested hour."""
         if frame.empty or "ds" not in frame.columns:
             return False
         required = [
@@ -305,10 +305,16 @@ class WeatherClient:
             for column in required
         ):
             return False
-        timestamps = pd.to_datetime(frame["ds"], utc=True)
-        first = pd.Timestamp(start_date, tz="UTC")
-        last = pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(hours=23)
-        return bool(timestamps.min() <= first and timestamps.max() >= last)
+        # Every hour of the requested dates must be present: archived
+        # forecasts can lack interior hours or days, which resampling would
+        # otherwise interpolate across.
+        hours = set(pd.to_datetime(frame["ds"], utc=True).dt.floor("h"))
+        expected = pd.date_range(
+            pd.Timestamp(start_date, tz="UTC"),
+            pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(hours=23),
+            freq="h",
+        )
+        return all(hour in hours for hour in expected)
 
     def _fetch_archive(
         self,

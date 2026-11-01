@@ -1128,3 +1128,50 @@ def test_unavailable_archived_forecasts_fall_back_to_the_archive(
     )
 
     assert weather["temperature_2m"].tolist() == [4.0]
+
+
+def test_archived_forecasts_missing_interior_hours_are_filled_from_the_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "kpower_forecast.weather_client._weather_today",
+        lambda: datetime.date(2026, 10, 30),
+    )
+    urls: list[str] = []
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> Response:
+        urls.append(url)
+        hours = [f"2026-10-01T{hour:02d}:00" for hour in range(24)]
+        if "historical-forecast" in url:
+            # First and last hour present, 10:00 missing.
+            kept = [hour for hour in hours if not hour.endswith("T10:00")]
+            return Response(_weather_payload(kept, [5.0] * len(kept), "hourly"))
+        return Response(_weather_payload(hours, [9.0] * 24, "hourly"))
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    client = WeatherClient(
+        46,
+        14,
+        WeatherConfig(
+            cache_dir=tmp_path, training_weather_source="historical_forecast"
+        ),
+    )
+
+    weather = client.fetch_historical(
+        datetime.date(2026, 10, 1), datetime.date(2026, 10, 1), strict=True
+    )
+
+    assert len(urls) == 2
+    values = weather.set_index("ds")["temperature_2m"]
+    assert values[pd.Timestamp("2026-10-01T10:00Z")] == 9.0
+    assert values[pd.Timestamp("2026-10-01T11:00Z")] == 5.0

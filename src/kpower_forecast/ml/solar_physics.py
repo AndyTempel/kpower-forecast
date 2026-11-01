@@ -25,6 +25,9 @@ ALBEDO = 0.2
 # Beam irradiance is not resolved for a sun this close to the horizon.
 _MAX_ZENITH_DEG = 87.0
 _MAX_DNI_W_M2 = 1100.0
+# A direct + diffuse split below this share of the global irradiance is
+# treated as missing (Open-Meteo components sum to the global value).
+_SPLIT_MIN_SHARE = 0.5
 # Rows used to fit the plane and the yield map: sun above this elevation and
 # a sky at least this clear (shortwave over clear-sky GHI).
 _FIT_MIN_ELEVATION_DEG = 8.0
@@ -117,8 +120,9 @@ def irradiance_components(
 ) -> pd.DataFrame:
     """Global, beam-normal and diffuse irradiance per row.
 
-    Uses the weather's direct/diffuse split when present, else the Erbs
-    decomposition of the global horizontal irradiance.
+    Uses the weather's direct/diffuse split where it accounts for the global
+    irradiance, else the Erbs decomposition of the global horizontal
+    irradiance (also for rows whose components were missing).
 
     Args:
         weather: Rows with ``shortwave_radiation`` and optionally
@@ -148,21 +152,31 @@ def irradiance_components(
     zenith = sun["zenith"].to_numpy(dtype=float)
     cos_zenith = np.cos(np.radians(zenith))
     resolved = zenith < _MAX_ZENITH_DEG
-    if "direct" in frame.columns:
-        dni = np.where(
-            resolved, frame["direct"].to_numpy() / np.maximum(cos_zenith, 1e-3), 0.0
-        )
-        dhi = frame["diffuse"].to_numpy(dtype=float)
-    else:
-        from pvlib.irradiance import erbs
+    ghi_values = frame["ghi"].to_numpy(dtype=float)
+    from pvlib.irradiance import erbs
 
-        split = erbs(
-            frame["ghi"],
-            pd.Series(zenith, index=frame.index),
-            sun["day_of_year"].to_numpy(dtype=float),
+    split = erbs(
+        frame["ghi"],
+        pd.Series(zenith, index=frame.index),
+        sun["day_of_year"].to_numpy(dtype=float),
+    )
+    dni = np.where(resolved, np.asarray(split["dni"], dtype=float), 0.0)
+    dhi = np.asarray(split["dhi"], dtype=float)
+    if "direct" in frame.columns:
+        direct_values = frame["direct"].to_numpy(dtype=float)
+        diffuse_values = frame["diffuse"].to_numpy(dtype=float)
+        # A provider split is used only where it accounts for the global
+        # irradiance; missing components (nulls filled with zero upstream)
+        # fall back to Erbs instead of an all-zero split.
+        consistent = (ghi_values <= 1.0) | (
+            direct_values + diffuse_values >= _SPLIT_MIN_SHARE * ghi_values
         )
-        dni = np.where(resolved, np.asarray(split["dni"], dtype=float), 0.0)
-        dhi = np.asarray(split["dhi"], dtype=float)
+        dni = np.where(
+            consistent,
+            np.where(resolved, direct_values / np.maximum(cos_zenith, 1e-3), 0.0),
+            dni,
+        )
+        dhi = np.where(consistent, diffuse_values, dhi)
     return pd.DataFrame(
         {
             "ghi": frame["ghi"].to_numpy(dtype=float),

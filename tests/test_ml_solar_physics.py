@@ -81,3 +81,18 @@ def test_without_a_direct_diffuse_split_irradiance_is_decomposed() -> None:
     assert components.loc[noon, "dni"] > 500.0
     assert components.loc[noon, "dhi"] < components.loc[noon, "ghi"]
     assert (components.loc[sun["elevation"] < 0, "dni"] == 0.0).all()
+
+
+def test_missing_split_components_fall_back_to_the_decomposition() -> None:
+    # The feature builder fills a provider's null direct/diffuse with zero.
+    weather = clear_sky_weather("2026-06-21", 1).assign(
+        direct_radiation=0.0, diffuse_radiation=0.0
+    )
+    sun = sun_position(weather["ds"], LATITUDE, LONGITUDE, 15)
+    reference = irradiance_components(
+        weather.drop(columns=["direct_radiation", "diffuse_radiation"]), sun
+    )
+
+    components = irradiance_components(weather, sun)
+
+    pd.testing.assert_frame_equal(components, reference, atol=1.0)
