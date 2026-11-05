@@ -30,6 +30,11 @@ STATE_FILE = "state.json"
 MODELS_FILE = "models.joblib"
 
 
+# Rows kept in training after a gap so the calibration tail has a contiguous
+# predecessor; the non-recursive structures need nothing longer.
+GAP_TOLERANT_MIN_CONTIGUOUS_ROWS = 8
+
+
 def to_nixtla_frame(df: pd.DataFrame, unique_id: str) -> pd.DataFrame:
     """Convert a KPower dataframe into Nixtla's long format.
 
@@ -113,10 +118,24 @@ class NixtlaHybridBackend:
         return self.config.hybrid_structure == HybridStructure.IRRADIANCE_DIRECT
 
     @property
+    def gap_tolerant(self) -> bool:
+        """Whether training only needs total rows, not a long contiguous tail.
+
+        The non-recursive structures have no lags and are not rolled forward
+        from the last observation, so a gap does not invalidate them.
+        """
+        return self._profile_direct or self._irradiance_direct
+
+    @property
+    def _seasonal_length(self) -> int:
+        return 24 if self.config.interval_minutes == 60 else 96
+
+    @property
     def minimum_contiguous_training_rows(self) -> int:
-        """Return the recent contiguous rows required by structural models."""
-        seasonal_length = 24 if self.config.interval_minutes == 60 else 96
-        return seasonal_length + 1
+        """Return the contiguous tail rows kept in training before calibration."""
+        if self.gap_tolerant:
+            return GAP_TOLERANT_MIN_CONTIGUOUS_ROWS
+        return self._seasonal_length + 1
 
     def fit(
         self,
@@ -135,14 +154,19 @@ class NixtlaHybridBackend:
         values = pd.to_numeric(history["y"], errors="coerce")
         if not values.map(math.isfinite).all():
             raise ValueError("history targets must be finite")
-        seasonal_length = self.minimum_contiguous_training_rows - 1
+        seasonal_length = self._seasonal_length
+        if self.gap_tolerant and values.notna().sum() < seasonal_length + 1:
+            raise ValueError(
+                "training history requires at least "
+                f"{seasonal_length + 1} observed rows"
+            )
         segmented_history = to_segmented_nixtla_frame(
             history, self.config.model_id, self.config.interval_minutes
         )
         structural_history = segmented_history.loc[
             segmented_history["unique_id"].eq(self.config.model_id)
         ].reset_index(drop=True)
-        if len(structural_history) < seasonal_length + 1:
+        if not self.gap_tolerant and len(structural_history) < seasonal_length + 1:
             raise ValueError(
                 "latest history segment requires at least "
                 f"{seasonal_length + 1} contiguous rows"

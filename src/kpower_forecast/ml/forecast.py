@@ -69,6 +69,14 @@ CONFORMAL_RETRAIN_REQUIRED = (
 # 00:00, so up to one hour between the two sources may be interpolated.
 MAX_WEATHER_SEAM: pd.Timedelta = pd.Timedelta(hours=1)
 HISTORY_POLICY_VERSION: int = 2
+# Without a backtest, bands calibrate on the contiguous tail; below this it is too
+# short after a recent gap, so training stays pending. Three hours of 15-min rows.
+MIN_GAP_TOLERANT_CALIBRATION_ROWS: int = 12
+# A stored model older than this is retrained on the archive if it must be.
+ARCHIVE_FALLBACK_MODEL_AGE: pd.Timedelta = pd.Timedelta(days=3)
+# Limits of the recent-bias factor: a few unusual days must not rescale a forecast.
+RECENT_BIAS_MIN_RATIO: float = 0.8
+RECENT_BIAS_MAX_RATIO: float = 1.25
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +170,7 @@ class KPowerMLForecast:
         self.selection_reason: Optional[str] = None
         self._regression: Optional[DegreeHourRegression] = None
         self._blend_weight: Optional[float] = None
+        self._recent_bias_ratio: float = 1.0
         self._restore_existing_manifest()
 
     def _weather_config_with_default_cache(
@@ -206,7 +215,10 @@ class KPowerMLForecast:
             target_interval_min=self.config.interval_minutes,
             preserve_gaps=self.config.preserve_gaps,
         )
-        complete_history = self._prepare_training_data(normalized)
+        complete_history = self._prepare_training_data(
+            normalized,
+            allow_archive_fallback=self._archive_fallback_allowed(existing_manifest),
+        )
         if covariates is not None:
             clash = set(self.config.known_covariates) & set(complete_history.columns)
             if clash:
@@ -259,6 +271,22 @@ class KPowerMLForecast:
             calibration_actual,
             calibration_predictions["yhat"].reset_index(drop=True),
         )
+        selection_used_tail = (
+            not self.config.candidate_selection
+            or self.selection_reason == "backtest_too_short"
+        )
+        if (
+            getattr(self.backend, "gap_tolerant", False)
+            and selection_used_tail
+            and calibration_actual.notna().sum() < MIN_GAP_TOLERANT_CALIBRATION_ROWS
+        ):
+            # Selection fell back to the tail, and after a recent gap that tail
+            # is too short to calibrate bands on.
+            raise ValueError(
+                "latest contiguous history requires more rows: "
+                f"{int(calibration_actual.notna().sum())} calibration rows, "
+                f"{MIN_GAP_TOLERANT_CALIBRATION_ROWS} needed"
+            )
         # Prediction intervals describe the forecast that is actually served,
         # calibrated on residuals that did not take part in selecting it.
         self.conformal.fit(actual=conformal_actual, predicted=conformal_predicted)
@@ -311,6 +339,7 @@ class KPowerMLForecast:
                     "reason": self.selection_reason,
                     "candidates": self.candidate_metrics,
                     "blend_weight": self._blend_weight,
+                    "recent_bias_ratio": self._recent_bias_ratio,
                 },
                 "degree_hour_regression": (
                     self._regression.to_dict() if self._regression is not None else None
@@ -430,6 +459,7 @@ class KPowerMLForecast:
             label="backend forecast",
         )
         forecast = self._sanitize_point_forecast(forecast)
+        forecast["yhat"] = forecast["yhat"] * self._recent_bias_ratio
         forecast = self.conformal.apply(forecast)
         forecast = forecast.iloc[
             skipped_steps : skipped_steps + returned_horizon
@@ -739,8 +769,13 @@ class KPowerMLForecast:
             if str(exc) != CONFORMAL_RETRAIN_REQUIRED:
                 raise
 
-    def _restore_from_manifest(self, manifest: MLModelManifest) -> None:
-        """Restore backend, interval, and correction state from a manifest."""
+    def _check_manifest_compatible(self, manifest: MLModelManifest) -> None:
+        """Raise when a stored model cannot serve the current configuration.
+
+        Raises:
+            ForecastAlignmentError: If the model needs a full retrain.
+            ValueError: If the model belongs to another backend or target.
+        """
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             raise ForecastAlignmentError(
                 "stored model uses forecast contract "
@@ -798,6 +833,9 @@ class KPowerMLForecast:
                 f"{manifest.target_type} != {self.config.forecast_type.value}"
             )
 
+    def _restore_from_manifest(self, manifest: MLModelManifest) -> None:
+        """Restore backend, interval, and correction state from a manifest."""
+        self._check_manifest_compatible(manifest)
         try:
             conformal = SplitConformalCalibrator.from_dict(
                 manifest.interval_levels, manifest.conformal_bands
@@ -904,6 +942,7 @@ class KPowerMLForecast:
         self.selection_reason = None
         self._regression = None
         self._blend_weight = None
+        self._recent_bias_ratio = 1.0
         default = (calibration_actual, ml_holdout)
         if not self.config.candidate_selection:
             return default
@@ -941,7 +980,14 @@ class KPowerMLForecast:
         winner = self._select(metrics)
         choices = self._leave_one_out_choices(windows, names, origins, winner, blend)
         conformal_actual = [windows[o]["actual"] for o in origins]
-        conformal_predicted = [windows[o][choices[o]] for o in origins]
+        # Each origin's correction comes from the other origins, like its choice.
+        conformal_predicted = [
+            windows[o][choices[o]]
+            * self._recent_bias_factor(
+                windows, [other for other in origins if other != o], choices[o]
+            )
+            for o in origins
+        ]
 
         self.selected_candidate = winner
         self.candidate_metrics = {name: m.as_dict() for name, m in metrics.items()}
@@ -959,10 +1005,39 @@ class KPowerMLForecast:
             self._regression = self._new_regression()
         if winner == BLEND_CANDIDATE:
             self._blend_weight = self._window_blend_weight(windows, origins)
+        self._recent_bias_ratio = self._recent_bias_factor(windows, origins, winner)
         return (
             pd.Series(np.concatenate(conformal_actual)),
             pd.Series(np.concatenate(conformal_predicted)),
         )
+
+    def _recent_bias_factor(
+        self,
+        windows: dict[pd.Timestamp, dict[str, np.ndarray]],
+        origins: list[pd.Timestamp],
+        name: str,
+    ) -> float:
+        """Return the bounded factor that removes part of ``name``'s energy gap.
+
+        Args:
+            windows: Backtest windows per origin.
+            origins: Origins to measure the gap on.
+            name: Candidate whose forecast is corrected.
+
+        Returns:
+            Multiplier for the forecast; 1.0 when disabled or without energy.
+        """
+        share = self.config.recent_bias_correction
+        if share <= 0.0 or not origins:
+            return 1.0
+        actual = np.concatenate([windows[o]["actual"] for o in origins])
+        predicted = np.concatenate([windows[o][name] for o in origins])
+        measured = np.isfinite(actual) & np.isfinite(predicted)
+        predicted_energy = float(predicted[measured].sum())
+        if predicted_energy <= 0.0:
+            return 1.0
+        ratio = 1.0 + share * (float(actual[measured].sum()) / predicted_energy - 1.0)
+        return float(np.clip(ratio, RECENT_BIAS_MIN_RATIO, RECENT_BIAS_MAX_RATIO))
 
     def _with_blend(
         self,
@@ -1267,6 +1342,18 @@ class KPowerMLForecast:
         self.selection_reason = reason if isinstance(reason, str) else None
         self._regression = None
         self._blend_weight = None
+        ratio = selection.get("recent_bias_ratio", 1.0)
+        if (
+            isinstance(ratio, bool)
+            or not isinstance(ratio, int | float)
+            or not RECENT_BIAS_MIN_RATIO <= float(ratio) <= RECENT_BIAS_MAX_RATIO
+        ):
+            raise ForecastAlignmentError(
+                "stored recent-bias ratio is invalid; a full retrain is required"
+            )
+        self._recent_bias_ratio = (
+            float(ratio) if self.config.recent_bias_correction > 0.0 else 1.0
+        )
         if self.selected_candidate not in ALL_SELECTION_CANDIDATES:
             raise ForecastAlignmentError(
                 f"stored candidate {self.selected_candidate!r} is unknown; a full "
@@ -1342,7 +1429,28 @@ class KPowerMLForecast:
             raise ValueError(f"invalid numeric value: {value!r}")
         return float(numeric[0])
 
-    def _prepare_training_data(self, history_df: pd.DataFrame) -> pd.DataFrame:
+    def _archive_fallback_allowed(self, manifest: MLModelManifest | None) -> bool:
+        """Whether training may fall back from archived forecasts to the archive.
+
+        With a usable, recent stored model the failure raises, so the caller
+        keeps that model and retries: a model trained on reanalysis weather is
+        biased on forecast input. Without one, an archive-trained model beats
+        no model, or one that keeps ageing through a lasting outage.
+        """
+        if manifest is None or manifest.training_end is None:
+            return True
+        try:
+            self._check_manifest_compatible(manifest)
+        except ValueError:
+            return True
+        age = pd.Timestamp.now(tz="UTC") - pd.to_datetime(
+            manifest.training_end, utc=True
+        )
+        return bool(age > ARCHIVE_FALLBACK_MODEL_AGE)
+
+    def _prepare_training_data(
+        self, history_df: pd.DataFrame, *, allow_archive_fallback: bool = True
+    ) -> pd.DataFrame:
         """Merge normalized history with historical weather and ML features."""
         if "ds" not in history_df.columns or "y" not in history_df.columns:
             raise ValueError("history_df must contain 'ds' and 'y' columns")
@@ -1350,7 +1458,9 @@ class KPowerMLForecast:
         history["ds"] = pd.to_datetime(history["ds"], utc=True)
         start_date = history["ds"].min().date()
         end_date = history["ds"].max().date()
-        weather = self.weather_client.fetch_historical(start_date, end_date)
+        weather = self.weather_client.fetch_historical(
+            start_date, end_date, allow_archive_fallback=allow_archive_fallback
+        )
         weather = self.weather_client.resample_weather(
             weather, self.config.interval_minutes
         )
@@ -1559,6 +1669,8 @@ def _selection_settings(config: KPowerMLConfig) -> dict[str, Any]:
         settings["min_origins"] = config.selection_min_origins
         settings["bias_tolerance"] = config.selection_bias_tolerance
         settings["bias_floor_kw"] = config.selection_bias_floor_kw
+        if config.recent_bias_correction > 0.0:
+            settings["recent_bias_correction"] = config.recent_bias_correction
     return settings
 
 

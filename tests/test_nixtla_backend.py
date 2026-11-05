@@ -550,3 +550,33 @@ def test_solar_selection_needs_irradiance_structure_and_load_cannot_use_it() -> 
             candidate_selection=True,
             selection_candidates=["kpower_ml", "solar_physics"],
         )
+
+
+def test_profile_direct_trains_right_after_a_long_gap(tmp_path) -> None:
+    """A gap must not cost a non-recursive model a day of waiting for rows."""
+    pytest.importorskip("lightgbm")
+    ds = pd.Series(pd.date_range("2026-09-01", periods=14 * 96, freq="15min", tz="UTC"))
+    # A 3 h gap, then only 20 rows.
+    keep = pd.Series(True, index=ds.index)
+    keep.iloc[-(20 + 12) : -20] = False
+    ds = ds[keep].reset_index(drop=True)
+    history = pd.DataFrame({"ds": ds, "y": 0.25})
+    backend = _profile_direct_backend()
+    assert backend.gap_tolerant
+    assert backend.minimum_contiguous_training_rows < 20
+
+    backend.fit(history, _calendar_features(ds), history.tail(4))
+
+    future_ds = pd.Series(
+        pd.date_range(ds.iloc[-1] + pd.Timedelta(minutes=15), periods=96, freq="15min")
+    )
+    forecast = backend.predict(_calendar_features(future_ds), horizon=96)
+    assert len(forecast) == 96
+
+
+def test_profile_direct_still_needs_a_day_of_observed_rows() -> None:
+    ds = pd.Series(pd.date_range("2026-09-01", periods=50, freq="15min", tz="UTC"))
+    history = pd.DataFrame({"ds": ds, "y": 0.25})
+
+    with pytest.raises(ValueError, match="requires at least 97 observed rows"):
+        _profile_direct_backend().fit(history, _calendar_features(ds), history.tail(4))

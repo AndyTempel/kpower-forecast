@@ -21,6 +21,7 @@ from kpower_forecast.ml.selection import (
     score_windows,
     select_candidate,
 )
+from kpower_forecast.weather_client import ArchivedForecastsUnavailableError
 
 _HOURS = 168
 
@@ -112,7 +113,7 @@ def _forecast(
         **settings,
     )
     monkeypatch.setattr(
-        forecast.weather_client, "fetch_historical", lambda start, end: weather
+        forecast.weather_client, "fetch_historical", lambda start, end, **_: weather
     )
     monkeypatch.setattr(
         forecast.weather_client,
@@ -632,3 +633,111 @@ def test_known_covariates_reject_reserved_names_and_unsupported_backends(
             forecast_type=MLForecastType.HVAC,
             **overrides,
         )
+
+
+def test_recent_bias_factor_removes_a_share_of_the_energy_gap_within_limits(
+    monkeypatch, tmp_path
+) -> None:
+    weather = _weather("2026-01-05", _HOURS)
+    forecast = _forecast(
+        monkeypatch, tmp_path, _Backend(), weather, recent_bias_correction=0.5
+    )
+    origins = list(pd.date_range("2026-01-05", periods=2, freq="D", tz="UTC"))
+    low = {
+        origin: {"actual": np.array([2.0, np.nan]), ML_CANDIDATE: np.array([1.6, 9.0])}
+        for origin in origins
+    }
+    far_low = {
+        origin: {"actual": np.full(2, 9.0), ML_CANDIDATE: np.full(2, 1.0)}
+        for origin in origins
+    }
+
+    # 2.0 / 1.6 = 1.25, half of it applied; the unmeasured row does not count.
+    assert forecast._recent_bias_factor(low, origins, ML_CANDIDATE) == pytest.approx(
+        1.125
+    )
+    assert forecast._recent_bias_factor(far_low, origins, ML_CANDIDATE) == 1.25
+    assert forecast._recent_bias_factor(low, [], ML_CANDIDATE) == 1.0
+
+
+def test_recent_bias_correction_scales_the_served_forecast_and_survives_restart(
+    monkeypatch, tmp_path
+) -> None:
+    weather = _weather("2026-01-05", _HOURS + 24)
+    past = weather.iloc[:_HOURS]
+    history = pd.DataFrame({"ds": past["ds"], "y": _heating(past)})
+    # Same data, same backend: only the correction differs between the two.
+    plain = _forecast(monkeypatch, tmp_path / "plain", _Backend(), weather)
+    plain.train(history, force=True)
+    corrected = _forecast(
+        monkeypatch,
+        tmp_path / "corrected",
+        _Backend(),
+        weather,
+        recent_bias_correction=1.0,
+    )
+    corrected.train(history, force=True)
+
+    ratio = corrected._recent_bias_ratio
+    assert ratio != 1.0
+    assert plain._recent_bias_ratio == 1.0
+    manifest = corrected.storage.load_manifest()
+    assert manifest is not None
+    selection = manifest.metadata["candidate_selection"]
+    assert selection["recent_bias_ratio"] == ratio
+    assert selection["recent_bias_correction"] == 1.0
+
+    corrected._recent_bias_ratio = 1.0
+    corrected._restore_selection(manifest)
+    assert corrected._recent_bias_ratio == ratio
+    selection["recent_bias_ratio"] = 5.0
+    with pytest.raises(ForecastAlignmentError, match="recent-bias ratio"):
+        corrected._restore_selection(manifest)
+
+
+def test_failed_archived_forecasts_keep_the_stored_model(monkeypatch, tmp_path) -> None:
+    weather = _weather("2026-01-05", _HOURS + 24)
+    past = weather.iloc[:_HOURS]
+    history = pd.DataFrame({"ds": past["ds"], "y": _heating(past)})
+    forecast = _forecast(monkeypatch, tmp_path, _Backend(), weather)
+    forecast.train(history, force=True)
+    before = forecast.storage.load_manifest()
+    assert before is not None
+    allowed: list[bool] = []
+
+    def fail(start: object, end: object, **kwargs: Any) -> pd.DataFrame:
+        allowed.append(kwargs["allow_archive_fallback"])
+        raise ArchivedForecastsUnavailableError("down")
+
+    monkeypatch.setattr(forecast.weather_client, "fetch_historical", fail)
+    monkeypatch.setattr(forecast, "_archive_fallback_allowed", lambda _: False)
+    with pytest.raises(ArchivedForecastsUnavailableError):
+        forecast.train(history, force=True)
+
+    assert allowed == [False]
+    assert forecast.storage.load_manifest() == before
+
+
+def test_a_short_tail_after_a_gap_keeps_training_pending(monkeypatch, tmp_path) -> None:
+    """Without a backtest, bands must not be calibrated on a handful of rows."""
+
+    class GapTolerantBackend(_Backend):
+        gap_tolerant = True
+        minimum_contiguous_training_rows = 8
+
+    weather = _weather("2026-01-05", _HOURS + 24)
+    past = weather.iloc[:_HOURS]
+    history = pd.DataFrame({"ds": past["ds"], "y": _heating(past)})
+    # A gap leaving 20 rows: one or two calibration rows, too short to calibrate.
+    history = history.drop(history.index[-26:-20])
+    forecast = _forecast(
+        monkeypatch,
+        tmp_path,
+        GapTolerantBackend(),
+        weather,
+        candidate_selection=False,
+    )
+
+    with pytest.raises(ValueError, match="latest contiguous history requires"):
+        forecast.train(history, force=True)
+    assert forecast.storage.load_manifest() is None

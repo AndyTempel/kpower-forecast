@@ -6,7 +6,11 @@ import pandas as pd
 import pytest
 import requests
 
-from kpower_forecast.weather_client import WeatherClient, WeatherConfig
+from kpower_forecast.weather_client import (
+    ArchivedForecastsUnavailableError,
+    WeatherClient,
+    WeatherConfig,
+)
 
 
 def test_recent_training_weather_caps_future_padding_and_shares_cache(
@@ -1175,3 +1179,167 @@ def test_archived_forecasts_missing_interior_hours_are_filled_from_the_archive(
     values = weather.set_index("ds")["temperature_2m"]
     assert values[pd.Timestamp("2026-10-01T10:00Z")] == 9.0
     assert values[pd.Timestamp("2026-10-01T11:00Z")] == 5.0
+
+
+def _archived_forecast_response(url: str, params: dict[str, object]) -> object:
+    class Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, object]:
+            return {
+                "timezone": "UTC",
+                "hourly": {
+                    "time": [f"{params['start_date']}T00:00"],
+                    "temperature_2m": [4.0],
+                    "cloud_cover": [10.0],
+                    "shortwave_radiation": [0.0],
+                    "snow_depth": [0.0],
+                    "snowfall": [0.0],
+                },
+            }
+
+    return Response()
+
+
+def test_archived_forecasts_are_requested_per_month_and_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A later retrain only asks for the month whose end date moved."""
+    ranges: list[tuple[object, object]] = []
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> object:
+        ranges.append((params["start_date"], params["end_date"]))
+        assert timeout == 30.0
+        return _archived_forecast_response(url, params)
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    client = WeatherClient(
+        46,
+        14,
+        WeatherConfig(
+            cache_dir=tmp_path, training_weather_source="historical_forecast"
+        ),
+    )
+    fetch = client._fetch_archived_forecasts
+
+    frame = fetch(datetime.date(2026, 8, 20), datetime.date(2026, 10, 3))
+    assert ranges == [
+        ("2026-08-20", "2026-08-31"),
+        ("2026-09-01", "2026-09-30"),
+        ("2026-10-01", "2026-10-03"),
+    ]
+    assert len(frame) == 3
+
+    ranges.clear()
+    fetch(datetime.date(2026, 8, 20), datetime.date(2026, 10, 4))
+    assert ranges == [("2026-10-01", "2026-10-04")]
+
+
+def test_archived_forecast_timeouts_are_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> object:
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.Timeout("slow")
+        return _archived_forecast_response(url, params)
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    monkeypatch.setattr("kpower_forecast.weather_client.time.sleep", lambda _: None)
+    client = WeatherClient(
+        46,
+        14,
+        WeatherConfig(
+            cache_dir=tmp_path, training_weather_source="historical_forecast"
+        ),
+    )
+
+    weather = client._fetch_training_history(
+        datetime.date(2026, 10, 1), datetime.date(2026, 10, 1), strict=True
+    )
+
+    archived = WeatherConfig().historical_forecast_url
+    assert calls.count(archived) == 2
+    assert weather["temperature_2m"].tolist() == [4.0]
+
+
+def test_archive_fallback_only_when_allowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A caller holding a good model gets an error, not reanalysis weather."""
+    config = WeatherConfig(
+        cache_dir=tmp_path, training_weather_source="historical_forecast"
+    )
+
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> object:
+        if url == config.historical_forecast_url:
+            raise requests.Timeout("slow")
+        return _archived_forecast_response(url, params)
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    monkeypatch.setattr("kpower_forecast.weather_client.time.sleep", lambda _: None)
+    client = WeatherClient(46, 14, config)
+    day = datetime.date(2026, 10, 1)
+
+    with pytest.raises(ArchivedForecastsUnavailableError):
+        client._fetch_training_history(
+            day, day, strict=True, allow_archive_fallback=False
+        )
+    weather = client._fetch_training_history(day, day, strict=True)
+    assert weather["temperature_2m"].tolist() == [4.0]
+
+
+def test_a_month_without_archived_forecasts_does_not_fail_the_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_get(url: str, params: dict[str, object], timeout: float) -> object:
+        if str(params["start_date"]).startswith("2026-08"):
+            response = _archived_forecast_response(url, params)
+            response.json = lambda: {"timezone": "UTC"}  # type: ignore[attr-defined]
+            return response
+        return _archived_forecast_response(url, params)
+
+    monkeypatch.setattr("kpower_forecast.weather_client.requests.get", fake_get)
+    client = WeatherClient(46, 14, WeatherConfig(cache_dir=tmp_path))
+
+    frame = client._fetch_archived_forecasts(
+        datetime.date(2026, 8, 20), datetime.date(2026, 9, 2)
+    )
+    assert len(frame) == 1
+    with pytest.raises(ValueError, match="no archived forecasts"):
+        client._fetch_archived_forecasts(
+            datetime.date(2026, 8, 20), datetime.date(2026, 8, 21)
+        )
+
+
+def test_recent_archived_forecast_months_are_refreshed_daily(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hours still filling in upstream must not stay missing for a month."""
+    ttls: dict[str, float] = {}
+    monkeypatch.setattr(
+        "kpower_forecast.weather_client._weather_today",
+        lambda: datetime.date(2026, 11, 2),
+    )
+    client = WeatherClient(46, 14, WeatherConfig(cache_dir=tmp_path))
+    stored = client._request_json
+
+    def request_json(*args: object, **kwargs: object) -> dict[str, object]:
+        params = kwargs["params"]
+        ttls[params["start_date"]] = kwargs["ttl_hours"]  # type: ignore[index]
+        return stored(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(client, "_request_json", request_json)
+    monkeypatch.setattr(
+        "kpower_forecast.weather_client.requests.get",
+        lambda url, params, timeout: _archived_forecast_response(url, params),
+    )
+
+    client._fetch_archived_forecasts(
+        datetime.date(2026, 9, 1), datetime.date(2026, 10, 31)
+    )
+
+    assert ttls == {"2026-09-01": 720.0, "2026-10-01": 24.0}
