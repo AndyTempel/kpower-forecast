@@ -20,6 +20,7 @@ from kpower_forecast.ml.dependencies import (
 from kpower_forecast.ml.forecast import (
     HISTORY_POLICY_VERSION,
     SANITIZED_CONFORMAL_STATE_VERSION,
+    _selection_settings,
     bridge_short_target_gaps,
 )
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
@@ -87,7 +88,7 @@ def test_ml_training_persists_full_gapped_history_for_baseline(
     backend = RecordingBackend()
     forecast.backend = cast(Any, backend)
     monkeypatch.setattr(
-        forecast.weather_client, "fetch_historical", lambda start, end: weather
+        forecast.weather_client, "fetch_historical", lambda start, end, **_: weather
     )
     monkeypatch.setattr(
         forecast.weather_client,
@@ -195,7 +196,7 @@ def test_ml_forecast_train_predict_with_neuralforecast_backend(
     )
 
     monkeypatch.setattr(
-        forecast.weather_client, "fetch_historical", lambda start, end: weather
+        forecast.weather_client, "fetch_historical", lambda start, end, **_: weather
     )
     monkeypatch.setattr(
         forecast.weather_client,
@@ -307,7 +308,7 @@ def test_ml_forecast_calibrates_against_sanitized_predictions(
         }
     )
     monkeypatch.setattr(
-        forecast.weather_client, "fetch_historical", lambda start, end: weather
+        forecast.weather_client, "fetch_historical", lambda start, end, **_: weather
     )
 
     forecast.train(history, force=True)
@@ -505,7 +506,7 @@ def test_ml_forecast_defaults_to_current_slot_and_loads_elapsed_weather(
     historical_calls: list[tuple[object, object]] = []
     forecast_calls: list[tuple[int, int]] = []
 
-    def fetch_historical(start: object, end: object) -> pd.DataFrame:
+    def fetch_historical(start: object, end: object, **_: object) -> pd.DataFrame:
         historical_calls.append((start, end))
         raise AssertionError("recent elapsed weather must not use the archive API")
 
@@ -571,7 +572,7 @@ def test_ml_forecast_caps_recent_weather_to_configured_one_day(
         forecast_calls.append((days, past_days))
         return recent
 
-    def fetch_historical(start: object, end: object) -> pd.DataFrame:
+    def fetch_historical(start: object, end: object, **_: object) -> pd.DataFrame:
         archive_calls.append((start, end))
         return archive
 
@@ -631,7 +632,7 @@ def test_ml_forecast_bridges_only_a_short_archive_forecast_seam(
         forecast.weather_client, "fetch_forecast", lambda days, past_days=0: recent
     )
     monkeypatch.setattr(
-        forecast.weather_client, "fetch_historical", lambda start, end: archive
+        forecast.weather_client, "fetch_historical", lambda start, end, **_: archive
     )
     monkeypatch.setattr(
         forecast.weather_client,
@@ -762,7 +763,7 @@ def test_ml_forecast_permits_forced_retrain_of_legacy_manifest(
         }
     )
     monkeypatch.setattr(
-        forecast.weather_client, "fetch_historical", lambda start, end: weather
+        forecast.weather_client, "fetch_historical", lambda start, end, **_: weather
     )
 
     assert forecast.training_end is None
@@ -1056,7 +1057,7 @@ def test_ml_training_bridges_short_gaps_but_calibrates_on_measured_rows(
     backend = RecordingBackend()
     forecast.backend = cast(Any, backend)
     monkeypatch.setattr(
-        forecast.weather_client, "fetch_historical", lambda start, end: weather
+        forecast.weather_client, "fetch_historical", lambda start, end, **_: weather
     )
     monkeypatch.setattr(
         forecast.weather_client,
@@ -1111,3 +1112,64 @@ def test_gap_safe_split_keeps_bridges_on_one_side_of_calibration(tmp_path) -> No
 
     assert calibration["ds"].iloc[0] == prepared["ds"].iloc[17]
     assert train["ds"].iloc[-1] == prepared["ds"].iloc[16]
+
+
+def test_archive_fallback_is_only_for_sites_without_a_usable_model(tmp_path) -> None:
+    """A usable model is kept over a retrain on reanalysis weather."""
+    forecast = KPowerMLForecast(
+        model_id="solar-source",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=15,
+        forecast_type=MLForecastType.SOLAR,
+        backend=MLBackendType.NIXTLA_HYBRID,
+        weather_config=WeatherConfig(training_weather_source="historical_forecast"),
+    )
+    assert forecast._archive_fallback_allowed(None)
+
+    def manifest(contract: int, source: str) -> MLModelManifest:
+        return MLModelManifest(
+            contract_version=contract,
+            model_id="solar-source",
+            backend_type=MLBackendType.NIXTLA_HYBRID.value,
+            target_type=MLForecastType.SOLAR.value,
+            interval_levels=[90],
+            feature_columns=[],
+            artifact_paths={},
+            conformal_bands={},
+            weather_bias_source="none",
+            training_start=None,
+            training_end=pd.Timestamp.now(tz="UTC").isoformat(),
+            package_version="0",
+            metadata={
+                "training_weather_source": source,
+                "hybrid_structure": forecast.config.hybrid_structure.value,
+                "candidate_selection": _selection_settings(forecast.config),
+                "sanitized_conformal_state_version": (
+                    SANITIZED_CONFORMAL_STATE_VERSION
+                ),
+                "timezone": forecast.config.timezone,
+                "history_policy_version": HISTORY_POLICY_VERSION,
+                "preserve_gaps": forecast.config.preserve_gaps,
+                "max_bridged_gap_intervals": 0,
+            },
+        )
+
+    usable = manifest(FORECAST_CONTRACT_VERSION, "historical_forecast")
+    assert not forecast._archive_fallback_allowed(usable)
+    # A lasting outage must not freeze the model: past the limit it may retrain.
+    stale = usable.model_copy(
+        update={
+            "training_end": (
+                pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=4)
+            ).isoformat()
+        }
+    )
+    assert forecast._archive_fallback_allowed(stale)
+    assert forecast._archive_fallback_allowed(
+        manifest(FORECAST_CONTRACT_VERSION - 1, "historical_forecast")
+    )
+    assert forecast._archive_fallback_allowed(
+        manifest(FORECAST_CONTRACT_VERSION, "archive")
+    )

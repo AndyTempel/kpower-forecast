@@ -120,3 +120,24 @@ def test_split_conformal_requires_residuals() -> None:
 
     with pytest.raises(ValueError, match="without residuals"):
         calibrator.fit(actual=pd.Series(dtype=float), predicted=pd.Series(dtype=float))
+
+
+def test_night_rows_do_not_shrink_daylight_bands() -> None:
+    """Sparse daylight bins fall back to a band pooled over daylight only."""
+    rng = np.random.default_rng(7)
+    daylight = pd.Series(rng.uniform(0.2, 1.0, 150))
+    errors = rng.normal(0.0, 0.3, 150)
+    calibrator = SplitConformalCalibrator(interval_levels=[90], min_bin_samples=96)
+    calibrator.fit(
+        actual=pd.concat([daylight + errors, pd.Series(np.zeros(400))]),
+        predicted=pd.concat([daylight, pd.Series(np.zeros(400))]),
+    )
+
+    lower, upper = calibrator.global_bands[90]
+    assert lower == pytest.approx(np.quantile(errors, 0.05), abs=1e-9)
+    assert upper == pytest.approx(np.quantile(errors, 0.95), abs=1e-9)
+    # The night bin keeps its own zero-width band; sparse daylight bins pool.
+    assert calibrator.bands[90][0] == pytest.approx((0.0, 0.0))
+    assert calibrator.bands[90][1:] == [calibrator.global_bands[90]] * (
+        len(calibrator.edges)
+    )

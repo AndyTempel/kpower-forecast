@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from enum import Enum
 from pathlib import Path
@@ -26,6 +27,17 @@ FORECAST_HOURS_PER_DAY = 24
 WEATHER_REQUEST_INTERVAL_MINUTES = 15
 FORECAST_INTERVALS_PER_HOUR = 60 // WEATHER_REQUEST_INTERVAL_MINUTES
 MAX_FORECAST_PAST_DAYS = 92
+# Forecast and archive requests are frequent; a slow one is retried next cycle.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+RETRY_BACKOFF_SECONDS = 2.0
+# Archived forecasts this close to today may still be filling in upstream, so a
+# completed month's chunk is refreshed daily until then.
+ARCHIVED_FORECAST_SETTLE_DAYS = 7
+RECENT_ARCHIVED_FORECAST_TTL_HOURS = 24.0
+
+
+class ArchivedForecastsUnavailableError(RuntimeError):
+    """Archived forecasts could not be fetched and no fallback was allowed."""
 
 
 def _weather_today() -> datetime.date:
@@ -77,6 +89,10 @@ class WeatherConfig(BaseModel):
         cache_dir: Optional directory for cached weather responses.
         forecast_cache_ttl_hours: Forecast cache freshness window in hours.
         historical_cache_ttl_hours: Historical cache freshness window in hours.
+        historical_forecast_timeout_seconds: Timeout of one archived-forecast
+            request.
+        historical_forecast_attempts: Attempts per archived-forecast request;
+            only timeouts and connection errors are retried.
         recent_forecast_past_days: Maximum recent elapsed days requested from
             the forecast endpoint. Defaults to one for self-hosted deployments.
         required_hourly_variables: Variables required by the forecasting core.
@@ -96,6 +112,8 @@ class WeatherConfig(BaseModel):
     cache_dir: Optional[Path] = None
     forecast_cache_ttl_hours: float = Field(default=1.0, gt=0)
     historical_cache_ttl_hours: float = Field(default=720.0, gt=0)
+    historical_forecast_timeout_seconds: float = Field(default=30.0, gt=0)
+    historical_forecast_attempts: int = Field(default=3, ge=1)
     recent_forecast_past_days: int = Field(default=1, ge=0, le=MAX_FORECAST_PAST_DAYS)
     required_hourly_variables: list[str] = Field(
         default_factory=lambda: [
@@ -178,6 +196,7 @@ class WeatherClient:
         end_date: datetime.date,
         *,
         strict: bool = False,
+        allow_archive_fallback: bool = True,
     ) -> pd.DataFrame:
         """Fetch archive weather and recent forecast weather for training.
 
@@ -190,11 +209,16 @@ class WeatherClient:
             start_date: First requested UTC date.
             end_date: Last requested UTC date, inclusive.
             strict: Preserve missing weather values for coverage validation.
+            allow_archive_fallback: With ``historical_forecast`` training
+                weather, use the archive alone when archived forecasts cannot
+                be fetched. When false, that failure raises instead.
 
         Returns:
             Ordered weather samples inside the elapsed requested dates.
 
         Raises:
+            ArchivedForecastsUnavailableError: If archived forecasts cannot be
+                fetched and ``allow_archive_fallback`` is false.
             ValueError: If the date range is reversed or entirely in the future.
             requests.RequestException: If a weather request fails.
         """
@@ -208,13 +232,23 @@ class WeatherClient:
             days=self.config.recent_forecast_past_days
         )
         if end_date < recent_start:
-            return self._fetch_training_history(start_date, end_date, strict=strict)
+            return self._fetch_training_history(
+                start_date,
+                end_date,
+                strict=strict,
+                allow_archive_fallback=allow_archive_fallback,
+            )
 
         frames: list[pd.DataFrame] = []
         archive_end = recent_start - datetime.timedelta(days=1)
         if start_date <= archive_end:
             frames.append(
-                self._fetch_training_history(start_date, archive_end, strict=True)
+                self._fetch_training_history(
+                    start_date,
+                    archive_end,
+                    strict=True,
+                    allow_archive_fallback=allow_archive_fallback,
+                )
             )
         recent = self.fetch_forecast(
             days=1,
@@ -242,36 +276,41 @@ class WeatherClient:
         end_date: datetime.date,
         *,
         strict: bool,
+        allow_archive_fallback: bool = True,
     ) -> pd.DataFrame:
         """Fetch elapsed training weather from the configured source.
 
         With ``historical_forecast`` the archived forecasts are primary and the
-        archive fills rows or required values they lack; if the archived
-        forecasts cannot be fetched at all, the archive is used alone.
+        archive fills rows or required values they lack. If the archived
+        forecasts cannot be fetched at all, the archive is used alone when
+        ``allow_archive_fallback`` is true; otherwise the failure raises, so a
+        caller holding a good model can keep it instead of training a model on
+        reanalysis weather.
 
         Args:
             start_date: First requested UTC date.
             end_date: Last requested UTC date, inclusive.
             strict: Preserve missing weather values for coverage validation.
+            allow_archive_fallback: Use the archive when archived forecasts
+                cannot be fetched.
 
         Returns:
             Weather rows for the requested elapsed dates.
 
         Raises:
+            ArchivedForecastsUnavailableError: If archived forecasts cannot be
+                fetched and ``allow_archive_fallback`` is false.
             requests.RequestException: If the archive request fails.
         """
         if self.config.training_weather_source == TrainingWeatherSource.ARCHIVE:
             return self._fetch_archive(start_date, end_date, strict=strict)
         try:
-            primary = self._fetch_archive(
-                start_date,
-                end_date,
-                strict=True,
-                url=self.config.historical_forecast_url,
-                endpoint="historical_forecast",
-                model=self.config.forecast_model,
-            )
-        except (requests.RequestException, ValueError):
+            primary = self._fetch_archived_forecasts(start_date, end_date)
+        except (requests.RequestException, ValueError) as error:
+            if not allow_archive_fallback:
+                raise ArchivedForecastsUnavailableError(
+                    f"archived forecasts unavailable for {start_date}..{end_date}"
+                ) from error
             logger.warning(
                 "Archived forecasts unavailable for %s..%s; using the archive",
                 start_date,
@@ -285,6 +324,63 @@ class WeatherClient:
         if strict:
             return self._clip_physical_bounds(primary)
         return self._finalize_weather_frame(primary)
+
+    def _fetch_archived_forecasts(
+        self, start_date: datetime.date, end_date: datetime.date
+    ) -> pd.DataFrame:
+        """Fetch archived forecasts one calendar month per request.
+
+        Months are cached separately, so a daily retrain only requests the
+        current month instead of the whole training range. A month with no
+        data is left out: the caller fills missing rows from the archive.
+
+        Args:
+            start_date: First requested UTC date.
+            end_date: Last requested UTC date, inclusive.
+
+        Returns:
+            Archived forecast rows of the requested dates.
+
+        Raises:
+            ValueError: If no requested month has any data.
+            requests.RequestException: If a request fails.
+        """
+        settled_before = _weather_today() - datetime.timedelta(
+            days=ARCHIVED_FORECAST_SETTLE_DAYS
+        )
+        frames: list[pd.DataFrame] = []
+        first = start_date
+        while first <= end_date:
+            next_month = (first.replace(day=1) + datetime.timedelta(days=32)).replace(
+                day=1
+            )
+            last = min(end_date, next_month - datetime.timedelta(days=1))
+            try:
+                frames.append(
+                    self._fetch_archive(
+                        first,
+                        last,
+                        strict=True,
+                        url=self.config.historical_forecast_url,
+                        endpoint="historical_forecast",
+                        model=self.config.forecast_model,
+                        ttl_hours=(
+                            self.config.historical_cache_ttl_hours
+                            if last < settled_before
+                            else RECENT_ARCHIVED_FORECAST_TTL_HOURS
+                        ),
+                        timeout=self.config.historical_forecast_timeout_seconds,
+                        attempts=self.config.historical_forecast_attempts,
+                    )
+                )
+            except ValueError as error:
+                logger.warning(
+                    "No archived forecasts for %s..%s: %s", first, last, error
+                )
+            first = next_month
+        if not frames:
+            raise ValueError(f"no archived forecasts for {start_date}..{end_date}")
+        return pd.concat(frames, ignore_index=True)
 
     def _covers_dates(
         self,
@@ -325,6 +421,9 @@ class WeatherClient:
         url: Optional[str] = None,
         endpoint: str = "historical",
         model: Optional[str] = None,
+        ttl_hours: Optional[float] = None,
+        timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        attempts: int = 1,
     ) -> pd.DataFrame:
         """Fetch only elapsed dates, retaining resolution and variable fallback.
 
@@ -335,6 +434,9 @@ class WeatherClient:
             url: Date-range API URL; the archive when unset.
             endpoint: Logical endpoint name for cache-key separation.
             model: Optional weather model requested from ``url``.
+            ttl_hours: Cache lifetime; the configured historical one when unset.
+            timeout: Timeout of one request in seconds.
+            attempts: Attempts per request.
 
         Returns:
             Weather rows for the requested dates.
@@ -361,7 +463,13 @@ class WeatherClient:
                     endpoint=endpoint,
                     url=target_url,
                     params=params,
-                    ttl_hours=self.config.historical_cache_ttl_hours,
+                    ttl_hours=(
+                        self.config.historical_cache_ttl_hours
+                        if ttl_hours is None
+                        else ttl_hours
+                    ),
+                    timeout=timeout,
+                    attempts=attempts,
                 )
                 try:
                     return self._process_response(data, interpolate=not strict)
@@ -787,6 +895,8 @@ class WeatherClient:
         url: str,
         params: dict[str, str | float | int | list[str]],
         ttl_hours: float,
+        timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        attempts: int = 1,
     ) -> dict[str, object]:
         """Fetch JSON from cache or the weather API.
 
@@ -795,6 +905,8 @@ class WeatherClient:
             url: Weather API URL.
             params: Query parameters.
             ttl_hours: Cache time-to-live in hours.
+            timeout: Timeout of one request in seconds.
+            attempts: Attempts; only timeouts and connection errors are retried.
 
         Returns:
             Raw JSON response payload.
@@ -810,7 +922,21 @@ class WeatherClient:
         if cached is not None:
             return cached
 
-        response = requests.get(url, params=params, timeout=10)
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.get(url, params=params, timeout=timeout)
+                break
+            except (requests.Timeout, requests.ConnectionError) as error:
+                if attempt == attempts:
+                    raise
+                logger.info(
+                    "Weather request to %s failed (attempt %d/%d): %s",
+                    url,
+                    attempt,
+                    attempts,
+                    error,
+                )
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict):

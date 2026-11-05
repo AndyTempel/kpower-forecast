@@ -105,6 +105,9 @@ class KPowerMLConfig(BaseModel):
     # the floor, whichever is larger) is not eligible to win.
     selection_bias_tolerance: float = Field(default=0.15, gt=0.0, le=1.0)
     selection_bias_floor_kw: float = Field(default=0.05, ge=0.0)
+    # Share of the served candidate's backtest energy gap removed from its
+    # forecast. Models trained on earlier weeks lag a seasonal rise; 0 disables.
+    recent_bias_correction: float = Field(default=0.0, ge=0.0, le=1.0)
     regression_base_temperature_c: float = 16.0
     regression_extra_features: list[str] = Field(
         default_factory=lambda: ["shortwave_radiation"]

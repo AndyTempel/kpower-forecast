@@ -6,7 +6,9 @@ the predicted value: solar error grows with output and load error with load,
 so one global width is too wide at low output and too narrow at high output.
 Zero forecasts (solar at night) form their own bin and the rest are split at
 quantiles of the positive forecasts, so night rows cannot collapse the bins.
-A bin with too few calibration rows uses the global band.
+A bin with too few calibration rows uses the global band. That band comes from
+the positive forecasts when there are enough of them: night rows have no error,
+so pooling them with daylight would shrink every daylight band.
 """
 
 from itertools import pairwise
@@ -88,17 +90,27 @@ class SplitConformalCalibrator:
         bin_index = self._bin_index(frame["predicted"].to_numpy())
         self.bands = {}
         self.global_bands = {}
+        is_positive = frame["predicted"] > 0.0
+        pooled = (
+            residuals[is_positive]
+            if is_positive.sum() >= self.min_bin_samples
+            else residuals
+        )
+        zero_bin = 0 if 0.0 in self.edges else None
         for level in self.interval_levels:
-            global_band = _residual_band(residuals, level)
+            global_band = _residual_band(pooled, level)
             self.global_bands[level] = global_band
+            all_rows_band = _residual_band(residuals, level)
             level_bands: list[Band] = []
             for index in range(len(self.edges) + 1):
                 in_bin = residuals[bin_index == index]
-                level_bands.append(
-                    _residual_band(in_bin, level)
-                    if len(in_bin) >= self.min_bin_samples
-                    else global_band
-                )
+                if len(in_bin) >= self.min_bin_samples:
+                    level_bands.append(_residual_band(in_bin, level))
+                elif index == zero_bin:
+                    # Zero forecasts are not daylight; never give them its band.
+                    level_bands.append(all_rows_band)
+                else:
+                    level_bands.append(global_band)
             self.bands[level] = level_bands
 
     def apply(self, forecast: pd.DataFrame) -> pd.DataFrame:
