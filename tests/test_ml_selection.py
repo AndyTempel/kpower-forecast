@@ -12,6 +12,7 @@ from kpower_forecast.ml import (
 )
 from kpower_forecast.ml.alignment import ForecastAlignmentError
 from kpower_forecast.ml.baselines import BASELINE_NAME
+from kpower_forecast.ml.forecast import _selection_settings, _selection_settings_match
 from kpower_forecast.ml.selection import (
     BLEND_CANDIDATE,
     DEGREE_HOUR_CANDIDATE,
@@ -21,6 +22,7 @@ from kpower_forecast.ml.selection import (
     score_windows,
     select_candidate,
 )
+from kpower_forecast.ml.storage import MLModelManifest
 from kpower_forecast.weather_client import ArchivedForecastsUnavailableError
 
 _HOURS = 168
@@ -741,3 +743,58 @@ def test_a_short_tail_after_a_gap_keeps_training_pending(monkeypatch, tmp_path) 
     with pytest.raises(ValueError, match="latest contiguous history requires"):
         forecast.train(history, force=True)
     assert forecast.storage.load_manifest() is None
+
+
+def test_held_out_actuals_do_not_steer_their_own_bias_factor(
+    monkeypatch, tmp_path
+) -> None:
+    """Other origins' blend weights must not carry the held-out origin's actuals."""
+    weather = _weather("2026-01-05", _HOURS)
+    forecast = _forecast(
+        monkeypatch, tmp_path, _Backend(), weather, recent_bias_correction=1.0
+    )
+    origins = list(pd.date_range("2026-01-05", periods=4, freq="D", tz="UTC"))
+    rng = np.random.default_rng(3)
+    low = {
+        origin: {
+            "actual": rng.uniform(0, 2, 24),
+            ML_CANDIDATE: rng.uniform(0, 2, 24),
+            DEGREE_HOUR_CANDIDATE: rng.uniform(0, 2, 24),
+        }
+        for origin in origins
+    }
+    high = {origin: dict(window) for origin, window in low.items()}
+    high[origins[0]]["actual"] = rng.uniform(0, 6, 24)
+    choices = dict.fromkeys(origins, BLEND_CANDIDATE)
+
+    def factors(source: dict) -> dict:
+        blended = forecast._with_blend(source, origins, held_out=None)
+        return forecast._held_out_bias_factors(blended, origins, choices, True)
+
+    assert factors(low)[origins[0]] == pytest.approx(factors(high)[origins[0]])
+    assert factors(low)[origins[1]] != pytest.approx(factors(high)[origins[1]])
+
+
+def test_disabling_bias_correction_requires_a_retrain(monkeypatch, tmp_path) -> None:
+    """Stored bands were calibrated on corrected forecasts."""
+    weather = _weather("2026-01-05", _HOURS + 24)
+    enabled = _forecast(
+        monkeypatch, tmp_path, _Backend(), weather, recent_bias_correction=0.75
+    )
+    disabled = _forecast(monkeypatch, tmp_path, _Backend(), weather)
+    settings = _selection_settings(enabled.config)
+    manifest = MLModelManifest(
+        model_id="heating",
+        backend_type="x",
+        target_type="x",
+        interval_levels=[90],
+        feature_columns=[],
+        metadata={"candidate_selection": settings},
+    )
+    assert _selection_settings_match(manifest, enabled.config)
+    assert not _selection_settings_match(manifest, disabled.config)
+
+    # An artifact from before the setting existed was trained without it.
+    settings.pop("recent_bias_correction")
+    assert _selection_settings_match(manifest, disabled.config)
+    assert not _selection_settings_match(manifest, enabled.config)

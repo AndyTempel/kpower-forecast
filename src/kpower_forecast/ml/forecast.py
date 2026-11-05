@@ -980,14 +980,8 @@ class KPowerMLForecast:
         winner = self._select(metrics)
         choices = self._leave_one_out_choices(windows, names, origins, winner, blend)
         conformal_actual = [windows[o]["actual"] for o in origins]
-        # Each origin's correction comes from the other origins, like its choice.
-        conformal_predicted = [
-            windows[o][choices[o]]
-            * self._recent_bias_factor(
-                windows, [other for other in origins if other != o], choices[o]
-            )
-            for o in origins
-        ]
+        factors = self._held_out_bias_factors(windows, origins, choices, blend)
+        conformal_predicted = [windows[o][choices[o]] * factors[o] for o in origins]
 
         self.selected_candidate = winner
         self.candidate_metrics = {name: m.as_dict() for name, m in metrics.items()}
@@ -1010,6 +1004,31 @@ class KPowerMLForecast:
             pd.Series(np.concatenate(conformal_actual)),
             pd.Series(np.concatenate(conformal_predicted)),
         )
+
+    def _held_out_bias_factors(
+        self,
+        windows: dict[pd.Timestamp, dict[str, np.ndarray]],
+        origins: list[pd.Timestamp],
+        choices: dict[pd.Timestamp, str],
+        blend: bool,
+    ) -> dict[pd.Timestamp, float]:
+        """Return each origin's correction, free of that origin's actuals.
+
+        Like the choices, blend predictions are rebuilt per held-out origin,
+        because the other origins' blend weights were fitted on its actuals.
+        """
+        if self.config.recent_bias_correction <= 0.0:
+            return dict.fromkeys(origins, 1.0)
+        factors: dict[pd.Timestamp, float] = {}
+        for origin in origins:
+            fold = (
+                self._with_blend(windows, origins, held_out=origin)
+                if blend
+                else windows
+            )
+            others = [other for other in origins if other != origin]
+            factors[origin] = self._recent_bias_factor(fold, others, choices[origin])
+        return factors
 
     def _recent_bias_factor(
         self,
@@ -1351,9 +1370,7 @@ class KPowerMLForecast:
             raise ForecastAlignmentError(
                 "stored recent-bias ratio is invalid; a full retrain is required"
             )
-        self._recent_bias_ratio = (
-            float(ratio) if self.config.recent_bias_correction > 0.0 else 1.0
-        )
+        self._recent_bias_ratio = float(ratio)
         if self.selected_candidate not in ALL_SELECTION_CANDIDATES:
             raise ForecastAlignmentError(
                 f"stored candidate {self.selected_candidate!r} is unknown; a full "
@@ -1669,8 +1686,7 @@ def _selection_settings(config: KPowerMLConfig) -> dict[str, Any]:
         settings["min_origins"] = config.selection_min_origins
         settings["bias_tolerance"] = config.selection_bias_tolerance
         settings["bias_floor_kw"] = config.selection_bias_floor_kw
-        if config.recent_bias_correction > 0.0:
-            settings["recent_bias_correction"] = config.recent_bias_correction
+        settings["recent_bias_correction"] = config.recent_bias_correction
     return settings
 
 
@@ -1681,9 +1697,10 @@ def _selection_settings_match(
     stored = manifest.metadata.get("candidate_selection")
     stored = stored if isinstance(stored, dict) else {}
     expected = _selection_settings(config)
+    # Settings added later default to what artifacts without them were trained on.
+    defaults: dict[str, Any] = {"enabled": False, "recent_bias_correction": 0.0}
     return all(
-        stored.get(key, False if key == "enabled" else None) == value
-        for key, value in expected.items()
+        stored.get(key, defaults.get(key)) == value for key, value in expected.items()
     )
 
 
