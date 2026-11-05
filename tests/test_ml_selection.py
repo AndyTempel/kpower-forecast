@@ -798,3 +798,70 @@ def test_disabling_bias_correction_requires_a_retrain(monkeypatch, tmp_path) -> 
     settings.pop("recent_bias_correction")
     assert _selection_settings_match(manifest, disabled.config)
     assert not _selection_settings_match(manifest, enabled.config)
+
+
+def test_a_rejected_retrain_leaves_the_instance_on_its_stored_model(
+    monkeypatch, tmp_path
+) -> None:
+    class GapTolerantBackend(_Backend):
+        gap_tolerant = True
+        minimum_contiguous_training_rows = 8
+
+    weather = _weather("2026-01-05", _HOURS + 24)
+    past = weather.iloc[:_HOURS]
+    history = pd.DataFrame({"ds": past["ds"], "y": _heating(past)})
+    forecast = _forecast(
+        monkeypatch,
+        tmp_path,
+        GapTolerantBackend(),
+        weather,
+        candidate_selection=False,
+    )
+    forecast.train(history.head(_HOURS - 40), force=True)
+    trained_until = forecast.training_end
+    before = forecast.storage.load_manifest()
+    restored: list[str] = []
+    monkeypatch.setattr(
+        forecast.backend, "load", lambda path: restored.append("load"), raising=False
+    )
+
+    # New rows, but only 20 after a gap: too short a tail to calibrate on.
+    with pytest.raises(ValueError, match="latest contiguous history requires"):
+        forecast.train(history.drop(history.index[-26:-20]), force=True)
+
+    assert forecast.training_end == trained_until
+    assert forecast.storage.load_manifest() == before
+    assert restored == ["load"]
+
+    # A damaged stored model must not replace that error or leave a cutoff.
+    def damaged(path: object) -> None:
+        raise EOFError("truncated")
+
+    monkeypatch.setattr(forecast.backend, "load", damaged, raising=False)
+    with pytest.raises(ValueError, match="latest contiguous history requires"):
+        forecast.train(history.drop(history.index[-26:-20]), force=True)
+    assert forecast.training_end is None
+
+
+def test_a_rejected_first_fit_cannot_predict(monkeypatch, tmp_path) -> None:
+    class GapTolerantBackend(_Backend):
+        gap_tolerant = True
+        minimum_contiguous_training_rows = 8
+
+    weather = _weather("2026-01-05", _HOURS + 24)
+    past = weather.iloc[:_HOURS]
+    history = pd.DataFrame({"ds": past["ds"], "y": _heating(past)})
+    forecast = _forecast(
+        monkeypatch,
+        tmp_path,
+        GapTolerantBackend(),
+        weather,
+        candidate_selection=False,
+    )
+
+    with pytest.raises(ValueError, match="latest contiguous history requires"):
+        forecast.train(history.drop(history.index[-26:-20]), force=True)
+
+    assert forecast.training_end is None
+    with pytest.raises(ForecastAlignmentError, match="cutoff is not available"):
+        forecast.predict(days=1)

@@ -282,6 +282,7 @@ class KPowerMLForecast:
         ):
             # Selection fell back to the tail, and after a recent gap that tail
             # is too short to calibrate bands on.
+            self._restore_after_rejected_retrain(existing_manifest)
             raise ValueError(
                 "latest contiguous history requires more rows: "
                 f"{int(calibration_actual.notna().sum())} calibration rows, "
@@ -1445,6 +1446,28 @@ class KPowerMLForecast:
         if pd.isna(numeric[0]):
             raise ValueError(f"invalid numeric value: {value!r}")
         return float(numeric[0])
+
+    def _restore_after_rejected_retrain(self, manifest: MLModelManifest | None) -> None:
+        """Put this instance back on its stored model after a rejected retrain.
+
+        The rejected attempt has refit the backend and moved the cutoff. Without
+        a restorable model the cutoff is cleared, so prediction fails plainly
+        instead of with a misaligned model.
+        """
+        self._training_end = None
+        if manifest is None:
+            return
+        try:
+            self._restore_from_manifest(manifest)
+        except Exception:  # noqa: BLE001
+            # The retrain's own error is what the caller must see; a partial
+            # restore must not serve.
+            self._training_end = None
+            logger.warning(
+                "Could not restore %s after a rejected retrain",
+                self.config.model_id,
+                exc_info=True,
+            )
 
     def _archive_fallback_allowed(self, manifest: MLModelManifest | None) -> bool:
         """Whether training may fall back from archived forecasts to the archive.
