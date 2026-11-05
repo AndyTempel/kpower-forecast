@@ -131,6 +131,11 @@ class NixtlaHybridBackend:
         return 24 if self.config.interval_minutes == 60 else 96
 
     @property
+    def minimum_total_training_rows(self) -> int:
+        """Return the observed rows a gap-tolerant fit needs in total."""
+        return self._seasonal_length + 1 if self.gap_tolerant else 1
+
+    @property
     def minimum_contiguous_training_rows(self) -> int:
         """Return the contiguous tail rows kept in training before calibration."""
         if self.gap_tolerant:

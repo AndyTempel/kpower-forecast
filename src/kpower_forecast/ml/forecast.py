@@ -1526,8 +1526,19 @@ class KPowerMLForecast:
         calibration_size = max(
             1, int(len(latest_indices) * self.config.calibration_fraction)
         )
+        # A gap-tolerant fit needs its rows in total, so calibration only takes
+        # what training can spare; a site is ready as soon as it has them.
+        minimum_total_rows = int(
+            getattr(self.backend, "minimum_total_training_rows", 1)
+        )
+        spare_rows = len(observed) - minimum_total_rows
+        if spare_rows < 1:
+            raise ValueError(
+                "training history requires at least "
+                f"{minimum_total_rows + 1} rows to reserve calibration data"
+            )
         calibration_size = min(
-            calibration_size, len(latest_indices) - minimum_training_rows
+            calibration_size, len(latest_indices) - minimum_training_rows, spare_rows
         )
         calibration_indices = latest_indices[-calibration_size:]
         if bridged is not None:

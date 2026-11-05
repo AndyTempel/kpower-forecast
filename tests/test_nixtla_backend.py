@@ -11,7 +11,7 @@ from kpower_forecast.ml.config import (
     MLBackendType,
     MLForecastType,
 )
-from kpower_forecast.ml.forecast import _structure_matches
+from kpower_forecast.ml.forecast import KPowerMLForecast, _structure_matches
 
 
 def test_non_solar_targets_do_not_fit_solar_radiation_baseline() -> None:
@@ -580,3 +580,29 @@ def test_profile_direct_still_needs_a_day_of_observed_rows() -> None:
 
     with pytest.raises(ValueError, match="requires at least 97 observed rows"):
         _profile_direct_backend().fit(history, _calendar_features(ds), history.tail(4))
+
+
+def test_calibration_never_takes_rows_a_gap_tolerant_fit_needs(tmp_path) -> None:
+    """The first day of history must train, not wait for 20 % more rows."""
+    pytest.importorskip("lightgbm")
+    ds = pd.Series(pd.date_range("2026-09-01", periods=100, freq="15min", tz="UTC"))
+    history = pd.DataFrame({"ds": ds, "y": 0.25})
+    forecast = KPowerMLForecast(
+        model_id="consumption",
+        latitude=46.0,
+        longitude=14.0,
+        storage_path=str(tmp_path),
+        interval_minutes=15,
+        forecast_type=MLForecastType.CONSUMPTION,
+        backend=MLBackendType.NIXTLA_HYBRID,
+        preserve_gaps=True,
+        hybrid_structure=HybridStructure.PROFILE_DIRECT,
+    )
+    features = forecast.feature_builder.build(history)
+
+    _, _, train, calibration = forecast._gap_safe_training_split(history, features)
+
+    assert len(train) == 97
+    assert len(calibration) == 3
+    with pytest.raises(ValueError, match="training history requires at least 98"):
+        forecast._gap_safe_training_split(history.head(97), features.head(97))
