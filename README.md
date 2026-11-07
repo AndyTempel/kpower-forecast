@@ -145,6 +145,30 @@ curtailment. `predict(dynamic_export_limits=...)` also accepts a dataframe with
 
 ---
 
+## HVAC evaluation inputs
+
+`kpower_forecast.hvac.HvacEvaluationBundle` reads manifest-inventoried electrical
+HVAC observations independently of the model backends. It verifies file hashes,
+local file paths and the UTC minute-index contract while preserving missing
+power and observation-quality columns. Loading source evidence does not qualify
+it for training or planning.
+
+```python
+from pathlib import Path
+from kpower_forecast.hvac import HvacEvaluationBundle
+
+bundle = HvacEvaluationBundle.load(Path("evaluation_bundle"))
+# Requires measured ingest_lag_min in manifest.json; never guesses a lag.
+history = bundle.available_at(origin)  # aware UTC datetime
+```
+
+The version-1 manifest records export/start/end times, controller/device identity,
+site timezone and coordinates, EMS revision, optional measured ingestion lag,
+readiness and an inventory of SHA-256 hashes and formats. Each artifact is a
+local filename with format `parquet` or `json`; `minutes.parquet` and
+`capabilities.json` are required. This input API preserves source evidence and
+does not implement the electrical HVAC prediction model.
+
 ## Passive thermal response model
 
 `kpower_forecast.thermal` is a separate, lightweight heating-regime API. It
