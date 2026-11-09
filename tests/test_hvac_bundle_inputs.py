@@ -197,3 +197,13 @@ def test_previous_runs_selects_required_lead_and_day0_is_explicitly_optimistic(b
     day0["vintage_kind"] = "unknown"
     with pytest.raises(ValueError, match="unknown weather"):
         _origin_weather(day0, T0)
+
+
+def test_unobserved_optional_sensor_metadata_is_not_past_lineage(bundle):
+    minutes = bundle.tables["minutes.parquet"]
+    minutes["outdoor_unit_c"] = float("nan")
+    minutes["outdoor_unit_c__measured_valid"] = False
+    minutes["outdoor_unit_c__source_device"] = "future-companion"
+    view = bundle.available_at(T0, include_inputs=True)
+    assert "outdoor_unit_c__source_device" not in view.training.lineage
+    assert view.training.lineage["power_w__source_device"] == "hp"

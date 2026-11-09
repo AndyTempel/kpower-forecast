@@ -690,7 +690,18 @@ def _bundle_snapshot(
     lineage = {"controller": manifest.controller_id, "device": manifest.device_id}
     for column in minutes:
         if isinstance(column, str) and column.endswith("__source_device"):
-            known_source = minutes[column].dropna()
+            signal = column.removesuffix("__source_device")
+            valid = minutes.get(
+                signal, pd.Series(index=minutes.index, dtype=float)
+            ).notna()
+            valid &= minutes.get(
+                signal + "__measured_valid", pd.Series(False, index=minutes.index)
+            ).eq(True)
+            if signal + "__quality" in minutes:
+                valid &= minutes[signal + "__quality"].isin(
+                    policy.measured_valid_qualities
+                )
+            known_source = minutes.loc[valid, column].dropna()
             if len(known_source):
                 lineage[column] = str(known_source.iloc[-1])
     training = HvacTrainingData(
@@ -776,7 +787,7 @@ def _bundle_snapshot(
             {
                 "scope": manifest.metadata.get("scope", "development"),
                 "epoch_basis": "bundle_start",
-                "lineage_basis": "observed_source_device_ids",
+                "lineage_basis": "measured_valid_source_device_ids",
                 "tariff_source": manifest.metadata.get("tariff_source"),
             }
         ),
