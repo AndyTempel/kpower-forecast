@@ -85,3 +85,16 @@ def test_invalid_evidence_and_cooperative_cancellation_fail_loudly():
         censored_lognormal_aft([[1]], [1], [False], cancel=event)
     with pytest.raises(HvacTimeout):
         censored_lognormal_aft([[1]], [1], [False], deadline=0)
+
+
+def test_offset_only_aft_estimates_scale_without_an_unidentified_intercept():
+    rng = np.random.default_rng(45)
+    durations = np.exp(2 + 0.4 * rng.normal(size=10000))
+    result = censored_lognormal_aft(
+        np.empty((len(durations), 0)),
+        durations,
+        np.zeros(len(durations), dtype=bool),
+        offset=np.full(len(durations), 2.0),
+    )
+    assert result.converged and result.coefficients.size == 0
+    assert result.sigma == pytest.approx(0.4, rel=0.03)

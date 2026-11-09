@@ -267,6 +267,18 @@ def extract_cycles(
                 else float("nan")
             )
 
+        flag_interruptions = 0
+        flag_minutes = 0
+        if "defrost" in samples:
+            defrost_on = samples.defrost.eq(1)
+            # Merged idle positions are excluded from samples, so this counts
+            # only additional observed defrost while the compressor stayed on.
+            flag_interruptions = int(
+                (defrost_on & ~defrost_on.shift(fill_value=False)).sum()
+            )
+            flag_minutes = int(defrost_on.sum())
+            if "defrost" in power_samples:
+                power_samples = power_samples.loc[~power_samples.defrost.eq(1)]
         local = spell.start.tz_convert(cfg.timezone)
         angle = 2 * np.pi * (local.hour + local.minute / 60) / 24
         rows.append(
@@ -283,8 +295,8 @@ def extract_cycles(
                 sun=mean("sun"),
                 hour_sin=float(np.sin(angle)),
                 hour_cos=float(np.cos(angle)),
-                defrost_interruptions=spell.interruptions,
-                defrost_minutes=spell.interruption_minutes,
+                defrost_interruptions=spell.interruptions + flag_interruptions,
+                defrost_minutes=spell.interruption_minutes + flag_minutes,
                 power_w=(
                     float(power_samples.power_w.median())
                     if len(power_samples)
@@ -294,7 +306,19 @@ def extract_cycles(
                 first_after_off=spell.kind == "run" and waiting_after_off,
             )
         )
-        for event in changed.itertuples():
+        response_events = changed
+        if spell.kind == "idle":
+            previous_mode = modes_at(
+                pd.DatetimeIndex([spell.start - pd.Timedelta(1, unit="ns")]),
+                events,
+                cfg.reference_mode,
+            ).iloc[0]
+            if previous_mode in cfg.off_modes:
+                boundary_events = events.loc[events.time.eq(spell.start)]
+                response_events = pd.concat(
+                    [boundary_events, changed], ignore_index=True
+                )
+        for event in response_events.itertuples():
             at = cast(pd.Timestamp, event.time)
             before = modes_at(
                 pd.DatetimeIndex([at - pd.Timedelta(1, unit="ns")]),

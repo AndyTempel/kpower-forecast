@@ -110,3 +110,22 @@ def test_first_recovery_run_remains_marked_after_intervening_idle(config):
     assert result.sojourns.loc[
         result.sojourns.kind.eq("run"), "first_after_off"
     ].tolist() == [True]
+
+    switch = result.mode_switches.iloc[0]
+    assert (
+        switch.from_mode,
+        switch.to_mode,
+        switch.state,
+        switch.elapsed_min,
+        switch.outcome_min,
+    ) == ("OFF", "NORMAL", "idle", 0.0, 5.0)
+
+
+def test_compressor_on_defrost_is_excluded_from_steady_run_power(config, trace):
+    frame, events = trace
+    frame.loc[frame.index[72:75], "defrost"] = 1.0
+    frame.loc[frame.index[72:75], "power_w"] = 9000.0
+    result = extract_cycles(frame, events, config)
+    run = result.sojourns.loc[result.sojourns.start.eq(frame.index[70])].iloc[0]
+    assert run.defrost_interruptions == 1 and run.defrost_minutes == 3
+    assert run.power_w == 4500.0

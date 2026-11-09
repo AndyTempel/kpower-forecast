@@ -8,7 +8,7 @@ by damped Newton steps, including the scale parameter and ridge penalties.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import erfc, pi
+from math import erfc, pi, sqrt
 from threading import Event
 from time import monotonic
 
@@ -19,6 +19,7 @@ from .types import HvacCancelled, HvacError, HvacTimeout
 
 FloatArray = NDArray[np.float64]
 _LOG_2PI: float = float(np.log(2 * pi))
+_SQRT_2: float = sqrt(2.0)
 
 
 def check_budget(cancel: Event | None, deadline: float | None) -> None:
@@ -87,7 +88,7 @@ def normal_logsf(z: ArrayLike) -> FloatArray:
     # log-likelihood in the far tail. Use the stdlib erfc for log-survival;
     # the asymptotic branch then avoids erfc underflow at extreme censoring.
     tails = np.fromiter(
-        (0.5 * erfc(float(v) / np.sqrt(2)) for v in x.ravel()),
+        (0.5 * erfc(float(v) / _SQRT_2) for v in x.ravel()),
         dtype=float,
         count=x.size,
     ).reshape(x.shape)
@@ -176,9 +177,13 @@ def _aft_objective(
     beta, eta = theta[:-1], theta[-1]
     sigma = np.exp(eta)
     z = (y - offset - x @ beta) / sigma
-    lam = np.exp(-0.5 * z**2 - 0.5 * _LOG_2PI - normal_logsf(z))
+    lam = np.zeros_like(z)
+    ll = -eta - 0.5 * z**2 - 0.5 * _LOG_2PI - y
+    if censored.any():
+        survival = normal_logsf(z[censored])
+        lam[censored] = np.exp(-0.5 * z[censored] ** 2 - 0.5 * _LOG_2PI - survival)
+        ll[censored] = survival
     prime = lam * (lam - z)
-    ll = np.where(censored, normal_logsf(z), -eta - 0.5 * z**2 - 0.5 * _LOG_2PI - y)
     sb = np.where(censored, lam, z) / sigma
     se = np.where(censored, lam * z, z**2 - 1)
     hbb = -np.where(censored, prime, 1) / sigma**2
@@ -236,7 +241,6 @@ def censored_lognormal_aft(
         or c.shape != t.shape
         or c.dtype != bool
         or not len(t)
-        or x.shape[1] < 1
         or not np.isfinite(x).all()
         or not np.isfinite(t).all()
         or (t <= 0).any()
