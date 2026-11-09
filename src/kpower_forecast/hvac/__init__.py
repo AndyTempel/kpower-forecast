@@ -2,6 +2,12 @@
 
 from .bundle import HvacEvaluationBundle
 from .model import KPowerHvacForecast, fingerprint
+from .settlement import (
+    BlockSettlement,
+    SettlementNeed,
+    SettlementWindow,
+    settlement_need,
+)
 from .types import (
     HVAC_CONTRACT_VERSION,
     HVAC_ESTIMATOR_VERSION,
@@ -30,6 +36,7 @@ from .types import (
 __all__ = [
     "HVAC_CONTRACT_VERSION",
     "HVAC_ESTIMATOR_VERSION",
+    "BlockSettlement",
     "FitResult",
     "GridInterval",
     "HistoryPolicy",
@@ -52,5 +59,8 @@ __all__ = [
     "ModeSpan",
     "RatedPoint",
     "SojournEnd",
+    "SettlementNeed",
+    "SettlementWindow",
     "fingerprint",
+    "settlement_need",
 ]
