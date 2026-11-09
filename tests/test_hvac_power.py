@@ -53,3 +53,32 @@ def test_power_regression_resists_an_outlier_and_retains_observed_standby_ramp(
     assert result.idle_default_w == 60 and result.off_w == 25
     assert result.defrost_w is None and result.metered_scope is MeteredScope.WHOLE_UNIT
     assert result.run_power(7.0, 35.0) == pytest.approx(4000.0)
+
+
+def test_control_setpoint_is_a_recorded_alternative_not_mixed_with_supply(power_trace):
+    frame, runs, events = power_trace
+    setpoint = runs.rename(columns={"supply_c": "control_setpoint_c"})
+    result = fit_power(
+        frame,
+        setpoint,
+        events,
+        HvacModelConfig(model_id="power", timezone="UTC"),
+        MeteredScope.WHOLE_UNIT,
+    )
+    assert result.uses_supply and result.temperature_source == "control_setpoint_c"
+    np.testing.assert_allclose(result.coefficients, [4000.0, -20.0, 30.0], atol=1e-5)
+    assert result.supply_reference_c == pytest.approx(
+        setpoint.control_setpoint_c.mean()
+    )
+    # A supported measured supply series takes precedence; sources are not mixed.
+    both = runs.copy()
+    both["control_setpoint_c"] = 50.0
+    supply = fit_power(
+        frame,
+        both,
+        events,
+        HvacModelConfig(model_id="power", timezone="UTC"),
+        MeteredScope.WHOLE_UNIT,
+    )
+    assert supply.temperature_source == "supply_c"
+    np.testing.assert_allclose(supply.coefficients, [4000.0, -20.0, 30.0], atol=1e-5)

@@ -127,6 +127,7 @@ def extract_cycles(
         "defrost_minutes",
         "power_w",
         "supply_c",
+        "control_setpoint_c",
         "first_after_off",
     ]
     switch_columns = [
@@ -303,6 +304,7 @@ def extract_cycles(
                     else float("nan")
                 ),
                 supply_c=mean("supply_c"),
+                control_setpoint_c=mean("control_setpoint_c"),
                 first_after_off=spell.kind == "run" and waiting_after_off,
             )
         )

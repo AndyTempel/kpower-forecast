@@ -27,7 +27,7 @@ from kpower_forecast import __version__
 from ._stats import censored_lognormal_aft, check_budget
 from .aggregate import interval_stats, representatives
 from .cycle_model import CycleFit, fit_cycles
-from .cycles import extract_cycles
+from .cycles import extract_cycles, modes_at
 from .families import EnergyFit, energy_paths, fit_energy
 from .frames import (
     history_verdict,
@@ -262,6 +262,7 @@ def _fit_candidate(
     control = _events_at(data.control_events, as_of)
     weather = _weather_at(data.weather, as_of, history=True)
     frame = outdoor_frame(frame, weather, cfg)
+    frame["mode"] = modes_at(pd.DatetimeIndex(frame.index), events, cfg.reference_mode)
     quality = history_verdict(frame, data.history_policy, as_of=as_of)
     diagnostic: dict[str, JsonValue] = {
         **asdict(quality),
@@ -599,9 +600,13 @@ def _predict_candidate(
             uncertain_off=any(s.end_uncertain for s in request.schedule),
             off_elapsed_min=off_elapsed,
         )
+        temperature_source = state.power.temperature_source or "supply_c"
         supply = (
-            recent.supply_c.dropna() if "supply_c" in recent else pd.Series(dtype=float)
+            recent[temperature_source].dropna()
+            if temperature_source in recent
+            else pd.Series(dtype=float)
         )
+        diagnostic["power_temperature_source"] = state.power.temperature_source
         supply_now = (
             float(supply.iloc[-1])
             if len(supply)

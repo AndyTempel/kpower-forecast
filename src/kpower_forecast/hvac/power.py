@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, cast
+from typing import Literal, Mapping, cast
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,7 @@ class PowerFit:
     diagnostics: tuple[str, ...]
     supply_reference_c: float = 35.0
     defrost_running_share: float = 0.0
+    temperature_source: Literal["supply_c", "control_setpoint_c"] | None = None
 
     def run_power(
         self, outdoor_c: ArrayLike, supply_c: ArrayLike = 35.0
@@ -38,7 +39,8 @@ class PowerFit:
 
         Args:
             outdoor_c: Outdoor temperatures.
-            supply_c: Supply/setpoint temperature when fitted, otherwise unused.
+            supply_c: The recorded supply or control-setpoint covariate when
+                fitted, otherwise unused. The caller must preserve its source.
 
         Returns:
             Nonnegative run electrical watts, in the declared meter scope.
@@ -81,12 +83,17 @@ def fit_power(
     )
     if len(runs) < 3:
         raise HvacError("insufficient_run_power")
-    use_supply = bool("supply_c" in runs and runs.supply_c.notna().sum() >= 3)
+    temperature_source: Literal["supply_c", "control_setpoint_c"] | None = None
+    if "supply_c" in runs and runs.supply_c.notna().sum() >= 3:
+        temperature_source = "supply_c"
+    elif "control_setpoint_c" in runs and runs.control_setpoint_c.notna().sum() >= 3:
+        temperature_source = "control_setpoint_c"
+    use_supply = temperature_source is not None
     if use_supply:
-        runs = runs.dropna(subset=["supply_c"])
+        runs = runs.dropna(subset=[cast(str, temperature_source)])
     columns = [np.ones(len(runs)), runs.outdoor_c.to_numpy() - 7]
     if use_supply:
-        columns.append(runs.supply_c.to_numpy() - 35)
+        columns.append(runs[cast(str, temperature_source)].to_numpy() - 35)
     design = np.column_stack(columns)
     coefficients = huber_regression(design, runs.power_w.to_numpy())
     residual = runs.power_w.to_numpy() - design @ coefficients
@@ -140,6 +147,7 @@ def fit_power(
         float(np.median(defrost)) if defrost else None,
         scope,
         tuple(diagnostics),
-        float(runs.supply_c.mean()) if use_supply else 35.0,
+        float(runs[cast(str, temperature_source)].mean()) if use_supply else 35.0,
         float(np.mean(defrost_on)) if defrost_on else 0.0,
+        temperature_source,
     )

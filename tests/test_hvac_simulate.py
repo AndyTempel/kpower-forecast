@@ -435,3 +435,176 @@ def test_automation_can_hide_a_comfort_release_without_re_latching_it(setup):
     assert (
         modes[:, 17:60] == "NORMAL"
     ).all()  # release sampled at origin, age30, not age47
+
+
+def test_off_command_exactly_at_origin_resets_off_age_and_applies_switch(setup):
+    from dataclasses import replace
+
+    cfg, _, fit, power, request, initial = setup
+    cfg = cfg.model_copy(update={"n_paths": 64})
+    initial = replace(
+        initial,
+        running=initial.running[:64],
+        elapsed_min=np.full(64, 35.0),
+        remaining_min=initial.remaining_min[:64],
+        water_draw=initial.water_draw[:64],
+    )
+    modes = np.full((64, 720), "NORMAL")
+    modes[:, :30] = "OFF"
+    cap = HvacCapabilities(family="fixed_speed", fingerprint="test")
+    command = simulate(
+        request,
+        fit,
+        power,
+        initial,
+        cfg,
+        cap,
+        np.full(modes.shape, 7.0, np.float32),
+        np.zeros(720),
+        modes,
+        np.random.default_rng(18),
+    ).paths
+    already_off = replace(
+        initial,
+        running=np.zeros(64, bool),
+        elapsed_min=np.zeros(64),
+        remaining_min=np.full(64, np.inf),
+    )
+    reference = simulate(
+        replace(request, last_mode="OFF"),
+        fit,
+        power,
+        already_off,
+        cfg,
+        cap,
+        np.full(modes.shape, 7.0, np.float32),
+        np.zeros(720),
+        modes,
+        np.random.default_rng(18),
+    ).paths
+    assert not command.running[:, :30].any()
+    np.testing.assert_array_equal(command.power_w, reference.power_w)
+
+
+@pytest.mark.parametrize("water_first", [None, 50.0])
+def test_off_release_counts_elapsed_minimum_and_preserves_water_first_start(
+    setup, water_first
+):
+    from dataclasses import replace
+
+    from kpower_forecast.hvac.cycle_model import SwitchEffect
+
+    cfg, _, fit, power, request, initial = setup
+    cfg = cfg.model_copy(update={"n_paths": 64})
+    fit = replace(
+        fit,
+        switch_effects=(SwitchEffect("OFF", "NORMAL", "idle", np.log(0.1), 0.01, 20),),
+    )
+    initial = replace(
+        initial,
+        running=np.zeros(64, bool),
+        elapsed_min=np.full(64, 30.0),
+        remaining_min=np.full(64, water_first if water_first else np.inf),
+        water_draw=np.full(64, water_first is not None),
+    )
+    modes = np.full((64, 720), "NORMAL")
+    modes[:, :30] = "OFF"
+    result = simulate(
+        replace(request, last_mode="OFF"),
+        fit,
+        power,
+        initial,
+        cfg,
+        HvacCapabilities(
+            family="fixed_speed", fingerprint="test", min_off_minutes=15.0
+        ),
+        np.full(modes.shape, 7.0, np.float32),
+        np.zeros(720),
+        modes,
+        np.random.default_rng(19),
+    ).paths
+    first = np.argmax(result.starts, axis=1)
+    np.testing.assert_array_equal(first, np.full(64, 31 if water_first is None else 50))
+
+
+def test_zero_demand_idle_resumes_on_cooling_without_aging_during_zero_demand(setup):
+    from dataclasses import replace
+
+    cfg, _, fit, power, request, initial = setup
+    n = cfg.n_paths
+    initial = replace(
+        initial,
+        running=np.zeros(n, bool),
+        elapsed_min=np.full(n, 120.0),
+        remaining_min=np.full(n, np.inf),
+    )
+    temperature = np.full((n, 720), 7.0, np.float32)
+    temperature[:, :60] = 25.0
+    modes = np.full(temperature.shape, "NORMAL")
+    result = simulate(
+        request,
+        fit,
+        power,
+        initial,
+        cfg,
+        HvacCapabilities(family="fixed_speed", fingerprint="test"),
+        temperature,
+        np.zeros(720),
+        modes,
+        np.random.default_rng(19),
+    )
+    assert not result.paths.running[:, :60].any()
+    first = np.argmax(result.paths.starts, axis=1)
+    assert np.median(first) == pytest.approx(105.0, abs=3.0)
+    assert "zero_demand_idle_resumed" in result.diagnostics
+    locked = replace(initial, lockout_min=180.0)
+    result = simulate(
+        request,
+        fit,
+        power,
+        locked,
+        cfg,
+        HvacCapabilities(family="fixed_speed", fingerprint="test"),
+        temperature,
+        np.zeros(720),
+        modes,
+        np.random.default_rng(19),
+    )
+    assert not result.paths.running[:, :180].any()
+
+
+def test_idle_before_an_off_command_also_counts_toward_minimum_off(setup):
+    from dataclasses import replace
+
+    from kpower_forecast.hvac.cycle_model import SwitchEffect
+
+    cfg, _, fit, power, request, initial = setup
+    cfg = cfg.model_copy(update={"n_paths": 64})
+    fit = replace(
+        fit,
+        switch_effects=(SwitchEffect("OFF", "NORMAL", "idle", np.log(0.1), 0.01, 20),),
+    )
+    initial = replace(
+        initial,
+        running=np.zeros(64, bool),
+        elapsed_min=np.full(64, 35.0),
+        remaining_min=np.full(64, 100.0),
+        water_draw=np.zeros(64, bool),
+    )
+    modes = np.full((64, 720), "NORMAL")
+    modes[:, :30] = "OFF"
+    result = simulate(
+        request,
+        fit,
+        power,
+        initial,
+        cfg,
+        HvacCapabilities(
+            family="fixed_speed", fingerprint="test", min_off_minutes=60.0
+        ),
+        np.full(modes.shape, 7.0, np.float32),
+        np.zeros(720),
+        modes,
+        np.random.default_rng(19),
+    ).paths
+    np.testing.assert_array_equal(np.argmax(result.starts, axis=1), np.full(64, 31))

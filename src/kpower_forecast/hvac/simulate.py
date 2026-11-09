@@ -237,8 +237,9 @@ def simulate(
         and power.defrost_w is None
     ):
         raise HvacError("defrost rate has no measured interruption power")
-    labels, codes = np.unique(modes, return_inverse=True)
-    mode = np.asarray(codes.reshape(n, horizon), dtype=np.int64)
+    actual_mode = request.last_mode or cfg.reference_mode
+    labels = np.union1d(np.unique(modes), [actual_mode])
+    mode = np.asarray(np.searchsorted(labels, modes), dtype=np.int64)
     is_off = np.isin(labels, list(cfg.off_modes))
     # Next schedule boundary per path; no Python per-minute scan.
     boundary = np.concatenate(
@@ -253,8 +254,9 @@ def simulate(
     angle = 2 * np.pi * (local.hour + local.minute / 60) / 24
     cov = np.column_stack([sun, np.sin(angle), np.cos(angle)])
     all_ids = np.arange(n, dtype=np.int64)
+    current_mode = np.full(n, int(np.searchsorted(labels, actual_mode)), dtype=np.int64)
     state = initial.running.copy()
-    state[is_off[mode[:, 0]]] = False
+    state[is_off[current_mode]] = False
     elapsed = initial.elapsed_min.copy()
     began = -elapsed
     offset = (request.origin - start).total_seconds() / 60
@@ -267,10 +269,10 @@ def simulate(
     )
     remaining[~state] = np.maximum(remaining[~state], initial.lockout_min)
     natural = offset + remaining
-    natural[is_off[mode[:, 0]]] = np.inf
+    natural[is_off[current_mode]] = np.inf
     mi, mr, overloaded, depth = rates.at(
         all_ids,
-        mode[:, 0],
+        current_mode,
         outdoor_c[:, 0].astype(float),
         np.broadcast_to(cov[0], (n, 3)),
     )
@@ -285,12 +287,21 @@ def simulate(
     )
     diagnostics: set[str] = set()
     if power.uses_supply:
-        diagnostics.add(
-            "supply_held_at_origin" if supply_c is not None else "supply_from_fit_mean"
+        source = (
+            "control_setpoint"
+            if power.temperature_source == "control_setpoint_c"
+            else "supply"
         )
-    pending_recovery = is_off[mode[:, 0]].copy()
+        diagnostics.add(
+            f"{source}_held_at_origin"
+            if supply_c is not None
+            else f"{source}_from_fit_mean"
+        )
+    pending_recovery = is_off[current_mode].copy()
     water = initial.water_draw.copy()
-    off_started = np.where(is_off[mode[:, 0]], -elapsed + offset, np.nan)
+    water_start = offset + initial.remaining_min
+    no_demand_idle = ~state & np.isposinf(mi) & ~is_off[current_mode] & ~water
+    off_started = np.where(is_off[current_mode], -elapsed + offset, np.nan)
     idle_power = np.array(
         [power.idle_by_mode.get(str(m), power.idle_default_w) for m in labels]
     )
@@ -360,15 +371,21 @@ def simulate(
     while np.any(filled < horizon):
         check_budget(cancel, deadline)
         position = np.minimum(filled, horizon - 1)
-        mode_here = mode[all_ids, position]
-        # Recheck only overloaded runs at hourly covariate changes.
+        mode_here = current_mode
+        # Overload and an infinite zero-demand idle need hourly regime checks.
         hour = ((filled // 60) + 1) * 60
-        hourly = np.where(state & overloaded, hour, horizon)
+        hourly = np.where((state & overloaded) | no_demand_idle, hour, horizon)
         natural_index = np.full(n, horizon, dtype=np.int64)
         finite = np.isfinite(natural) & (natural < horizon)
         natural_index[finite] = np.ceil(natural[finite]).astype(np.int64)
         event = np.minimum.reduce(
-            [natural_index, next_mode[all_ids, position], hourly, np.full(n, horizon)]
+            [
+                natural_index,
+                next_mode[all_ids, position],
+                hourly,
+                np.full(n, horizon),
+                np.where(current_mode != mode[all_ids, position], filled, horizon),
+            ]
         )
         event = np.maximum(event, filled)
         active = filled < horizon
@@ -418,6 +435,7 @@ def simulate(
         if earliest >= horizon:
             continue
         new = mode[ids, earliest]
+        current_mode[ids] = new
         changed = new != previous
         old_state = state[ids].copy()
         old_over = overloaded[ids].copy()
@@ -435,7 +453,7 @@ def simulate(
         off_started[ids[into_off]] = earliest
         pending_recovery[ids[into_off]] = True
         natural[ids[into_off]] = np.inf
-        began[ids[into_off]] = earliest
+        began[ids[into_off & old_state]] = earliest
         for off_index in np.flatnonzero(into_off):
             defrost_start[ids[off_index]] = np.empty(0)
             defrost_on[ids[off_index]] = np.empty(0, bool)
@@ -445,8 +463,9 @@ def simulate(
             natural[out_ids] = earliest + conditional_lognormal(
                 mi_new[out_off], rates.si[out_ids], age_off, rng
             )
-            began[out_ids] = earliest
-            natural[out_ids] = np.maximum(natural[out_ids], earliest + min_off)
+            water_ids = out_ids[water[out_ids]]
+            natural[water_ids] = np.maximum(water_start[water_ids], earliest)
+            # Keep the physical off clock, including an idle before the command.
         rescale = changed & ~into_off & ~out_off & ~water[ids]
         for on_state in (False, True):
             use = rescale & (old_state == on_state)
@@ -459,6 +478,7 @@ def simulate(
         for effect in fit.switch_effects:
             use = (
                 changed
+                & ~water[ids]
                 & (labels[previous] == effect.from_mode)
                 & (labels[new] == effect.to_mode)
                 & ~is_off[new]
@@ -526,9 +546,23 @@ def simulate(
                 duration[on_new],
                 outdoor_c[newly_running, earliest].astype(float),
             )
+        resumed = no_demand_idle[ids] & ~state[ids] & ~is_off[new] & np.isfinite(mi_new)
+        if resumed.any():
+            chosen = ids[resumed]
+            natural[chosen] = earliest + conditional_lognormal(
+                mi_new[resumed], rates.si[chosen], np.zeros(len(chosen)), rng
+            )
+            diagnostics.add("zero_demand_idle_resumed")
+        no_demand_idle[ids] = (
+            ~state[ids] & ~is_off[new] & np.isposinf(mi_new) & ~water[ids]
+        )
+        natural[ids[no_demand_idle[ids]]] = np.inf
         # Minimum spells survive mode rescaling, but OFF commands always win.
         eligible = ~is_off[new]
         lower = began[ids] + np.where(state[ids], min_run, min_off)
+        lower = np.where(
+            state[ids], lower, np.maximum(lower, offset + initial.lockout_min)
+        )
         natural[ids[eligible]] = np.maximum(natural[ids[eligible]], lower[eligible])
         # A zero-residual learned/conditional event is processed at the next sample.
         natural[ids[eligible]] = np.maximum(natural[ids[eligible]], earliest + 1e-6)
