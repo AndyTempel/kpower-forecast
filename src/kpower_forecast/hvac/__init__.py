@@ -1,5 +1,53 @@
-"""Validated electrical-HVAC evaluation inputs, independent of forecasting backends."""
+"""Electrical-HVAC contracts, isolated from optional forecasting backends."""
 
 from .bundle import HvacEvaluationBundle
+from .types import (
+    HVAC_CONTRACT_VERSION,
+    HVAC_ESTIMATOR_VERSION,
+    FitResult,
+    GridInterval,
+    HistoryPolicy,
+    HvacCancelled,
+    HvacCapabilities,
+    HvacError,
+    HvacFamily,
+    HvacForecast,
+    HvacForecastRequest,
+    HvacModelConfig,
+    HvacRegime,
+    HvacTimeout,
+    HvacTrainingData,
+    InputTier,
+    IntervalStats,
+    MeteredScope,
+    MinutePaths,
+    ModeSpan,
+    RatedPoint,
+    SojournEnd,
+)
 
-__all__ = ["HvacEvaluationBundle"]
+__all__ = [
+    "HVAC_CONTRACT_VERSION",
+    "HVAC_ESTIMATOR_VERSION",
+    "FitResult",
+    "GridInterval",
+    "HistoryPolicy",
+    "HvacCancelled",
+    "HvacCapabilities",
+    "HvacError",
+    "HvacFamily",
+    "HvacEvaluationBundle",
+    "HvacForecast",
+    "HvacForecastRequest",
+    "HvacModelConfig",
+    "HvacRegime",
+    "HvacTimeout",
+    "HvacTrainingData",
+    "InputTier",
+    "IntervalStats",
+    "MeteredScope",
+    "MinutePaths",
+    "ModeSpan",
+    "RatedPoint",
+    "SojournEnd",
+]
