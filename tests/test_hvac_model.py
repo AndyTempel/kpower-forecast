@@ -281,6 +281,8 @@ def test_fixed_speed_candidate_predicts_all_paths_and_recomputes_statistics(trai
     model.install(candidate)
     result = model.predict(request)
     assert result.minute_paths.power_w.shape == (32, 120)
+    assert result.diagnostics["n_paths"] == 32
+    assert result.diagnostics["run_threshold_w"] == 200.0
     unknown = _predict_candidate(request, candidate, cfg, force_phase_unknown=True)
     assert unknown.diagnostics["phase_forced_unknown"] is True
     assert unknown.diagnostics["stationary_initial_state"] is True

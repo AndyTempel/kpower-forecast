@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Mapping, Sequence
 
+import numpy as np
 import pandas as pd
 from pydantic import JsonValue
 
@@ -258,11 +259,19 @@ def summarize(
         if not runs.empty
         else runs
     )
+    calibration_sizes: int | np.ndarray = n_paths
+    excluded_size = 0
+    if len(calibrated) and "n_paths" in calibrated:
+        sizes = pd.to_numeric(calibrated.n_paths, errors="coerce")
+        known_size = sizes.notna() & sizes.ge(2) & sizes.eq(np.floor(sizes))
+        excluded_size = int((~known_size).sum())
+        calibrated = calibrated.loc[known_size]
+        calibration_sizes = sizes.loc[known_size].to_numpy(dtype=np.int64)
     fit = (
         calibration_slope(
             calibrated.probability.to_numpy(dtype=float),
             calibrated.actual_run.to_numpy(dtype=float),
-            n_paths=n_paths,
+            n_paths=calibration_sizes,
         )
         if len(calibrated)
         else None
@@ -282,6 +291,7 @@ def summarize(
             if fit
             else {"reason": "no_eligible_run_pairs", "observations": 0}
         ),
+        "excluded_unknown_ensemble_size": excluded_size,
     }
     for key in ("A6", "A7"):
         value = (hard_gates or {}).get(key)

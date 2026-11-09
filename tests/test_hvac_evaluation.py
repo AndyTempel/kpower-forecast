@@ -66,6 +66,16 @@ def test_logistic_calibration_recovers_slope_and_reports_unidentifiable_cases():
     assert fit.reason is None
     assert fit.slope == pytest.approx(1.0, abs=0.08)
     assert fit.intercept == pytest.approx(0.0, abs=0.08)
+    sizes = np.resize(np.array([128, 256], dtype=np.int64), len(probability))
+    boundary = probability.copy()
+    boundary[:100] = 0
+    boundary[-100:] = 1
+    varying = calibration_slope(boundary, actual, n_paths=sizes)
+    explicit = calibration_slope(
+        np.clip(boundary, 0.5 / sizes, 1 - 0.5 / sizes), actual, n_paths=100000
+    )
+    assert varying.slope == pytest.approx(explicit.slope)
+    assert varying.intercept == pytest.approx(explicit.intercept)
     assert (
         calibration_slope(
             np.array([0.0, 0.0, 1.0, 1.0]), np.array([0.0, 0.0, 1.0, 1.0]), n_paths=256

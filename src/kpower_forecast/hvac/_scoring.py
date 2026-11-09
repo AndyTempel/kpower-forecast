@@ -162,6 +162,7 @@ def run_scores(
                         "model": name,
                         "eligible": eligible,
                         "probability": p[i],
+                        "n_paths": len(forecast.minute_paths.power_w),
                         "actual_run": outcomes.ran[i],
                         "brier": (p[i] - outcomes.ran[i]) ** 2 if eligible else np.nan,
                     }

@@ -274,7 +274,10 @@ class CalibrationFit:
 
 
 def calibration_slope(
-    probability: NDArray[np.float64], actual: NDArray[np.float64], *, n_paths: int
+    probability: NDArray[np.float64],
+    actual: NDArray[np.float64],
+    *,
+    n_paths: int | NDArray[np.int64],
 ) -> CalibrationFit:
     """Fit the maintainer-approved logistic calibration definition for A5.
 
@@ -291,11 +294,17 @@ def calibration_slope(
         ValueError: For malformed probabilities, actuals or path count.
     """
     p, y = _binary_inputs(probability, actual)
-    if isinstance(n_paths, bool) or n_paths < 2:
+    sizes = np.asarray(n_paths)
+    if (
+        sizes.dtype.kind not in "iu"
+        or sizes.dtype.kind == "b"
+        or sizes.shape not in ((), p.shape)
+        or (sizes < 2).any()
+    ):
         raise HvacError("calibration requires at least two paths")
     if len(p) < 3 or np.unique(y).size < 2:
         return CalibrationFit(None, None, len(p), "insufficient_outcome_variation")
-    clipped = np.clip(p, 0.5 / n_paths, 1 - 0.5 / n_paths)
+    clipped = np.clip(p, 0.5 / sizes, 1 - 0.5 / sizes)
     logit = np.log(clipped) - np.log1p(-clipped)
     x = np.column_stack([np.ones(len(p)), logit])
     if np.linalg.matrix_rank(x) < 2:

@@ -544,6 +544,8 @@ def _predict_candidate(
             comfort = found
     modes, assumptions = schedule_modes(request, cfg, index, rng, comfort_off=comfort)
     diagnostic: dict[str, JsonValue] = dict(candidate.diagnostics)
+    diagnostic["n_paths"] = cfg.n_paths
+    diagnostic["run_threshold_w"] = state.threshold_w
     diagnostic.update({key: True for key in assumptions})
     diagnostic["outdoor_extrapolated"] = bool(
         np.min(temperatures) < state.outdoor_low_c - 2
