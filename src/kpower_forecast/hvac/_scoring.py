@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Mapping
 
 import numpy as np
@@ -196,7 +196,6 @@ def energy_scores(
         raise HvacError("offline energy scores require a minute-aligned origin")
     index = pd.date_range(forecast.origin, periods=hours * 60, freq="min")
     observed = actual.reindex(index).power_w.to_numpy(dtype=float)
-    known = np.isfinite(observed)
     offset = int((forecast.origin - forecast.minute_paths.start).total_seconds() / 60)
     mean = np.mean(
         forecast.minute_paths.power_w[:, offset : offset + len(index)], axis=0
@@ -206,6 +205,22 @@ def energy_scores(
         if baseline.expected_kwh.shape != (hours * 4,):
             raise HvacError("energy baseline does not match the horizon")
         predictions[name] = np.repeat(baseline.expected_kwh * 4000, 15)
+    return _energy_windows(
+        forecast.origin, index, observed, predictions, cycle_method="minute_path_mean"
+    )
+
+
+def _energy_windows(
+    origin: datetime,
+    index: pd.DatetimeIndex,
+    observed: NDArray[np.float64],
+    predictions: Mapping[str, NDArray[np.float64]],
+    *,
+    cycle_method: str,
+) -> pd.DataFrame:
+    known = np.isfinite(observed)
+    if any(value.shape != observed.shape for value in predictions.values()):
+        raise HvacError("energy predictions and actual footprint differ")
     records: list[dict[str, object]] = []
     for duration in (1, 6, 24):
         length = duration * 60
@@ -224,7 +239,7 @@ def energy_scores(
                 expected = float(np.sum(values) / 60000)
                 records.append(
                     {
-                        "origin": forecast.origin,
+                        "origin": origin,
                         "interval_start": index[left].to_pydatetime(),
                         "duration_h": duration,
                         "model": name,
@@ -238,7 +253,7 @@ def energy_scores(
                         "partial_expected_kwh": predicted_partial,
                         "partial_error_kwh": predicted_partial - actual_partial,
                         "partial_method": (
-                            "minute_path_mean"
+                            cycle_method
                             if name == "cycle"
                             else "quarter_mean_piecewise_constant"
                         ),

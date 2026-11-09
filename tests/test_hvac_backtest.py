@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from kpower_forecast.hvac._artifacts import write_report
 from kpower_forecast.hvac._backtest import backtest
 from kpower_forecast.hvac._report import summarize
 from kpower_forecast.hvac.bundle import BundleManifest, HvacEvaluationBundle
@@ -84,6 +85,7 @@ def bundle():
 
 def test_future_only_feature_spike_cannot_change_full_scoring_and_gaps_cannot_pass_gate(
     bundle,
+    tmp_path,
 ):
     cfg = HvacModelConfig(
         model_id="test",
@@ -108,6 +110,15 @@ def test_future_only_feature_spike_cannot_change_full_scoring_and_gaps_cannot_pa
         .probability.isna()
         .all()
     )
+    output = tmp_path / "report"
+    write_report(original, output)
+    assert json.loads((output / "metrics.json").read_text())["scope"] == "development"
+    assert "cannot satisfy A4" in (output / "report.md").read_text()
+    assert not any(
+        "path" in column for column in pd.read_parquet(output / "quarters.parquet")
+    )
+    with pytest.raises(FileExistsError):
+        write_report(original, output)
 
 
 def test_one_gateway_per_origin_and_six_hour_or_lineage_refit(bundle, monkeypatch):

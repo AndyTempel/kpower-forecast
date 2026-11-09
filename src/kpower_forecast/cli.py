@@ -17,6 +17,7 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from .core import DataCategory, KPowerForecast, MeasurementUnit
+from .hvac.cli import app as hvac_app
 
 # Setup logging
 logging.basicConfig(
@@ -32,6 +33,7 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+app.add_typer(hvac_app, name="hvac")
 
 
 class ForecastType(str, Enum):

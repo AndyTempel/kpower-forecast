@@ -164,7 +164,29 @@ def backtest(
             if progress:
                 progress(origin, "fit")
             began = perf_counter()
-            candidate = model.fit(view.training, as_of=origin)
+            try:
+                candidate = model.fit(view.training, as_of=origin)
+            except HvacError as exc:
+                if str(exc) not in {
+                    "no_eligible_history",
+                    "insufficient_energy_history",
+                    "insufficient_weather_calibration",
+                    "no_outdoor_history",
+                }:
+                    raise
+                tables["origins"].append(
+                    pd.DataFrame(
+                        [
+                            {
+                                "origin": origin,
+                                "status": "skipped_unavailable_fit",
+                                "reason": str(exc),
+                                "schedule": schedule,
+                            }
+                        ]
+                    )
+                )
+                continue
             fit_seconds = perf_counter() - began
             model.install(candidate)
             fitted_at, fitted_identity = origin, candidate.fingerprint

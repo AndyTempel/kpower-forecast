@@ -46,7 +46,7 @@ def simple_baselines(
     Args:
         view: One origin-availability snapshot.
         cfg: Same resolved quality policy and ingestion lag as the evaluated model.
-        grid: Quarter-hour scoring grid starting at the prediction origin.
+        grid: Quarter-hour grid starting at origin or its upcoming quarter.
 
     Returns:
         Point-distribution naive baselines. B2 repeats the latest 24-hour pattern
@@ -54,11 +54,11 @@ def simple_baselines(
         Missing yesterday quarters remain unknown, including the ingestion tail.
 
     Raises:
-        ValueError: For a non-quarter grid or a grid not starting at this origin.
+        ValueError: For a non-quarter grid or a start outside the next quarter.
     """
     if (
         not grid
-        or grid[0].start != view.origin
+        or not timedelta(0) <= grid[0].start - view.origin < timedelta(minutes=15)
         or any(step.minutes != 15 for step in grid)
     ):
         raise HvacError("naive baselines require an origin-aligned quarter grid")
@@ -75,10 +75,10 @@ def simple_baselines(
     enough = density >= policy_number(view.training.history_policy, "_MIN_DENSITY")
     mean = float(past.power_w.mean()) if enough else np.nan
     b1 = _point(np.full(len(grid), mean), grid, "eligible_trailing_mean_intervals")
-    yesterday = regular_grid(view.origin - timedelta(days=1), minutes=15, hours=24)
+    yesterday = regular_grid(grid[0].start - timedelta(days=1), minutes=15, hours=24)
     actual = actual_intervals(frame, yesterday, threshold_w=None)
     phase = np.array(
-        [int((step.start - view.origin).total_seconds() // 900) % 96 for step in grid]
+        [int((step.start - grid[0].start).total_seconds() // 900) % 96 for step in grid]
     )
     previous_power = actual.energy_kwh[phase] * 4000
     b2 = _point(previous_power, grid, "eligible_yesterday_intervals")
