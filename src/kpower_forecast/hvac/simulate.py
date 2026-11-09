@@ -80,28 +80,28 @@ def schedule_modes(
         if start >= len(index) or end <= 0:
             continue
         if not span.end_uncertain:
-            modes[:, start:] = span.mode
+            modes[:, start:end] = span.mode
             continue
         if comfort_off is None or span.release_mode is None:
             raise HvacError("uncertain_comfort_release_unidentified")
         if span.mode not in cfg.off_modes:
             raise HvacError("uncertain span must be an off mode")
         if release is None:
+            start_offset = (span.start - request.origin).total_seconds() / 60
+            age_at_origin = max(span.elapsed_min - start_offset, 0.0)
             remaining = conditional_lognormal(
                 comfort_off[0],
                 comfort_off[1],
-                np.full(cfg.n_paths, span.elapsed_min),
+                np.full(cfg.n_paths, age_at_origin),
                 rng,
             )
             release = (
-                span.start - index[0].to_pydatetime()
+                request.origin - index[0].to_pydatetime()
             ).total_seconds() / 60 + remaining
         at = np.arange(start, end)
         modes[:, start:end] = np.where(
             at[None, :] < release[:, None], span.mode, span.release_mode
         )
-        # Hold the underlying command beyond this piece; a later piece overrides it.
-        modes[:, end:] = span.release_mode
     return modes, tuple(diagnostics)
 
 

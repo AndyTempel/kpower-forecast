@@ -1,0 +1,713 @@
+{
+  "owner_sources": {
+    "projection": "18910a8f1b9c0f2af3ec9a635651b0a9d4c33d0e0f3dd8ab993368ed19eddeed",
+    "schedule": "511e3a7572db955e28081c42d8153327895ec623d85b3a8af5aa70e0f1fe8cdf"
+  },
+  "policy": {
+    "automation_open_ended_hold_s": 7200.0,
+    "future_skew_s": 30.0
+  },
+  "cases": [
+    {
+      "name": "plan",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": false,
+        "comfort_off_latched": false,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": null
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": [
+        {
+          "start": "2026-11-09T12:00:00Z",
+          "end": "2026-11-09T12:10:00Z",
+          "mode": "ECO",
+          "source": "plan",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:25:00Z",
+          "end": "2026-11-09T12:40:00Z",
+          "mode": "NORMAL",
+          "source": "plan",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        }
+      ],
+      "error": null
+    },
+    {
+      "name": "missing",
+      "payload": null,
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": [],
+      "error": null
+    },
+    {
+      "name": "stale",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": false,
+        "comfort_off_latched": false,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": null
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:14:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": [],
+      "error": null
+    },
+    {
+      "name": "other_device",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": false,
+        "comfort_off_latched": false,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": null
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "other",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": [],
+      "error": null
+    },
+    {
+      "name": "bounded_override",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": false,
+        "comfort_off_latched": false,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": {
+              "mode": "BOOST",
+              "source": "automation",
+              "valid_until": "2026-11-09T12:17:00Z",
+              "reason": null
+            }
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": [
+        {
+          "start": "2026-11-09T12:00:00Z",
+          "end": "2026-11-09T12:10:00Z",
+          "mode": "BOOST",
+          "source": "automation",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:10:00Z",
+          "end": "2026-11-09T12:17:00Z",
+          "mode": "BOOST",
+          "source": "automation",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:25:00Z",
+          "end": "2026-11-09T12:40:00Z",
+          "mode": "NORMAL",
+          "source": "plan",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        }
+      ],
+      "error": null
+    },
+    {
+      "name": "open_override",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": false,
+        "comfort_off_latched": false,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": {
+              "mode": "OFF",
+              "source": "automation",
+              "valid_until": null,
+              "reason": null
+            }
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": [
+        {
+          "start": "2026-11-09T12:00:00Z",
+          "end": "2026-11-09T12:10:00Z",
+          "mode": "OFF",
+          "source": "automation",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:10:00Z",
+          "end": "2026-11-09T12:25:00Z",
+          "mode": "OFF",
+          "source": "automation",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:25:00Z",
+          "end": "2026-11-09T12:40:00Z",
+          "mode": "OFF",
+          "source": "automation",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:40:00Z",
+          "end": "2026-11-09T14:00:00Z",
+          "mode": "OFF",
+          "source": "automation",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        }
+      ],
+      "error": null
+    },
+    {
+      "name": "comfort",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": true,
+        "comfort_off_latched": true,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": null
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": "2026-11-09T11:30:00+00:00",
+      "horizon_end": "2026-11-10T18:00:00+00:00",
+      "expected": [
+        {
+          "start": "2026-11-09T12:00:00Z",
+          "end": "2026-11-09T12:10:00Z",
+          "mode": "OFF",
+          "source": "thermostat",
+          "end_uncertain": true,
+          "release_mode": "ECO",
+          "elapsed_min": 30.0
+        },
+        {
+          "start": "2026-11-09T12:10:00Z",
+          "end": "2026-11-09T12:25:00Z",
+          "mode": "OFF",
+          "source": "thermostat",
+          "end_uncertain": true,
+          "release_mode": "NORMAL",
+          "elapsed_min": 40.0
+        },
+        {
+          "start": "2026-11-09T12:25:00Z",
+          "end": "2026-11-09T12:40:00Z",
+          "mode": "OFF",
+          "source": "thermostat",
+          "end_uncertain": true,
+          "release_mode": "NORMAL",
+          "elapsed_min": 55.0
+        },
+        {
+          "start": "2026-11-09T12:40:00Z",
+          "end": "2026-11-10T12:00:00Z",
+          "mode": "OFF",
+          "source": "thermostat",
+          "end_uncertain": true,
+          "release_mode": "NORMAL",
+          "elapsed_min": 70.0
+        }
+      ],
+      "error": null
+    },
+    {
+      "name": "comfort_override",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": true,
+        "comfort_off_latched": true,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": {
+              "mode": "BOOST",
+              "source": "automation",
+              "valid_until": "2026-11-09T12:17:00Z",
+              "reason": null
+            }
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": "2026-11-09T11:30:00+00:00",
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": [
+        {
+          "start": "2026-11-09T12:00:00Z",
+          "end": "2026-11-09T12:10:00Z",
+          "mode": "BOOST",
+          "source": "automation",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:10:00Z",
+          "end": "2026-11-09T12:17:00Z",
+          "mode": "BOOST",
+          "source": "automation",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:17:00Z",
+          "end": "2026-11-09T12:25:00Z",
+          "mode": "OFF",
+          "source": "thermostat",
+          "end_uncertain": true,
+          "release_mode": "NORMAL",
+          "elapsed_min": 47.0
+        },
+        {
+          "start": "2026-11-09T12:25:00Z",
+          "end": "2026-11-09T12:40:00Z",
+          "mode": "OFF",
+          "source": "thermostat",
+          "end_uncertain": true,
+          "release_mode": "NORMAL",
+          "elapsed_min": 55.0
+        },
+        {
+          "start": "2026-11-09T12:40:00Z",
+          "end": "2026-11-09T15:00:00Z",
+          "mode": "OFF",
+          "source": "thermostat",
+          "end_uncertain": true,
+          "release_mode": "NORMAL",
+          "elapsed_min": 70.0
+        }
+      ],
+      "error": null
+    },
+    {
+      "name": "comfort_missing_age",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": true,
+        "comfort_off_latched": true,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": null
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": null,
+      "error": "active comfort latch requires its causal OFF event"
+    },
+    {
+      "name": "future_comfort",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": true,
+        "comfort_off_latched": false,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": null
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T15:00:00+00:00",
+      "expected": [
+        {
+          "start": "2026-11-09T12:00:00Z",
+          "end": "2026-11-09T12:10:00Z",
+          "mode": "ECO",
+          "source": "plan",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:25:00Z",
+          "end": "2026-11-09T12:40:00Z",
+          "mode": "NORMAL",
+          "source": "plan",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        }
+      ],
+      "error": null
+    },
+    {
+      "name": "clipped",
+      "payload": {
+        "schema_version": 1,
+        "generated_at": "2026-11-09T11:59:00Z",
+        "valid_until": "2026-11-09T12:14:00Z",
+        "plan_generated_at": null,
+        "thermostat_enabled": false,
+        "comfort_off_latched": false,
+        "devices": [
+          {
+            "device_id": "hp",
+            "slots": [
+              {
+                "start": "2026-11-09T11:55:00Z",
+                "end": "2026-11-09T12:10:00Z",
+                "mode": "ECO",
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:10:00Z",
+                "end": "2026-11-09T12:25:00Z",
+                "mode": null,
+                "source": "plan",
+                "reason": null
+              },
+              {
+                "start": "2026-11-09T12:25:00Z",
+                "end": "2026-11-09T12:40:00Z",
+                "mode": "NORMAL",
+                "source": "plan",
+                "reason": null
+              }
+            ],
+            "override": null
+          }
+        ]
+      },
+      "origin": "2026-11-09T12:00:00+00:00",
+      "device_id": "hp",
+      "last_mode": "NORMAL",
+      "last_mode_event": null,
+      "horizon_end": "2026-11-09T12:30:00+00:00",
+      "expected": [
+        {
+          "start": "2026-11-09T12:00:00Z",
+          "end": "2026-11-09T12:10:00Z",
+          "mode": "ECO",
+          "source": "plan",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        },
+        {
+          "start": "2026-11-09T12:25:00Z",
+          "end": "2026-11-09T12:30:00Z",
+          "mode": "NORMAL",
+          "source": "plan",
+          "end_uncertain": false,
+          "release_mode": null,
+          "elapsed_min": 0.0
+        }
+      ],
+      "error": null
+    }
+  ]
+}

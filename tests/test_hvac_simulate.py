@@ -380,3 +380,58 @@ def test_continuous_overload_still_has_observed_defrost_interruptions(setup):
     assert not paths.starts.any()  # interruptions stay within the merged run
     assert not paths.running[paths.power_w == 700.0].any()
     assert paths.running[paths.power_w == 4000.0].all()
+
+
+def test_uncovered_schedule_periods_hold_the_origin_last_mode(setup):
+    from dataclasses import replace
+
+    cfg, _, _, _, request, _ = setup
+    span = ModeSpan(
+        start=ORIGIN + timedelta(minutes=30),
+        end=ORIGIN + timedelta(minutes=60),
+        mode="ECO",
+        source="plan",
+    )
+    modes, _ = schedule_modes(
+        replace(request, schedule=(span,)),
+        cfg,
+        pd.date_range(ORIGIN, periods=120, freq="min"),
+        np.random.default_rng(1),
+    )
+    assert (modes[:, :30] == "NORMAL").all()
+    assert (modes[:, 30:60] == "ECO").all()
+    assert (modes[:, 60:] == "NORMAL").all()
+
+
+def test_automation_can_hide_a_comfort_release_without_re_latching_it(setup):
+    from dataclasses import replace
+
+    cfg, _, _, _, request, _ = setup
+    spans = (
+        ModeSpan(
+            start=ORIGIN,
+            end=ORIGIN + timedelta(minutes=17),
+            mode="BOOST",
+            source="automation",
+        ),
+        ModeSpan(
+            start=ORIGIN + timedelta(minutes=17),
+            end=ORIGIN + timedelta(minutes=60),
+            mode="OFF",
+            source="thermostat",
+            end_uncertain=True,
+            elapsed_min=47.0,
+            release_mode="NORMAL",
+        ),
+    )
+    modes, _ = schedule_modes(
+        replace(request, schedule=spans),
+        cfg,
+        pd.date_range(ORIGIN, periods=120, freq="min"),
+        np.random.default_rng(1),
+        comfort_off=(np.log(35.0), 0.01),
+    )
+    assert (modes[:, :17] == "BOOST").all()
+    assert (
+        modes[:, 17:60] == "NORMAL"
+    ).all()  # release sampled at origin, age30, not age47
