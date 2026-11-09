@@ -742,6 +742,7 @@ def _bundle_snapshot(
             "r1c_replay.parquet",
             "legacy_shadow.parquet",
             "r1c_shadow.parquet",
+            "legacy_awareness.parquet",
         )
     }
     # Actuals are separate from features and are qualified at export availability.
@@ -761,6 +762,7 @@ def _bundle_snapshot(
             "live_forecasts.parquet",
             "live_first_hour.parquet",
             "live_reserves.parquet",
+            "live_window_inputs.parquet",
         )
     }
     actuals["minutes.parquet"] = prepare_minutes(
