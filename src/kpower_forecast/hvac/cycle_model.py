@@ -168,6 +168,7 @@ class CycleFit:
     defrost_length_min: float = 0.0
     switch_effects: tuple[SwitchEffect, ...] = ()
     bootstrap_grid_edges: int = 0
+    defrost_hourly_rate: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 def _design(
@@ -409,7 +410,8 @@ def fit_cycles(
     run_rows = sojourns.loc[sojourns.kind.eq("run")].copy()
     counts = run_rows.get("defrost_interruptions", pd.Series(0.0, index=run_rows.index))
     overall = float(counts.mean()) if len(counts) else 0.0
-    bins = np.digitize(run_rows.outdoor_c.to_numpy(), [3.0, 7.0])
+    temperatures = run_rows.outdoor_c.to_numpy()
+    bins = np.where(temperatures < 3, 0, np.where(temperatures <= 7, 1, 2))
     rates = tuple(
         float((counts.loc[bins == i].sum() + 20 * overall) / ((bins == i).sum() + 20))
         for i in range(3)
@@ -419,6 +421,20 @@ def fit_cycles(
         / counts.where(counts > 0)
     ).dropna()
     length = float(lengths.median()) if len(lengths) else 0.0
+    active_run = run_rows.minutes - run_rows.get("defrost_minutes", 0.0)
+    mean_active = float(active_run.mean())
+    hourly_rates = tuple(
+        (
+            float(
+                60
+                * (counts.loc[bins == i].sum() + 20 * overall)
+                / (active_run.loc[bins == i].sum() + 20 * mean_active)
+            )
+            if mean_active > 0
+            else 0.0
+        )
+        for i in range(3)
+    )
     effects = []
     if mode_switches is not None and len(mode_switches):
         for keys, group in mode_switches.groupby(["from_mode", "to_mode", "state"]):
@@ -455,6 +471,7 @@ def fit_cycles(
             length,
             tuple(effects),
             bootstrap_edges,
+            (hourly_rates[0], hourly_rates[1], hourly_rates[2]),
         ),
         None,
     )

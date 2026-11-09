@@ -409,3 +409,19 @@ class HvacForecast:
     diagnostics: Diagnostic
     fingerprint: str
     estimator_version: str = HVAC_ESTIMATOR_VERSION
+
+    def stats(self, grid: tuple[GridInterval, ...]) -> IntervalStats:
+        """Recompute grid statistics from all retained paths.
+
+        Args:
+            grid: Contiguous intervals within the retained minute horizon.
+
+        Returns:
+            Full-ensemble statistics on that exact grid.
+
+        Raises:
+            ValueError: If the grid exceeds the path horizon.
+        """
+        from .aggregate import interval_stats
+
+        return interval_stats(self.minute_paths, grid)

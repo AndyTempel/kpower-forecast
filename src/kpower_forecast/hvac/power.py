@@ -28,6 +28,8 @@ class PowerFit:
     defrost_w: float | None
     metered_scope: MeteredScope
     diagnostics: tuple[str, ...]
+    supply_reference_c: float = 35.0
+    defrost_running_share: float = 0.0
 
     def run_power(
         self, outdoor_c: ArrayLike, supply_c: ArrayLike = 35.0
@@ -105,6 +107,7 @@ def fit_power(
         diagnostics.append("off_power_from_idle")
     ramps: list[list[float]] = [[], [], []]
     defrost = []
+    defrost_on: list[float] = []
     for row in runs.itertuples():
         start = cast(pd.Timestamp, row.start)
         end = cast(pd.Timestamp, row.end)
@@ -121,6 +124,7 @@ def fit_power(
         if "defrost" in inside:
             mask |= inside.defrost.eq(1)
         defrost.extend(inside.loc[mask, "power_w"].dropna().tolist())
+        defrost_on.extend(inside.loc[mask, "running"].dropna().tolist())
     for i, values in enumerate(ramps):
         if not values:
             diagnostics.append(f"start_ramp_unidentified:{i}")
@@ -136,4 +140,6 @@ def fit_power(
         float(np.median(defrost)) if defrost else None,
         scope,
         tuple(diagnostics),
+        float(runs.supply_c.mean()) if use_supply else 35.0,
+        float(np.mean(defrost_on)) if defrost_on else 0.0,
     )
