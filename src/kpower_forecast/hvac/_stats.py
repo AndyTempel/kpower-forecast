@@ -399,3 +399,59 @@ def sample_crps(samples: ArrayLike, observed: ArrayLike) -> FloatArray:
     return np.asarray(
         np.mean(np.abs(x - y), axis=0) - np.sum(ranks * ordered, axis=0) / n**2
     )
+
+
+def conditional_lognormal(
+    mu: ArrayLike,
+    sigma: ArrayLike,
+    elapsed: ArrayLike,
+    rng: np.random.Generator,
+) -> FloatArray:
+    """Sample remaining duration conditional on survival through elapsed time.
+
+    Args:
+        mu: Log-median duration, possibly +inf for a non-ending state.
+        sigma: Positive log-scale dispersion.
+        elapsed: Nonnegative observed age in minutes.
+        rng: Caller-owned deterministic generator.
+
+    Returns:
+        Nonnegative remaining minutes. Log-survival inversion avoids rounding
+        extreme conditional probabilities to one.
+
+    Raises:
+        ValueError: For malformed parameters or elapsed ages.
+    """
+    m, s, e = np.broadcast_arrays(
+        np.asarray(mu, dtype=float),
+        np.asarray(sigma, dtype=float),
+        np.asarray(elapsed, dtype=float),
+    )
+    if (
+        np.isnan(m).any()
+        or np.isneginf(m).any()
+        or not np.isfinite(s).all()
+        or (s <= 0).any()
+        or not np.isfinite(e).all()
+        or (e < 0).any()
+    ):
+        raise HvacError("invalid conditional lognormal parameters")
+    result = np.full(m.shape, np.inf)
+    use = np.isfinite(m)
+    if not use.any():
+        return result
+    mm, ss, ee = m[use], s[use], e[use]
+    z_age = (np.log(np.maximum(ee, 1e-300)) - mm) / ss
+    log_survival = np.where(ee > 0, normal_logsf(z_age), 0.0)
+    target = log_survival + np.log(rng.uniform(np.finfo(float).tiny, 1.0, len(mm)))
+    # Inverse CDF is accurate in the central region; asymptotic initialization
+    # remains finite when 1-exp(target) would round to exactly one.
+    z = np.sqrt(np.maximum(-2 * target, 0.0))
+    central = target > -30
+    z[central] = normal_ppf(-np.expm1(target[central]))
+    for _ in range(6):
+        survival = normal_logsf(z)
+        mills = np.exp(-0.5 * z * z - 0.5 * _LOG_2PI - survival)
+        z += (survival - target) / mills
+    result[use] = np.maximum(np.exp(np.minimum(mm + ss * z, 700)) - ee, 0.0)
+    return result

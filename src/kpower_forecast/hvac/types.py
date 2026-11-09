@@ -206,6 +206,7 @@ class ModeSpan(_Input):
     mode: str = Field(min_length=1)
     source: ModeSource
     end_uncertain: bool = False
+    release_mode: str | None = Field(default=None, min_length=1)
     elapsed_min: float = Field(default=0, ge=0)
 
     @model_validator(mode="after")

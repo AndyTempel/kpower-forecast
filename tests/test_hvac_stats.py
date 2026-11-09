@@ -98,3 +98,15 @@ def test_offset_only_aft_estimates_scale_without_an_unidentified_intercept():
     )
     assert result.converged and result.coefficients.size == 0
     assert result.sigma == pytest.approx(0.4, rel=0.03)
+
+
+def test_conditional_lognormal_survives_extreme_ages_without_clipping_to_zero():
+    from kpower_forecast.hvac._stats import conditional_lognormal
+
+    rng = np.random.default_rng(12)
+    result = conditional_lognormal(np.full(20000, np.log(45)), 0.4, 120.0, rng)
+    ze = (np.log(120) - np.log(45)) / 0.4
+    expected = np.exp(np.log(45) + 0.4 * norm.isf(0.5 * norm.sf(ze))) - 120
+    assert np.median(result) == pytest.approx(expected, rel=0.04)
+    extreme = conditional_lognormal(np.zeros(1000), 0.2, 1e9, rng)
+    assert np.isfinite(extreme).all() and (extreme > 0).all()

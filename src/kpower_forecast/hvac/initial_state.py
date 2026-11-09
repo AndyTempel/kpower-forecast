@@ -14,6 +14,11 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
+
+from ._stats import conditional_lognormal
+from .cycle_model import CycleParameters
+from .types import HvacModelConfig, InputTier
 
 # Transport-neutral legacy column labels retained for numerical parity.
 WATER_CYCLE_POWER_KEY = "power_w"
@@ -650,3 +655,379 @@ def _minutes_left_by_water(
     if rise < MIN_RISE_PER_MIN:
         return None
     return max((float(np.median(ends)) - float(supply.iloc[-1])) / rise, 0.5)
+
+
+# New initial-state wiring starts here. The numerical R1c functions above remain
+# unchanged; the independently committed parity fixtures guard that boundary.
+@dataclass(frozen=True)
+class ControllerFit:
+    """First-spell controller dynamics; enablement requires its separate CAN gate."""
+
+    cooling: tuple[float, float, float]
+    rising: tuple[float, float, float]
+    cooling_sd: float
+    rising_sd: float
+    threshold_modes: tuple[str, ...]
+    threshold_beta: tuple[float, ...]
+    hysteresis: float
+
+
+@dataclass(frozen=True)
+class InitialState:
+    """Per-path current phase and conditional remaining duration."""
+
+    running: NDArray[np.bool_]
+    elapsed_min: NDArray[np.float64]
+    remaining_min: NDArray[np.float64]
+    lockout_min: float
+    water_draw: NDArray[np.bool_]
+    tier: InputTier
+    stationary: bool
+
+
+def fit_controller_state(
+    frame: pd.DataFrame, *, minimum_days: float, minimum_density: float
+) -> ControllerFit | None:
+    """Fit the controller's first-spell rates on contiguous five-minute changes.
+
+    Args:
+        frame: Qualified minute state/control/outdoor observations.
+        minimum_days: Resolved owner minimum history; CAN also requires 14 days.
+        minimum_density: Resolved owner minimum observed density.
+
+    Returns:
+        Dynamics or None when optional controller evidence is insufficient.
+    """
+    required = [
+        "running",
+        "control_c",
+        "control_setpoint_c",
+        "control_hysteresis_c",
+        "outdoor_c",
+        "sun",
+    ]
+    if frame.empty or not set(required) <= set(frame):
+        return None
+    valid = frame[required].notna().all(axis=1)
+    rows = frame.loc[valid]
+    known_index = pd.DatetimeIndex(rows.index)
+    if (
+        len(rows) < 2
+        or (known_index[-1] - known_index[0]).total_seconds() / 86400
+        < max(14.0, minimum_days)
+        or valid.mean() < minimum_density
+    ):
+        return None
+    contiguous = valid.rolling(6, min_periods=6).sum().eq(6)
+    change = (frame.control_c - frame.control_c.shift(5)) / 5
+    design = np.column_stack(
+        [
+            np.ones(len(frame)),
+            frame.control_c.shift(5) - frame.outdoor_c.shift(5),
+            frame.sun.shift(5),
+        ]
+    )
+    fits: list[tuple[tuple[float, float, float], float]] = []
+    for on in (False, True):
+        state = frame.running.rolling(6, min_periods=6).sum().eq(6 if on else 0)
+        use = contiguous & state & change.notna()
+        if use.sum() < 4:
+            return None
+        x, y = design[use.to_numpy()], change.loc[use].to_numpy()
+        beta = np.linalg.lstsq(x, y, rcond=None)[0]
+        residual = y - x @ beta
+        fits.append(
+            (
+                (float(beta[0]), float(beta[1]), float(beta[2])),
+                float(np.std(residual, ddof=1)),
+            )
+        )
+    if "mode" in rows:
+        modes = tuple(sorted(str(x) for x in rows["mode"].unique()))
+    else:
+        modes = ()
+    blocks = [np.ones(len(rows)), rows.outdoor_c.to_numpy()]
+    blocks.extend(rows["mode"].eq(m).to_numpy(dtype=float) for m in modes[1:])
+    beta = np.linalg.lstsq(
+        np.column_stack(blocks), rows.control_setpoint_c.to_numpy(), rcond=None
+    )[0]
+    return ControllerFit(
+        fits[0][0],
+        fits[1][0],
+        fits[0][1],
+        fits[1][1],
+        modes,
+        tuple(float(v) for v in beta),
+        float(rows.control_hysteresis_c.median()),
+    )
+
+
+def water_start_samples(
+    cycles: WaterCycles,
+    latest: pd.DataFrame,
+    *,
+    mode_now: str,
+    future_modes: Sequence[str],
+    origin: datetime,
+) -> tuple[np.ndarray | None, str | None]:
+    """Expose the legacy ensemble's distribution of its first future start.
+
+    Args:
+        cycles: Unchanged R1c fitted water parameters.
+        latest: Qualified recent water/power rows.
+        mode_now: Current command.
+        future_modes: Known per-minute future modes, starting at the origin minute.
+        origin: Actual forecast origin.
+
+    Returns:
+        First-start minutes after origin per trigger member, or a legacy guard
+        reason. This is a first-start CDF, not a reduction of run probabilities.
+    """
+    rows = latest.dropna(subset=[POWER_COLUMN, RETURN_COLUMN])
+    rows = rows.loc[rows.index <= pd.Timestamp(origin)]
+    if rows.empty or origin - rows.index[-1].to_pydatetime() > MAX_MINUTE_AGE:
+        return None, "stale_water"
+    if not future_modes:
+        return None, "no_water_horizon"
+    if mode_now == _OFF and future_modes[0] != _OFF:
+        return None, "unexplained_off"
+    lengths = [run[1] for run in cycles.runs if run[0] == mode_now][-RECENT_RUNS:]
+    if len(lengths) < MIN_RECENT_RUNS:
+        lengths = [run[1] for run in cycles.runs][-RECENT_RUNS:]
+    if (
+        len(lengths) < MIN_RECENT_RUNS
+        or len(cycles.gaps_min) < MIN_RECENT_GAPS
+        or len(cycles.spread_c) < MIN_WATER_STARTS
+    ):
+        return None, "too_few_water_starts"
+    stamp = rows.index[-1].to_pydatetime()
+    lag = (origin - (stamp + MINUTE)) / MINUTE
+    prefix = max(int(np.ceil(lag)), 0)
+    modes = [mode_now] * prefix + list(future_modes)
+    triggers = {mode: cycles.trigger_c(mode) for mode in set(modes)}
+    errors = np.quantile(cycles.spread_c, TRIGGER_QUANTILES)
+    run_length = float(np.median(lengths))
+    gap = float(np.median(cycles.gaps_min[-RECENT_GAPS:]))
+    starts = []
+    for error in errors:
+        played = _play(
+            cycles,
+            _Member(float(error), run_length, gap, run_length, 0.0),
+            return_c=float(rows[RETURN_COLUMN].iloc[-1]),
+            running=False,
+            mode_now=mode_now,
+            modes=modes,
+            triggers=triggers,
+            stop_share={},
+        )
+        first = np.flatnonzero(played)
+        starts.append(max(float(first[0]) - lag, 0.0) if len(first) else float("inf"))
+    return np.asarray(starts), None
+
+
+def _controller_remaining(
+    model: ControllerFit,
+    latest: pd.DataFrame,
+    running: NDArray[np.bool_],
+    mode: str,
+    outdoor_c: float,
+    sun: float,
+    rng: np.random.Generator,
+) -> NDArray[np.float64] | None:
+    """Solve the fitted first-spell linear ODE at current covariates."""
+    if model.threshold_modes and mode not in model.threshold_modes:
+        return None
+    needed = ["control_c", "control_setpoint_c", "control_hysteresis_c"]
+    rows = (
+        latest.dropna(subset=needed) if set(needed) <= set(latest) else pd.DataFrame()
+    )
+    if rows.empty:
+        return None
+    last = rows.iloc[-1]
+    beta = model.threshold_beta
+    threshold = (
+        beta[0]
+        + beta[1] * outdoor_c
+        + sum(
+            beta[2 + i] * (mode == m) for i, m in enumerate(model.threshold_modes[1:])
+        )
+    )
+    c = float(last.control_c)
+    result = np.full(len(running), np.inf)
+    for on, coeff, sd in [
+        (False, model.cooling, model.cooling_sd),
+        (True, model.rising, model.rising_sd),
+    ]:
+        use = running == on
+        count = int(use.sum())
+        if not count:
+            continue
+        target = threshold if on else threshold - model.hysteresis
+        if c >= target if on else c <= target:
+            result[use] = 0.0
+            continue
+        k0, k1, k2 = coeff
+        drift = k0 + k2 * sun + rng.normal(0, sd, count)
+        if abs(k1) < 1e-10:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                time = (target - c) / drift
+        else:
+            equilibrium = outdoor_c - drift / k1
+            with np.errstate(divide="ignore", invalid="ignore"):
+                time = np.log((target - equilibrium) / (c - equilibrium)) / k1
+        result[use] = np.where(np.isfinite(time) & (time >= 0), time, np.inf)
+    return result
+
+
+def initial_distribution(
+    latest: pd.DataFrame,
+    parameter_sets: Sequence[CycleParameters],
+    cfg: HvacModelConfig,
+    *,
+    origin: datetime,
+    mode: str,
+    outdoor_c: float,
+    sun: float,
+    rng: np.random.Generator,
+    water: WaterCycles | None = None,
+    future_modes: Sequence[str] = (),
+    controller: ControllerFit | None = None,
+    uncertain_off: bool = False,
+    off_elapsed_min: float = 0.0,
+) -> InitialState:
+    """Choose fresh measured phase or stationary age, then the highest valid tier.
+
+    Args:
+        latest: Qualified, classified recent minutes (availability already sliced).
+        parameter_sets: Full and day-block duration fits.
+        cfg: Evidence freshness, mixture and path configuration.
+        origin: Actual prediction origin.
+        mode: Current caller-declared mode.
+        outdoor_c: Selected site outdoor at the origin.
+        sun: Current radiation /1000.
+        rng: Deterministic prediction generator.
+        water: Optional unchanged R1c fit.
+        future_modes: Known future modes for the water first-start distribution.
+        controller: Optional separately qualified CAN dynamics.
+        uncertain_off: Disable deterministic water schedules for uncertain OFF release.
+        off_elapsed_min: Known active OFF age, if supplied by the caller.
+
+    Returns:
+        Per-path phase/age/remaining duration and the tier actually used.
+    """
+    n = cfg.n_paths
+    selected = np.arange(n) % len(parameter_sets)
+    mi = np.empty(n)
+    mr = np.empty(n)
+    si = np.empty(n)
+    sr = np.empty(n)
+    local = pd.Timestamp(origin).tz_convert(cfg.timezone)
+    angle = 2 * np.pi * (local.hour + local.minute / 60) / 24
+    for j, p in enumerate(parameter_sets):
+        use = selected == j
+        ii, rr, _ = p.locations(outdoor_c, mode, sun, np.sin(angle), np.cos(angle))
+        mi[use] = ii
+        mr[use] = rr
+        si[use] = p.sigma_idle * cfg.dispersion_inflation
+        sr[use] = p.sigma_run * cfg.dispersion_inflation
+    rows = latest.dropna(subset=[POWER_COLUMN, "running"])
+    fresh = bool(
+        len(rows)
+        and origin - rows.index[-1].to_pydatetime()
+        <= timedelta(minutes=cfg.state_max_age_min)
+    )
+    elapsed = np.zeros(n)
+    if mode in cfg.off_modes:
+        running = np.zeros(n, dtype=bool)
+        elapsed[:] = off_elapsed_min
+        remaining = conditional_lognormal(mi, si, elapsed, rng)
+    elif fresh:
+        on = bool(rows.running.iloc[-1] > 0)
+        running = np.full(n, on)
+        # Only a contiguous suffix identifies an observed spell's elapsed time.
+        i = len(rows) - 1
+        while (
+            i > 0
+            and bool(rows.running.iloc[i - 1] > 0) == on
+            and rows.index[i] - rows.index[i - 1]
+            <= timedelta(minutes=cfg.minute_gap_tolerance_min)
+        ):
+            i -= 1
+        elapsed[:] = max((origin - rows.index[i].to_pydatetime()) / MINUTE, 0.0)
+        remaining = conditional_lognormal(
+            np.where(running, mr, mi), np.where(running, sr, si), elapsed, rng
+        )
+    else:
+        with np.errstate(over="ignore", invalid="ignore"):
+            mean_i = np.exp(mi + si * si / 2)
+            mean_r = np.exp(mr + sr * sr / 2)
+            duty = np.where(np.isposinf(mr), 1.0, mean_r / (mean_r + mean_i))
+        running = rng.random(n) < duty
+        mu = np.where(running, mr, mi)
+        sigma = np.where(running, sr, si)
+        length = np.exp(
+            np.minimum(mu + sigma * sigma + sigma * rng.normal(size=n), 700)
+        )
+        length = np.where(np.isposinf(mu), np.inf, length)
+        finite = np.isfinite(length)
+        elapsed[finite] = rng.random(int(finite.sum())) * length[finite]
+        remaining = np.full(n, np.inf)
+        remaining[finite] = length[finite] - elapsed[finite]
+    tier = InputTier.T1_POWER
+    water_draw = np.zeros(n, dtype=bool)
+    lockout = 0.0
+    if fresh and "lockout_remaining_s" in latest:
+        countdown = latest.lockout_remaining_s.dropna()
+        if len(countdown):
+            age = max(
+                (
+                    origin - (countdown.index[-1].to_pydatetime() + MINUTE)
+                ).total_seconds(),
+                0.0,
+            )
+            lockout = max(float(countdown.iloc[-1]) - age, 0.0) / 60
+    if fresh and cfg.enable_t3 and controller is not None:
+        fields = ["control_c", "control_setpoint_c", "control_hysteresis_c"]
+        controls = (
+            latest.dropna(subset=fields)
+            if set(fields) <= set(latest)
+            else pd.DataFrame()
+        )
+        if len(controls) and origin - controls.index[-1].to_pydatetime() <= timedelta(
+            minutes=cfg.state_max_age_min
+        ):
+            projected = _controller_remaining(
+                controller, controls, running, mode, outdoor_c, sun, rng
+            )
+            if projected is not None:
+                remaining = projected
+                tier = InputTier.T3_CONTROLLER
+    if (
+        tier is not InputTier.T3_CONTROLLER
+        and fresh
+        and not bool(running.any())
+        and water is not None
+        and not uncertain_off
+        and cfg.water_weight > 0
+    ):
+        mapped_mode = _OFF if mode in cfg.off_modes else mode
+        mapped = [_OFF if m in cfg.off_modes else m for m in future_modes]
+        starts, reason = water_start_samples(
+            water, latest, mode_now=mapped_mode, future_modes=mapped, origin=origin
+        )
+        if starts is not None and reason is None:
+            water_draw = rng.random(n) < cfg.water_weight
+            remaining[water_draw] = rng.choice(starts, int(water_draw.sum()))
+            tier = InputTier.T2_WATER
+    # The simulator applies manufacturer minima using the known elapsed age.
+    remaining = np.maximum(remaining, 0.0)
+    remaining[~running] = np.maximum(remaining[~running], lockout)
+    return InitialState(
+        running,
+        elapsed,
+        remaining,
+        lockout,
+        water_draw,
+        tier,
+        not fresh and mode not in cfg.off_modes,
+    )

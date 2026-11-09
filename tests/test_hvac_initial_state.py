@@ -375,3 +375,169 @@ def test_unchanged_ems_numerical_golden_parity_to_one_nanounit(case_number):
         where = np.flatnonzero(played)
         times.append(int(where[0]) if len(where) else None)
     assert times == case["first_start_minutes"]
+
+
+def test_water_first_start_distribution_matches_the_legacy_golden_cdf():
+    from kpower_forecast.hvac.initial_state import water_start_samples
+
+    case = json.loads(
+        (Path(__file__).parent / "fixtures/hvac_water_parity.json").read_text()
+    )["cases"][0]
+    frame, commands = _history(14 * 1440, **case["kwargs"])
+    cycles = _fitted(frame, commands)
+    origin = frame.index[-1].to_pydatetime() + MINUTE
+    starts, why = water_start_samples(
+        cycles, frame, mode_now="NORMAL", future_modes=["NORMAL"] * 240, origin=origin
+    )
+    assert why is None and starts is not None
+    np.testing.assert_allclose(starts, case["first_start_minutes"], atol=1e-9, rtol=0)
+
+
+def test_stale_phase_uses_length_biased_stationarity_instead_of_invented_age():
+    from kpower_forecast.hvac.cycle_model import CycleParameters
+    from kpower_forecast.hvac.initial_state import initial_distribution
+    from kpower_forecast.hvac.types import HvacModelConfig
+
+    cfg = HvacModelConfig(
+        model_id="stationary", timezone="UTC", n_paths=20000, n_parameter_sets=1
+    )
+    model = CycleParameters(
+        20.0, (), (-np.log(1 / 585), 0.0, 0.0, 0.0), 0.4, 4 / 45, 0.0, (), (), 0.2
+    )
+    frame = pd.DataFrame(
+        {"power_w": [60.0], "running": [0.0]},
+        index=pd.date_range(START, periods=1, freq="min"),
+    )
+    initial = initial_distribution(
+        frame,
+        [model],
+        cfg,
+        origin=START + timedelta(hours=1),
+        mode="NORMAL",
+        outdoor_c=7.0,
+        sun=0.0,
+        rng=np.random.default_rng(51),
+    )
+    duty, _ = model.stationary(7.0, "NORMAL")
+    assert initial.stationary and initial.running.mean() == pytest.approx(
+        float(duty), abs=0.015
+    )
+    assert np.std(initial.elapsed_min) > 0 and not initial.water_draw.any()
+    forced = initial_distribution(
+        frame,
+        [model],
+        cfg,
+        origin=START + timedelta(hours=1),
+        mode="OFF",
+        outdoor_c=7.0,
+        sun=0.0,
+        rng=np.random.default_rng(51),
+    )
+    assert not forced.running.any() and not forced.stationary
+
+
+def test_water_mixture_is_only_used_for_fresh_idle_and_respects_its_configured_weight():
+    from kpower_forecast.hvac.cycle_model import CycleParameters
+    from kpower_forecast.hvac.initial_state import initial_distribution
+    from kpower_forecast.hvac.types import HvacModelConfig, InputTier
+
+    frame, commands = _history(14 * 1440, ending_idle_c=26.5)
+    water = _fitted(frame, commands)
+    frame = frame.copy()
+    frame["running"] = (frame[POWER_COLUMN] >= THRESHOLD_W).astype(float)
+    model = CycleParameters(
+        20.0, (), (-np.log(1 / 585), 0.0, 0.0, 0.0), 0.4, 4 / 45, 0.0, (), (), 0.2
+    )
+    cfg = HvacModelConfig(
+        model_id="mixture", timezone="UTC", n_paths=20000, n_parameter_sets=1
+    )
+    origin = frame.index[-1].to_pydatetime() + MINUTE
+    initial = initial_distribution(
+        frame,
+        [model],
+        cfg,
+        origin=origin,
+        mode="NORMAL",
+        outdoor_c=7.0,
+        sun=0.0,
+        rng=np.random.default_rng(52),
+        water=water,
+        future_modes=["NORMAL"] * 240,
+    )
+    assert initial.tier is InputTier.T2_WATER
+    assert initial.water_draw.mean() == pytest.approx(0.7, abs=0.015)
+    assert not initial.running.any()
+
+
+def test_controller_dynamics_need_fourteen_days_and_explicit_tier_enablement():
+    from kpower_forecast.hvac.cycle_model import CycleParameters
+    from kpower_forecast.hvac.initial_state import (
+        fit_controller_state,
+        initial_distribution,
+    )
+    from kpower_forecast.hvac.types import HvacModelConfig, InputTier
+
+    count = 16 * 1440
+    index = pd.date_range(START, periods=count, freq="min")
+    temperature = 5 + 2 * np.sin(np.arange(count) * 2 * np.pi / 1440)
+    sun = np.maximum(np.sin(np.arange(count) * 2 * np.pi / 1440), 0)
+    control = []
+    running = []
+    c = 29.0
+    on = False
+    for i in range(count):
+        if c <= 28:
+            on = True
+        elif c >= 30:
+            on = False
+        c += (0.45 if on else 0.2) - 0.01 * (c - temperature[i]) + 0.002 * sun[i]
+        control.append(c)
+        running.append(float(on))
+    frame = pd.DataFrame(
+        {
+            "power_w": np.where(np.array(running) > 0, 4500.0, 60.0),
+            "running": running,
+            "control_c": control,
+            "control_setpoint_c": 30.0,
+            "control_hysteresis_c": 2.0,
+            "outdoor_c": temperature,
+            "sun": sun,
+            "mode": "NORMAL",
+        },
+        index=index,
+    )
+    assert (
+        fit_controller_state(
+            frame.iloc[: 7 * 1440], minimum_days=14.0, minimum_density=0.5
+        )
+        is None
+    )
+    controller = fit_controller_state(frame, minimum_days=14.0, minimum_density=0.5)
+    assert controller is not None
+    assert controller.cooling[1] == pytest.approx(-0.01, rel=0.15)
+    model = CycleParameters(
+        20.0, (), (-np.log(1 / 585), 0.0, 0.0, 0.0), 0.4, 4 / 45, 0.0, (), (), 0.2
+    )
+    cfg = HvacModelConfig(model_id="controller", timezone="UTC", enable_t3=False)
+    origin = frame.index[-1].to_pydatetime() + MINUTE
+    kwargs = dict(
+        origin=origin,
+        mode="NORMAL",
+        outdoor_c=float(temperature[-1]),
+        sun=float(sun[-1]),
+        controller=controller,
+    )
+    disabled = initial_distribution(
+        frame.iloc[-360:], [model], cfg, rng=np.random.default_rng(1), **kwargs
+    )
+    enabled = initial_distribution(
+        frame.iloc[-360:],
+        [model],
+        cfg.model_copy(update={"enable_t3": True}),
+        rng=np.random.default_rng(1),
+        **kwargs,
+    )
+    assert (
+        disabled.tier is InputTier.T1_POWER and enabled.tier is InputTier.T3_CONTROLLER
+    )
+    assert (enabled.remaining_min >= 0).all()
