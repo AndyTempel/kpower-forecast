@@ -141,6 +141,15 @@ def fit_outdoor(
     selected = selected.loc[selected.index.intersection(site.index)].dropna()
     if len(selected) < 7:
         raise HvacError("insufficient_weather_calibration")
+    on_reanalysis = bool(
+        on_reanalysis
+        and not forecast.reindex(selected.index)[
+            ["temperature_2m", "shortwave_radiation", "wind_speed_10m"]
+        ]
+        .notna()
+        .all(axis=1)
+        .all()
+    )
     x = _design(selected, timezone)
     y = site.reindex(selected.index).to_numpy(dtype=float)
     beta = np.linalg.solve(x.T @ x + np.diag([0.0, 1.0, 1.0, 1.0, 1.0, 1.0]), x.T @ y)

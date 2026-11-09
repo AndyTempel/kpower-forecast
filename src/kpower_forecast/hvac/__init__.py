@@ -1,6 +1,7 @@
 """Electrical-HVAC contracts, isolated from optional forecasting backends."""
 
 from .bundle import HvacEvaluationBundle
+from .model import KPowerHvacForecast, fingerprint
 from .types import (
     HVAC_CONTRACT_VERSION,
     HVAC_ESTIMATOR_VERSION,
@@ -45,9 +46,11 @@ __all__ = [
     "HvacTrainingData",
     "InputTier",
     "IntervalStats",
+    "KPowerHvacForecast",
     "MeteredScope",
     "MinutePaths",
     "ModeSpan",
     "RatedPoint",
     "SojournEnd",
+    "fingerprint",
 ]

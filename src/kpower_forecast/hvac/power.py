@@ -81,7 +81,7 @@ def fit_power(
     )
     if len(runs) < 3:
         raise HvacError("insufficient_run_power")
-    use_supply = "supply_c" in runs and runs.supply_c.notna().sum() >= 3
+    use_supply = bool("supply_c" in runs and runs.supply_c.notna().sum() >= 3)
     if use_supply:
         runs = runs.dropna(subset=["supply_c"])
     columns = [np.ones(len(runs)), runs.outdoor_c.to_numpy() - 7]
