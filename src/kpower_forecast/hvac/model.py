@@ -490,6 +490,7 @@ def _predict_candidate(
     cfg: HvacModelConfig,
     *,
     cancel: Event | None = None,
+    force_phase_unknown: bool = False,
 ) -> HvacForecast:
     began = monotonic()
     deadline = began + request.deadline_s
@@ -585,8 +586,14 @@ def _predict_candidate(
                 )
             else:
                 diagnostic["off_elapsed_unknown"] = True
+        phase_frame = _water_frame(recent)
+        if force_phase_unknown:
+            # Evaluator B4 hides phase evidence only. Outdoor conditioning and
+            # the measured electrical-power covariate stay identical to cycle.
+            phase_frame = phase_frame.iloc[:0]
+            diagnostic["phase_forced_unknown"] = True
         initial = initial_distribution(
-            _water_frame(recent),
+            phase_frame,
             state.cycle.parameter_sets,
             cfg,
             origin=request.origin,

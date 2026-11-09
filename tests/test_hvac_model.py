@@ -11,7 +11,12 @@ import pandas as pd
 import pytest
 
 from kpower_forecast.hvac.cycle_model import CycleFit, CycleParameters
-from kpower_forecast.hvac.model import KPowerHvacForecast, _State, fingerprint
+from kpower_forecast.hvac.model import (
+    KPowerHvacForecast,
+    _predict_candidate,
+    _State,
+    fingerprint,
+)
 from kpower_forecast.hvac.power import PowerFit
 from kpower_forecast.hvac.types import (
     FitResult,
@@ -276,6 +281,10 @@ def test_fixed_speed_candidate_predicts_all_paths_and_recomputes_statistics(trai
     model.install(candidate)
     result = model.predict(request)
     assert result.minute_paths.power_w.shape == (32, 120)
+    unknown = _predict_candidate(request, candidate, cfg, force_phase_unknown=True)
+    assert unknown.diagnostics["phase_forced_unknown"] is True
+    assert unknown.diagnostics["stationary_initial_state"] is True
+    assert "phase_forced_unknown" not in result.diagnostics
     assert result.paths_w.shape == (16, 24)
     assert result.intervals.run_probability is not None
     quarter = tuple(
