@@ -14,9 +14,10 @@ from datetime import datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Mapping, Self
+from typing import Literal, Mapping, Self, cast, overload
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 from pydantic import (
     AwareDatetime,
@@ -28,7 +29,15 @@ from pydantic import (
     model_validator,
 )
 
-from .types import ModeSpan, utc
+from .types import (
+    HistoryPolicy,
+    HvacCapabilities,
+    HvacModelConfig,
+    HvacTrainingData,
+    ModeSource,
+    ModeSpan,
+    utc,
+)
 
 
 class BundleArtifact(BaseModel):
@@ -157,11 +166,25 @@ class HvacEvaluationBundle:
         _validate_minutes(tables["minutes.parquet"], manifest)
         return cls(manifest, MappingProxyType(tables), MappingProxyType(documents))
 
-    def available_at(self, origin: datetime) -> pd.DataFrame:
+    @overload
+    def available_at(
+        self, origin: datetime, *, include_inputs: Literal[False] = False
+    ) -> pd.DataFrame: ...
+
+    @overload
+    def available_at(
+        self, origin: datetime, *, include_inputs: Literal[True]
+    ) -> BundleSnapshot: ...
+
+    def available_at(
+        self, origin: datetime, *, include_inputs: bool = False
+    ) -> pd.DataFrame | BundleSnapshot:
         """Return an isolated observed-history slice after the availability boundary.
 
         Args:
             origin: Aware UTC origin of a fit or prediction.
+            include_inputs: Return the complete separated feature/outcome snapshot
+                for scoring. The default preserves the original minute-only API.
 
         Returns:
             Copy of minute rows whose end plus measured lag is at/before origin.
@@ -178,7 +201,8 @@ class HvacEvaluationBundle:
         cutoff = pd.Timestamp(origin) - pd.Timedelta(
             minutes=1 + self.manifest.ingest_lag_min
         )
-        return frame.loc[frame.index <= cutoff].copy(deep=True)
+        minutes = frame.loc[frame.index <= cutoff].copy(deep=True)
+        return _bundle_snapshot(self, origin, minutes) if include_inputs else minutes
 
 
 # Compatibility mirror of the owning EMS policy. Synthetic golden cases are
@@ -429,3 +453,331 @@ def _project_effective_mode_spans(
                 )
             )
     return tuple(spans)
+
+
+@dataclass(frozen=True)
+class BundleSnapshot:
+    """One availability boundary: causal features separated from scoring outcomes.
+
+    Outcomes are never passed into fit or predict. S1 deliberately reads oracle
+    commands from outcomes and must be reported as such. Day-0 weather is an
+    explicitly optimistic development approximation, never archived evidence.
+    """
+
+    origin: datetime
+    training: HvacTrainingData
+    weather_forecast: pd.DataFrame
+    vintage_kinds: tuple[str, ...]
+    schedule_payload: Mapping[str, JsonValue] | None
+    schedule_hash: str | None
+    last_mode: str | None
+    last_mode_event: datetime | None
+    ledger: pd.DataFrame
+    baselines: Mapping[str, pd.DataFrame]
+    outcomes: Mapping[str, pd.DataFrame]
+    provenance: Mapping[str, JsonValue]
+
+    def spans(
+        self,
+        variant: Literal["s0", "s1", "s2"],
+        *,
+        device_id: str,
+        horizon_end: datetime,
+    ) -> tuple[ModeSpan, ...]:
+        """Build held, explicitly oracle, or archived effective future spans.
+
+        Args:
+            variant: S0 holds current mode; S1 uses actual future commands; S2
+                uses only the archived version available at this origin.
+            device_id: Selected heat pump for S2.
+            horizon_end: Requested output horizon.
+
+        Returns:
+            Known future spans, with uncertainty only for an active S2 latch.
+
+        Raises:
+            ValueError: For an unknown variant or malformed schedule evidence.
+        """
+        if variant == "s0":
+            return ()
+        if variant == "s2":
+            return effective_mode_spans(
+                self.schedule_payload,
+                device_id,
+                self.origin,
+                self.last_mode,
+                self.last_mode_event,
+                horizon_end=horizon_end,
+            )
+        if variant != "s1":
+            raise ValueError("unknown schedule variant")
+        events = self.outcomes.get("mode_events.parquet", pd.DataFrame())
+        if events.empty:
+            return ()
+        future = events.loc[
+            (events.time > self.origin) & (events.time < horizon_end)
+        ].sort_values("time", kind="stable")
+        spans = []
+        for i, row in enumerate(future.itertuples()):
+            end = (
+                cast(pd.Timestamp, future.time.iloc[i + 1]).to_pydatetime()
+                if i + 1 < len(future)
+                else horizon_end
+            )
+            spans.append(
+                ModeSpan(
+                    start=cast(pd.Timestamp, row.time).to_pydatetime(),
+                    end=end,
+                    mode=str(row.mode),
+                    source=cast(ModeSource, str(row.source)),
+                )
+            )
+        return tuple(spans)
+
+
+def _utc_column(frame: pd.DataFrame, name: str) -> pd.DatetimeIndex:
+    if name not in frame:
+        raise ValueError(f"missing availability column: {name}")
+    index = pd.DatetimeIndex(frame[name])
+    if str(index.tz) != "UTC" or index.hasnans:
+        raise ValueError(f"{name} must contain aware UTC timestamps")
+    return index
+
+
+def _causal_events(frame: pd.DataFrame, origin: datetime, time: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    known = _utc_column(frame, time) <= pd.Timestamp(origin)
+    if "available_at" in frame:
+        known &= _utc_column(frame, "available_at") <= pd.Timestamp(origin)
+    return cast(pd.DataFrame, frame.loc[known].copy().sort_values(time, kind="stable"))
+
+
+def _origin_weather(frame: pd.DataFrame, origin: datetime) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    source = frame.copy()
+    valid = _utc_column(source, "valid_at")
+    available = _utc_column(source, "available_at")
+    allowed = {"archived", "approx_previous_runs", "approx_day0"}
+    if not source.vintage_kind.isin(allowed).all():
+        raise ValueError("unknown weather vintage kind")
+    optimistic = source.vintage_kind.eq("approx_day0").to_numpy()
+    known = (available <= pd.Timestamp(origin)) | optimistic
+    previous = source.vintage_kind.eq("approx_previous_runs").to_numpy()
+    required_day = np.maximum(
+        np.ceil((valid - pd.Timestamp(origin)).total_seconds() / 86400), 1
+    )
+    implied_day = (valid - available).total_seconds() / 86400
+    known &= ~previous | np.isclose(implied_day, required_day)
+    source = source.loc[known].copy()
+    source["_priority"] = source.vintage_kind.map(
+        {"archived": 0, "approx_previous_runs": 1, "approx_day0": 2}
+    )
+    source = source.sort_values(
+        ["valid_at", "_priority", "available_at"],
+        ascending=[True, True, False],
+        kind="stable",
+    ).drop_duplicates("valid_at")
+    # Day0 deliberately has no causal vintage. Preserve its original stamp and
+    # mark a virtual origin-time availability, never mislabel it as an archive.
+    day0 = source.vintage_kind.eq("approx_day0")
+    source["original_available_at"] = source.available_at
+    source.loc[day0, "available_at"] = pd.Timestamp(origin)
+    return source.drop(columns="_priority").set_index("valid_at").sort_index()
+
+
+def _origin_schedule(
+    frame: pd.DataFrame, origin: datetime
+) -> tuple[Mapping[str, JsonValue] | None, str | None]:
+    if frame.empty:
+        return None, None
+    at = _utc_column(frame, "available_at")
+    until = _utc_column(frame, "valid_until")
+    eligible = frame.loc[(at <= pd.Timestamp(origin)) & (pd.Timestamp(origin) < until)]
+    if eligible.empty:
+        return None, None
+    latest = eligible.sort_values("available_at", kind="stable").iloc[-1]
+    payload = json.loads(str(latest.payload_json), parse_constant=_reject_constant)
+    if not isinstance(payload, dict):
+        raise ValueError("schedule version must be a JSON object")
+    semantic = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"generated_at", "valid_until"}
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            semantic, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    ).hexdigest()
+    if (
+        "content_hash" in latest
+        and pd.notna(latest.content_hash)
+        and str(latest.content_hash) != digest
+    ):
+        raise ValueError("schedule semantic content hash mismatch")
+    # A version retains its first whole payload; a seen heartbeat supplies current
+    # publication/expiry times without changing that version's content identity.
+    if "generated_at" in latest and pd.notna(latest.generated_at):
+        generated = pd.Timestamp(latest.generated_at)
+        if str(generated.tz) != "UTC":
+            raise ValueError("schedule generated_at must be aware UTC")
+        payload["generated_at"] = generated.isoformat()
+    payload["valid_until"] = pd.Timestamp(latest.valid_until).isoformat()
+    _SchedulePayload.model_validate(payload)
+    return MappingProxyType(payload), digest
+
+
+def _bundle_snapshot(
+    bundle: HvacEvaluationBundle, origin: datetime, minutes: pd.DataFrame
+) -> BundleSnapshot:
+    from .frames import prepare_minutes
+
+    manifest = bundle.manifest
+    policy_document = bundle.documents.get("history_policy.json")
+    qualification = bundle.documents.get("minute_qualification.json")
+    if not isinstance(policy_document, dict) or not isinstance(qualification, dict):
+        raise ValueError(
+            "full bundle inputs require resolved policy and minute quality evidence"
+        )
+    scope = qualification.get("scope")
+    if scope not in {
+        "direct_device_minutes",
+        "direct_device",
+        "system_attributed_heating",
+    }:
+        raise ValueError("unknown minute target scope")
+    settings = policy_document.get(
+        "minute_history_policy", policy_document.get("policy")
+    )
+    if not isinstance(settings, dict):
+        raise ValueError("missing resolved minute history policy")
+    state = qualification.get("model_state")
+    last_change = (
+        state.get("last_fingerprint_change_at") if isinstance(state, dict) else None
+    )
+    policy = HistoryPolicy.model_validate(
+        {
+            "version": settings.get("_HISTORY_POLICY_VERSION"),
+            "scope": (
+                "direct_device"
+                if scope in {"direct_device_minutes", "direct_device"}
+                else scope
+            ),
+            "settings": settings,
+            "measured_valid_qualities": policy_document.get("measured_valid_qualities"),
+            "last_fingerprint_change_at": last_change,
+        }
+    )
+    events = _causal_events(
+        bundle.tables.get("mode_events.parquet", pd.DataFrame()), origin, "time"
+    )
+    controls = _causal_events(
+        bundle.tables.get("control_events.parquet", pd.DataFrame()), origin, "time"
+    )
+    weather = bundle.tables.get("weather.parquet", pd.DataFrame()).copy()
+    if len(weather):
+        stamp = (
+            _utc_column(weather, "ds")
+            if "ds" in weather
+            else _utc_index(weather.index, "weather")
+        )
+        known = stamp <= pd.Timestamp(origin)
+        if "available_at" in weather:
+            known &= _utc_column(weather, "available_at") <= pd.Timestamp(origin)
+        weather = cast(pd.DataFrame, weather.loc[known].copy())
+    lineage = {"controller": manifest.controller_id, "device": manifest.device_id}
+    for column in minutes:
+        if isinstance(column, str) and column.endswith("__source_device"):
+            known_source = minutes[column].dropna()
+            if len(known_source):
+                lineage[column] = str(known_source.iloc[-1])
+    training = HvacTrainingData(
+        HvacCapabilities.model_validate(bundle.documents["capabilities.json"]),
+        minutes,
+        events,
+        weather,
+        manifest.start,
+        lineage,
+        policy,
+        controls,
+    )
+    forecast_weather = _origin_weather(
+        bundle.tables.get("weather_vintages.parquet", pd.DataFrame()), origin
+    )
+    kinds = (
+        tuple(sorted(str(v) for v in forecast_weather.vintage_kind.unique()))
+        if len(forecast_weather)
+        else ()
+    )
+    payload, digest = _origin_schedule(
+        bundle.tables.get("schedules.parquet", pd.DataFrame()), origin
+    )
+    last_mode = str(events["mode"].iloc[-1]) if len(events) else None
+    latch = (
+        events.loc[events["mode"].eq("OFF") & events.source.eq("thermostat")]
+        if len(events)
+        else events
+    )
+    latch_at = latch.time.iloc[-1].to_pydatetime() if len(latch) else None
+    ledger = _causal_events(
+        bundle.tables.get("ledger.parquet", pd.DataFrame()), origin, "observed_until"
+    )
+    baselines = {
+        name: _causal_events(bundle.tables.get(name, pd.DataFrame()), origin, "origin")
+        for name in (
+            "served_forecast.parquet",
+            "r1c_replay.parquet",
+            "legacy_shadow.parquet",
+            "r1c_shadow.parquet",
+        )
+    }
+    # Actuals are separate from features and are qualified at export availability.
+    # They can contain future outcomes relative to this prediction origin.
+    outcome_cfg = HvacModelConfig(
+        model_id="actuals",
+        timezone=manifest.timezone,
+        ingest_lag_min=cast(int, manifest.ingest_lag_min),
+    )
+    actuals = {
+        name: bundle.tables.get(name, pd.DataFrame()).copy(deep=True)
+        for name in (
+            "site_minutes.parquet",
+            "site_quarters.parquet",
+            "tariff_quarters.parquet",
+            "mode_events.parquet",
+            "live_forecasts.parquet",
+            "live_first_hour.parquet",
+            "live_reserves.parquet",
+        )
+    }
+    actuals["minutes.parquet"] = prepare_minutes(
+        bundle.tables["minutes.parquet"],
+        outcome_cfg,
+        as_of=manifest.exported_at,
+        policy=policy,
+        training=False,
+        epoch_start=manifest.start,
+    )
+    return BundleSnapshot(
+        origin,
+        training,
+        forecast_weather,
+        kinds,
+        payload,
+        digest,
+        last_mode,
+        latch_at,
+        ledger,
+        MappingProxyType(baselines),
+        MappingProxyType(actuals),
+        MappingProxyType(
+            {
+                "scope": manifest.metadata.get("scope", "development"),
+                "epoch_basis": "bundle_start",
+                "lineage_basis": "observed_source_device_ids",
+                "tariff_source": manifest.metadata.get("tariff_source"),
+            }
+        ),
+    )
