@@ -1,0 +1,151 @@
+{
+  "start": "2026-10-24T12:00:00+00:00",
+  "as_of": "2026-11-09T12:03:00+00:00",
+  "periods": 23040,
+  "version": 3,
+  "settings": {
+    "_HISTORY_POLICY_VERSION": 3,
+    "_MAX_TRAINING_GAP": {
+      "seconds": 86400.0
+    },
+    "_MIN_SPAN_DAYS": 14.0,
+    "_MIN_DENSITY": 0.5,
+    "_MIN_HOURS_SINCE_CHANGE": 48,
+    "_ATTRIBUTION_QUALITY_WINDOW": {
+      "seconds": 604800.0
+    },
+    "_FULL_ATTRIBUTION_COVERAGE_RATIO": 0.95,
+    "_MIN_FULL_ATTRIBUTION_ROW_FRACTION": 0.8,
+    "_MIN_MEAN_ATTRIBUTION_COVERAGE": 0.95,
+    "_HISTORY_ROW_LABEL_OFFSET": {
+      "seconds": 900.0
+    },
+    "_MAX_BRIDGED_GAP_INTERVALS": 4
+  },
+  "measured_valid_qualities": [
+    "degraded",
+    "good"
+  ],
+  "cases": {
+    "good": {
+      "missing_ranges": [],
+      "scope": "direct_device",
+      "last_change": null,
+      "expected": {
+        "rows": 23040,
+        "start": "2026-10-24T12:00:00+00:00",
+        "span_days": 15.999305555555555,
+        "density": 1.0,
+        "full_fraction": null,
+        "mean_coverage": null,
+        "reliable": true,
+        "reason": null
+      }
+    },
+    "short_gap": {
+      "missing_ranges": [
+        [
+          14400,
+          14402
+        ]
+      ],
+      "scope": "direct_device",
+      "last_change": null,
+      "expected": {
+        "rows": 23040,
+        "start": "2026-10-24T12:00:00+00:00",
+        "span_days": 15.999305555555555,
+        "density": 0.9999131944444445,
+        "full_fraction": null,
+        "mean_coverage": null,
+        "reliable": true,
+        "reason": null
+      }
+    },
+    "large_gap": {
+      "missing_ranges": [
+        [
+          11520,
+          12961
+        ]
+      ],
+      "scope": "direct_device",
+      "last_change": null,
+      "expected": {
+        "rows": 10079,
+        "start": "2026-11-02T12:01:00+00:00",
+        "span_days": 6.998611111111111,
+        "density": 1.0,
+        "full_fraction": null,
+        "mean_coverage": null,
+        "reliable": false,
+        "reason": "insufficient_history"
+      }
+    },
+    "missing_coverage": {
+      "missing_ranges": [],
+      "scope": "system_attributed_heating",
+      "last_change": null,
+      "expected": {
+        "rows": 23040,
+        "start": "2026-10-24T12:00:00+00:00",
+        "span_days": 15.999305555555555,
+        "density": 1.0,
+        "full_fraction": 0.0,
+        "mean_coverage": 0.0,
+        "reliable": false,
+        "reason": "partial_attribution_coverage"
+      }
+    },
+    "invalid_target": {
+      "missing_ranges": [
+        [
+          15000,
+          15001
+        ]
+      ],
+      "scope": "direct_device",
+      "last_change": null,
+      "expected": {
+        "rows": 23040,
+        "start": "2026-10-24T12:00:00+00:00",
+        "span_days": 15.999305555555555,
+        "density": 0.9999565972222222,
+        "full_fraction": null,
+        "mean_coverage": null,
+        "reliable": true,
+        "reason": null
+      }
+    },
+    "optional_sensor_outage": {
+      "missing_ranges": [],
+      "scope": "direct_device",
+      "last_change": null,
+      "expected": {
+        "rows": 23040,
+        "start": "2026-10-24T12:00:00+00:00",
+        "span_days": 15.999305555555555,
+        "density": 1.0,
+        "full_fraction": null,
+        "mean_coverage": null,
+        "reliable": true,
+        "reason": null
+      }
+    },
+    "recent_change": {
+      "missing_ranges": [],
+      "scope": "direct_device",
+      "last_change": "2026-11-08T12:03:00+00:00",
+      "expected": {
+        "rows": 23040,
+        "start": "2026-10-24T12:00:00+00:00",
+        "span_days": 15.999305555555555,
+        "density": 1.0,
+        "full_fraction": null,
+        "mean_coverage": null,
+        "reliable": false,
+        "reason": "recent_device_change"
+      }
+    }
+  }
+}
