@@ -376,6 +376,15 @@ def test_fixed_speed_fit_to_prediction_uses_the_physical_model(training):
     assert (
         forecast.diagnostics["reliable"] is False
     )  # 3d never waives the owner 14d policy
+    cold_recent = minutes.tail(360).copy()
+    cold_recent["outdoor_env_c"] = -10.0
+    cold_weather = request.weather_forecast.copy()
+    cold_weather["temperature_2m"] = -10.0
+    cold = model.predict(
+        replace(request, recent=cold_recent, weather_forecast=cold_weather)
+    )
+    assert cold.diagnostics["outdoor_extrapolated"] is True
+    assert forecast.diagnostics["outdoor_extrapolated"] is False
 
 
 def test_t3_fit_learns_mode_conditioned_thresholds_from_command_history(training):
