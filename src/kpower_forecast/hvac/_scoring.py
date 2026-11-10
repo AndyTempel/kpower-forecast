@@ -187,8 +187,9 @@ def energy_scores(
         hours: Whole-hour horizon, including the separate 120-hour M6 pass.
 
     Returns:
-        Non-overlapping 1/6/24-hour windows. Official error is NaN unless complete;
-        partial errors compare exactly the observed minutes without rescaling.
+        First 1/6/24-hour windows are official M6. Later windows are explicitly
+        lead-labelled diagnostics. Official error is NaN unless complete; partial
+        errors compare exactly the observed minutes without rescaling.
 
     Raises:
         ValueError: For incompatible baseline lengths or a non-minute origin.
@@ -243,6 +244,15 @@ def _energy_windows(
                         "origin": origin,
                         "interval_start": index[left].to_pydatetime(),
                         "duration_h": duration,
+                        "lead_min": (
+                            index[left].to_pydatetime() - origin
+                        ).total_seconds()
+                        / 60,
+                        "energy_scope": (
+                            "first_horizon"
+                            if index[left] == origin
+                            else "lead_diagnostic"
+                        ),
                         "model": name,
                         "eligible": complete,
                         "coverage": coverage,

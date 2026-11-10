@@ -130,6 +130,13 @@ def write_report(
         "decision; missing evidence is not a pass.",
         "",
     ]
+    lines += [
+        "Official M6 and A4 use the first 1/6/24 hours from the actual origin. "
+        "Later windows are lead-labelled diagnostics in metrics.json and "
+        "energy.parquet. Missing actuals or an unpublished forecast prefix "
+        "never become a complete energy window.",
+        "",
+    ]
     for key in ("M1", "M2", "M3", "M4", "M5", "M6", "M7", "future_comfort_off_error"):
         value = metrics.get(key)
         records = cast(

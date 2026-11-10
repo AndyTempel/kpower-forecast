@@ -9,12 +9,153 @@ import numpy as np
 import pandas as pd
 
 from ._backtest import BacktestResult, _site_quality
-from ._baselines import legacy_baseline, r1c_probabilities, simple_baselines
+from ._baselines import (
+    BaselineForecast,
+    legacy_baseline,
+    r1c_probabilities,
+    simple_baselines,
+)
 from ._scoring import _energy_windows
+from .aggregate import _integral
 from .bundle import BundleSnapshot, HvacEvaluationBundle
 from .evaluation import actual_intervals, lead_bucket, pinball, regular_grid
 from .settlement import SettlementWindow, settlement_need
 from .types import GridInterval, HvacError, HvacModelConfig, MinutePaths, utc
+
+
+def _official_energy(
+    view: BundleSnapshot,
+    rows: pd.DataFrame,
+    baselines: dict[str, BaselineForecast],
+) -> pd.DataFrame:
+    """Use original actual-origin totals; never fill an unpublished prefix."""
+    totals = view.outcomes.get("live_horizon_energy.parquet", pd.DataFrame())
+    lookup: dict[int, float] = {}
+    if not totals.empty:
+        selected = totals.loc[totals.origin.eq(view.origin)].copy()
+        if selected.duplicated(["horizon", "duration_h"]).any():
+            raise HvacError("duplicate original horizon energy identity")
+        if not selected.horizon.isin(["hourly", "daily"]).all():
+            raise HvacError("unknown original horizon publication")
+        selected["_priority"] = selected.horizon.map({"hourly": 0, "daily": 1})
+        for row in selected.sort_values("_priority").itertuples():
+            if isinstance(row.duration_h, bool) or isinstance(row.expected_kwh, bool):
+                raise HvacError("invalid original horizon energy")
+            duration = float(cast(float, row.duration_h))
+            value = float(cast(float, row.expected_kwh))
+            if duration not in (1, 6, 24) or not np.isfinite(value) or value < 0:
+                raise HvacError("invalid original horizon energy")
+            lookup.setdefault(int(duration), value)
+    result = rows.copy()
+    actual = view.outcomes["minutes.parquet"]
+    additions: list[dict[str, object]] = []
+    for duration in (1, 6, 24):
+        end = view.origin + timedelta(hours=duration)
+        start = pd.Timestamp(view.origin).floor("min")
+        index = pd.date_range(
+            start, pd.Timestamp(end).ceil("min"), freq="min", inclusive="left"
+        )
+        power = actual.reindex(index).power_w.to_numpy(dtype=float)
+        known = np.isfinite(power)
+        offset = (view.origin - start.to_pydatetime()).total_seconds() / 60
+        left, right = np.array([offset]), np.array([offset + duration * 60])
+        covered = float(_integral(known[None, :], left, right)[0, 0])
+        actual_partial = float(
+            _integral(np.where(known, power, 0.0)[None, :], left, right)[0, 0] / 60000
+        )
+        full = bool(np.isclose(covered, duration * 60, rtol=0, atol=1e-9))
+        for model in ("cycle", *baselines):
+            existing = result.index[
+                result.interval_start.eq(view.origin)
+                & result.duration_h.eq(duration)
+                & result.model.eq(model)
+            ]
+            if len(existing) > 1:
+                raise HvacError("duplicate official energy window")
+            if len(existing) and (model != "cycle" or duration not in lookup):
+                continue  # Aligned, complete published quarter means are additive.
+            expected = (
+                lookup.get(duration, np.nan)
+                if model == "cycle"
+                else (
+                    float(baselines["B1"].expected_kwh[0] * 4 * duration)
+                    if model == "B1"
+                    else np.nan
+                )
+            )
+            complete = bool(full and np.isfinite(expected))
+            record: dict[str, object] = {
+                "origin": view.origin,
+                "interval_start": view.origin,
+                "duration_h": duration,
+                "lead_min": 0.0,
+                "energy_scope": "first_horizon",
+                "model": model,
+                "eligible": complete,
+                "coverage": covered / (duration * 60),
+                "observed_minutes": covered,
+                "actual_kwh": actual_partial if complete else np.nan,
+                "expected_kwh": expected,
+                "error_kwh": expected - actual_partial if complete else np.nan,
+                "partial_actual_kwh": actual_partial if covered > 0 else np.nan,
+                "partial_expected_kwh": (
+                    expected
+                    if complete
+                    else (
+                        expected * covered / (duration * 60)
+                        if model == "B1"
+                        else np.nan
+                    )
+                ),
+                "partial_error_kwh": (
+                    expected - actual_partial
+                    if complete
+                    else (
+                        expected * covered / (duration * 60) - actual_partial
+                        if model == "B1" and covered > 0
+                        else np.nan
+                    )
+                ),
+                "partial_method": (
+                    "original_total_complete_window_only"
+                    if model == "cycle"
+                    else (
+                        "causal_flat_mean"
+                        if model == "B1"
+                        else "missing_published_prefix"
+                    )
+                ),
+                "horizon_evidence": (
+                    "original_mean_total"
+                    if model == "cycle" and duration in lookup
+                    else (
+                        "causal_flat_mean"
+                        if model == "B1"
+                        else "missing_published_prefix"
+                    )
+                ),
+            }
+            if len(existing):
+                previous = result.loc[existing[0]]
+                previous_mean = float(previous.expected_kwh)
+                if np.isfinite(previous_mean) and not np.isclose(
+                    previous_mean, expected, rtol=1e-9, atol=1e-9
+                ):
+                    raise HvacError(
+                        "original horizon total contradicts complete published means"
+                    )
+                # Keep the separately labelled observed-footprint diagnostic
+                # from published interval means when it can be computed.
+                for key in (
+                    "partial_actual_kwh",
+                    "partial_expected_kwh",
+                    "partial_error_kwh",
+                    "partial_method",
+                ):
+                    record[key] = previous[key]
+                result = result.drop(index=existing)
+            additions.append(record)
+    return pd.concat([result, pd.DataFrame.from_records(additions)], ignore_index=True)
 
 
 def _original_number(rows: pd.DataFrame, name: str) -> float | None:
@@ -428,12 +569,16 @@ def live_score(
             }
         )
         tables["energy"].append(
-            _energy_windows(
-                origin,
-                index,
-                actual.reindex(index).power_w.to_numpy(dtype=float),
-                predictions,
-                cycle_method="published_quarter_mean_piecewise_constant",
+            _official_energy(
+                view,
+                _energy_windows(
+                    origin,
+                    index,
+                    actual.reindex(index).power_w.to_numpy(dtype=float),
+                    predictions,
+                    cycle_method="published_quarter_mean_piecewise_constant",
+                ),
+                baselines,
             )
         )
         tables["blocks"].append(_live_blocks(view, grid, baselines["B3"].planner_w))

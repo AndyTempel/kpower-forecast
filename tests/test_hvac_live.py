@@ -125,8 +125,12 @@ def test_live_scores_published_quantiles_reserves_and_unknown_original_evidence(
     )  # never substitutes for published size
     assert report["gates"]["A4"]["status"] == "unscorable"
     assert result.tables["energy"].loc[
-        lambda rows: rows.model.eq("cycle")
+        lambda rows: rows.model.eq("cycle") & rows.energy_scope.eq("lead_diagnostic")
     ].partial_method.unique().tolist() == ["published_quarter_mean_piecewise_constant"]
+    official = result.tables["energy"].loc[
+        lambda rows: rows.model.eq("cycle") & rows.energy_scope.eq("first_horizon")
+    ]
+    assert len(official) == 3 and not official.eligible.any()
     changed = published.tables["live_forecasts.parquet"].copy()
     changed[["n_paths", "run_threshold_w"]] = np.nan
     missing = replace(
@@ -159,3 +163,51 @@ def test_live_rejects_duplicate_or_conflicting_published_identity(published):
     )
     with pytest.raises(ValueError, match="duplicate published"):
         live_score(duplicate, cfg, deploy=ORIGIN - timedelta(minutes=1))
+
+
+def test_original_horizon_total_scores_missing_grid_prefix_without_model_or_gap_fill(
+    published, monkeypatch
+):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("must use published horizon total")
+
+    monkeypatch.setattr(KPowerHvacForecast, "predict", forbidden)
+    cfg = HvacModelConfig(model_id="test", timezone="UTC", ingest_lag_min=2)
+    origin = ORIGIN - timedelta(minutes=1)
+    totals = pd.DataFrame(
+        [{"origin": origin, "horizon": "hourly", "duration_h": 1, "expected_kwh": 0.9}]
+    )
+    source = replace(
+        published, tables={**published.tables, "live_horizon_energy.parquet": totals}
+    )
+    result = live_score(source, cfg, deploy=origin)
+    row = (
+        result.tables["energy"]
+        .loc[
+            lambda rows: (
+                rows.model.eq("cycle")
+                & rows.energy_scope.eq("first_horizon")
+                & rows.duration_h.eq(1)
+            )
+        ]
+        .iloc[0]
+    )
+    assert row.interval_start == origin and row.eligible
+    assert row.expected_kwh == 0.9 and row.horizon_evidence == "original_mean_total"
+    actual = published.tables["minutes.parquet"].copy()
+    actual.loc[origin, "power_w"] = np.nan
+    gapped = replace(source, tables={**source.tables, "minutes.parquet": actual})
+    result = live_score(gapped, cfg, deploy=origin)
+    row = (
+        result.tables["energy"]
+        .loc[
+            lambda rows: (
+                rows.model.eq("cycle")
+                & rows.energy_scope.eq("first_horizon")
+                & rows.duration_h.eq(1)
+            )
+        ]
+        .iloc[0]
+    )
+    assert not row.eligible and row.coverage == pytest.approx(59 / 60)
+    assert np.isnan(row.error_kwh) and np.isnan(row.partial_error_kwh)

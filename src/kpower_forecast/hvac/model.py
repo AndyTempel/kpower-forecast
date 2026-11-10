@@ -25,7 +25,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, JsonValue
 from kpower_forecast import __version__
 
 from ._stats import censored_lognormal_aft, check_budget
-from .aggregate import interval_stats, representatives
+from .aggregate import _integral, interval_stats, representatives
 from .cycle_model import CycleFit, fit_cycles
 from .cycles import extract_cycles, modes_at
 from .families import EnergyFit, energy_paths, fit_energy
@@ -652,6 +652,26 @@ def _predict_candidate(
         diagnostic.update({key: True for key in simulated.diagnostics})
         diagnostic["stationary_initial_state"] = initial.stationary
     intervals = interval_stats(paths, request.grid)
+    offset = (request.origin - paths.start).total_seconds() / 60
+    horizons = [
+        hours for hours in (1, 6, 24) if offset + hours * 60 <= paths.power_w.shape[1]
+    ]
+    if horizons:
+        # Means are additive. Retain original actual-origin totals without
+        # serializing paths or relying on an upcoming-quarter display grid.
+        mean_power = np.mean(paths.power_w, axis=0, dtype=float)
+        energy = (
+            _integral(
+                mean_power[None, :],
+                np.full(len(horizons), offset),
+                offset + np.asarray(horizons) * 60,
+            )[0]
+            / 60000
+        )
+        diagnostic["horizon_energy_kwh"] = {
+            str(hours): float(value)
+            for hours, value in zip(horizons, energy, strict=True)
+        }
     diagnostic.update({"tier": tier.value, "predict_seconds": monotonic() - began})
     check_budget(cancel, deadline)
     return HvacForecast(

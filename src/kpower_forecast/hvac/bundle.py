@@ -761,6 +761,7 @@ def _bundle_snapshot(
             "mode_events.parquet",
             "live_forecasts.parquet",
             "live_first_hour.parquet",
+            "live_horizon_energy.parquet",
             "live_reserves.parquet",
             "live_window_inputs.parquet",
         )

@@ -98,8 +98,23 @@ def summarize(
             result.append(record)
         summaries[name] = result
     energy_summary = []
-    if not energy.empty:
-        for (model, duration), part in energy.groupby(["model", "duration_h"]):
+    energy_first = (
+        energy.loc[energy.interval_start.eq(energy.origin)].copy()
+        if not energy.empty
+        else energy
+    )
+    energy_later = (
+        energy.loc[~energy.interval_start.eq(energy.origin)].copy()
+        if not energy.empty
+        else energy
+    )
+    if not energy_later.empty:
+        energy_later["lead_min"] = (
+            pd.to_datetime(energy_later.interval_start)
+            - pd.to_datetime(energy_later.origin)
+        ).dt.total_seconds() / 60
+    if not energy_first.empty:
+        for (model, duration), part in energy_first.groupby(["model", "duration_h"]):
             official = part.loc[part.eligible]
             energy_summary.append(
                 {
@@ -117,6 +132,29 @@ def summarize(
                 }
             )
     summaries["M6"] = energy_summary
+    summaries["M6_definition"] = "first_1_6_24_hours_from_actual_origin"
+    later_summary = []
+    if not energy_later.empty:
+        for (model, duration, lead), part in energy_later.groupby(
+            ["model", "duration_h", "lead_min"]
+        ):
+            official = part.loc[part.eligible]
+            later_summary.append(
+                {
+                    "model": model,
+                    "duration_h": duration,
+                    "lead_min": lead,
+                    "scope": "lead_diagnostic",
+                    "attempted": len(part),
+                    "eligible": len(official),
+                    "mae_kwh": float(official.error_kwh.abs().mean()),
+                    "bias_kwh": float(official.error_kwh.mean()),
+                    "partial_n": int(part.partial_error_kwh.notna().sum()),
+                    "partial_mae_kwh": float(part.partial_error_kwh.abs().mean()),
+                    "mean_coverage": float(part.coverage.mean()),
+                }
+            )
+    summaries["M6_lead_diagnostics"] = later_summary
     gates: dict[str, object] = {}
     a1 = []
     for bucket, _, _ in LEAD_BUCKETS[:3]:
@@ -219,7 +257,11 @@ def summarize(
         ),
         "checks": a3,
     }
-    day = energy.loc[energy.duration_h.eq(24)] if not energy.empty else energy
+    day = (
+        energy_first.loc[energy_first.duration_h.eq(24)]
+        if not energy_first.empty
+        else energy_first
+    )
     pairs = _pairs(day, "B1", ["origin", "interval_start", "duration_h"], "error_kwh")
     a4: dict[str, object] = {"paired_n": len(pairs), "status": "unscorable"}
     if len(pairs):
