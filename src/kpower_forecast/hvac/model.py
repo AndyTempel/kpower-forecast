@@ -10,7 +10,7 @@ import hashlib
 import json
 import os
 import tempfile
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event, RLock
@@ -54,6 +54,7 @@ from .types import (
     InputTier,
     utc,
 )
+from .water import WaterFit, current_water, fit_water
 
 
 class _State(BaseModel):
@@ -71,6 +72,7 @@ class _State(BaseModel):
     power: PowerFit | None = None
     energy: EnergyFit | None = None
     threshold_w: float | None = None
+    water: WaterFit | None = None
     comfort_off: dict[str, tuple[float, float]]
     outdoor_low_c: float
     outdoor_high_c: float
@@ -274,6 +276,7 @@ def _fit_candidate(
     elif classified.reason:
         fallback = classified.reason
     cycle = None
+    water = None
     power = None
     energy = None
     tier = InputTier.ENERGY
@@ -297,6 +300,8 @@ def _fit_candidate(
         diagnostic["dropped_left_edges"] = extraction.dropped_left_edges
         if cycle is not None:
             power = fit_power(frame, events, cfg, data.capabilities.metered_scope)
+            water = fit_water(frame, sojourns)
+            diagnostic["buffer_nowcast_samples"] = water.samples if water else 0
             tier = InputTier.POWER
             diagnostic.update(
                 {
@@ -330,6 +335,7 @@ def _fit_candidate(
         power=power,
         energy=energy,
         threshold_w=classified.threshold_w,
+        water=water,
         comfort_off=off,
         outdoor_low_c=float(known.quantile(0.02)),
         outdoor_high_c=float(known.quantile(0.98)),
@@ -492,6 +498,15 @@ def _predict_candidate(
         if force_phase_unknown:
             # Phase ablation hides compressor-state evidence; covariates stay identical.
             diagnostic["phase_forced_unknown"] = True
+        elif state.water is not None and phase.running is False:
+            hint = current_water(recent, pd.Timestamp(request.origin))
+            if hint is not None:
+                diagnostic["buffer_remaining_min"] = hint
+                phase = replace(
+                    phase,
+                    water_min=hint * float(np.exp(state.water.bias)),
+                    water_sigma=state.water.sigma,
+                )
         simulated = simulate(
             request,
             state.cycle,

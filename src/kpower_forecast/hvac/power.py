@@ -1,16 +1,19 @@
 """Measured electrical power while running, idle and off.
 
 A fixed-speed compressor's electrical input rises through a run as the supply
-water warms (observed: about 4.0 kW at start to 4.8 kW after ~15 minutes, with
-a partial first minute). A flat level underestimates quarter-hour peaks, and a
+water warms (observed: about 4.2 kW early to 5.2 kW after ~20 minutes, with a
+partial first minute). A flat level underestimates quarter-hour peaks, and a
 straight line overstates long runs, so run power is the measured profile
 by minute-in-run (mean) plus a linear outdoor-temperature term:
 
     P(k, T) = profile[min(k, K)] + c * (T - 7)
 
-``profile`` is the mean over runs with known starts (including each run's
-partial stop minute, so energy is preserved), up to the last minute observed in
-enough runs; later minutes hold the last value.
+``profile`` is the mean over interior minutes of runs with known starts, up to
+the last minute observed in enough runs; later minutes hold the last value.
+Each run's partial stop minute has its own measured mean (``stop_w``), which the
+simulation applies to the last minute of every run. Averaging stop minutes into
+the profile would preserve energy but lower every late-run minute, exactly where
+quarter-hour peaks occur.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ class PowerFit:
     idle_w: float
     off_w: float
     metered_scope: MeteredScope
+    stop_w: float | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -92,10 +96,21 @@ def fit_power(
     minute = running.groupby(segment).cumcount().to_numpy()
     # A run whose start is a gap has an unknown minute index; exclude it.
     known_start = running.shift().notna().groupby(segment).transform("first").to_numpy()
+    on = running.eq(1).to_numpy()
+    following = running.shift(-1)
+    stop = on & following.eq(0).to_numpy()
+    measured = frame.power_w.notna().to_numpy()
+    stop_power = frame.power_w.to_numpy(dtype=float)[stop & measured]
+    # Interior minutes only; merged in-run dips are not run power either.
+    interior = on & following.eq(1).to_numpy()
+    level = frame.power_w.to_numpy(dtype=float)
+    if (interior & measured).any():
+        floor = 0.5 * float(np.nanmedian(level[interior & measured]))
+        interior &= ~(level < floor)
     use = (
-        running.eq(1).to_numpy()
+        interior
         & known_start
-        & frame.power_w.notna().to_numpy()
+        & measured
         & np.isfinite(frame.outdoor_c.to_numpy(dtype=float))
     )
     if use.sum() < MIN_RUN_MINUTES_FOR_FIT:
@@ -114,8 +129,6 @@ def fit_power(
     centred_t = t - pd.Series(t).groupby(k).transform("mean").to_numpy()
     slope = float(huber_regression(centred_t[:, None], centred_p)[0])
     adjusted = p - slope * t
-    # Means, not medians: every run ends in a partial minute, and only the mean
-    # profile reproduces measured run energy (medians overstate it by ~5 %).
     profile = pd.Series(adjusted).groupby(k).mean().reindex(range(last + 1))
     profile = profile.interpolate(limit_direction="both")
     residual = adjusted - profile.to_numpy()[k]
@@ -136,4 +149,5 @@ def fit_power(
         idle_w,
         float(np.median(off_power)) if len(off_power) else idle_w,
         scope,
+        float(np.mean(stop_power)) if len(stop_power) else None,
     )

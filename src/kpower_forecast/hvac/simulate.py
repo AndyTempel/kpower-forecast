@@ -45,6 +45,9 @@ class InitialState:
     elapsed_min: float = 0.0
     prev_run_min: float | None = None
     lockout_min: float = 0.0
+    # Calibrated median remaining idle from the buffer nowcast, and its log spread.
+    water_min: float | None = None
+    water_sigma: float = 0.0
 
 
 def initial_state(
@@ -319,6 +322,11 @@ def simulate(
         mu = locate(running, temperature[:, 0], sun[0], codes[:, 0], prev_run)
         sigma = np.where(running, fit.run_sigma, fit.idle_sigma)
         remaining = conditional_lognormal(mu, sigma, elapsed, rng)
+        if initial.water_min is not None and not initial.running:
+            diagnostics.add("buffer_nowcast")
+            remaining = initial.water_min * np.exp(
+                initial.water_sigma * rng.normal(size=n)
+            )
         # Manufacturer minimums count from spell start; the reported lockout is
         # already the time left at the origin.
         remaining = np.maximum(
@@ -397,6 +405,10 @@ def simulate(
         level = power.run_power(minute, temperature[:, a:b])
         low = np.where(is_off_code[codes[:, a:b]], power.off_w, power.idle_w)
         watts[:, a:b] = np.where(state[:, a:b], level, low)
+    if power.stop_w is not None and horizon > 1:
+        # The last minute of a run is partial; the final column's end is unknown.
+        ending = state[:, :-1] & ~state[:, 1:]
+        watts[:, :-1][ending] = power.stop_w
     return SimulationResult(
         MinutePaths(start, watts, state, starts),
         tuple(sorted(diagnostics)),

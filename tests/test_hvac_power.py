@@ -28,7 +28,9 @@ def test_power_recovers_rising_run_level_ramp_and_standby():
     cfg = HvacModelConfig(model_id="t", timezone="UTC")
     fit = fit_power(frame, events, cfg, MeteredScope.WHOLE_UNIT)
     assert abs(fit.per_c_w + 30) < 5
-    assert len(fit.profile_w) == 20
+    # The stop minute is modelled separately and does not lower the late profile.
+    assert len(fit.profile_w) == 19
+    assert fit.stop_w is not None and abs(fit.stop_w - (4000 + 60 * 19)) < 60
     assert abs(fit.profile_w[0] - 0.6 * 4000) < 60  # partial first minute
     assert abs(fit.profile_w[10] - 4600) < 60  # one 20 kW spike is clipped
     assert fit.idle_w == 95.0 and fit.off_w == 95.0

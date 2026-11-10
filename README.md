@@ -160,10 +160,18 @@ with a known start becomes a training row; a spell interrupted by a real mode
 change or control intervention, or ended at a gap, is right-censored. Idle and
 run lengths are recency-weighted (default half-life 3 days) censored log-normal
 regressions on outdoor temperature, radiation and mode; idle also depends on the
-length of the run before it. Run power is the measured mean profile by
-minute-in-run (it rises as the supply water warms) plus a robust outdoor
-temperature slope; idle and off standby are measured medians. Prediction conditions the current spell on its
-observed age, then simulates 256 paths minute by minute along MOS-corrected
+length of the run before it. Run power is the measured mean profile over
+interior minutes of runs (it rises as the supply water warms, about 4.2 to 5.2 kW
+on the development site) plus a robust outdoor temperature slope; the partial
+stop minute has its own measured level so late-run quarter-hour peaks are not
+diluted. Idle and off standby are measured medians.
+
+When the buffer (control) temperature, its setpoint and hysteresis are measured,
+the current idle is nowcast physically: the unit restarts at
+`setpoint - hysteresis`, so the remaining idle is the gap divided by the recent
+cooling rate, calibrated on complete idles. Without enough such idles the
+duration model is used alone. Prediction conditions the current spell on its
+observed age (or the buffer nowcast), then simulates 256 paths minute by minute along MOS-corrected
 outdoor paths and the caller's mode schedule, including an uncertain release of
 an active comfort OFF. Run timing is predictable for roughly two to three cycles;
 beyond that the ensemble mean is flat by design and the information is in the
