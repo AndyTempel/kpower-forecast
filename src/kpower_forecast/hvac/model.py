@@ -113,17 +113,25 @@ def _fingerprint(
     policy: HistoryPolicy,
     lineage: Mapping[str, str],
 ) -> str:
+    config_identity = cfg.model_dump(mode="json")
+    policy_identity = policy.model_dump(mode="json")
+    config_identity["off_modes"] = sorted(cfg.off_modes)
+    policy_identity["measured_valid_qualities"] = sorted(
+        policy.measured_valid_qualities
+    )
     identity = {
         "contract": HVAC_CONTRACT_VERSION,
         "estimator": HVAC_ESTIMATOR_VERSION,
-        "config": cfg.model_dump(mode="json"),
+        "config": config_identity,
         "capabilities": capabilities.model_dump(mode="json"),
-        "policy": policy.model_dump(mode="json"),
+        "policy": policy_identity,
         "lineage": dict(lineage),
         "outdoor_precedence": ["unit", "environment", "weather"],
         "tier_set": ["t0_energy", "t1_power", "t2_water"]
         + (["t3_controller"] if cfg.enable_t3 else []),
     }
+    # These inputs are sets, not ordered statistical quantities. Their JSON
+    # iteration order can change on a validation round-trip or another process.
     canonical = json.dumps(
         identity, sort_keys=True, separators=(",", ":"), allow_nan=False
     )

@@ -1,6 +1,9 @@
 """Lifecycle, family fallbacks and origin-availability contract regressions."""
 
 import json
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -31,6 +34,31 @@ from kpower_forecast.hvac.types import (
     InputTier,
     MeteredScope,
 )
+
+
+def test_fingerprint_canonicalizes_sets_across_roundtrips_and_hash_seeds():
+    source = """
+from kpower_forecast.hvac import HistoryPolicy, HvacCapabilities, HvacModelConfig
+from kpower_forecast.hvac.model import _fingerprint
+p = HistoryPolicy(version=1, scope="direct_device", settings={},
+                  measured_valid_qualities=["good", "degraded"])
+c = HvacCapabilities(family="inverter", fingerprint="test")
+cfg = HvacModelConfig(model_id="test", timezone="UTC", off_modes=["OFF", "DISABLED"])
+original = _fingerprint(cfg, c, p, {})
+roundtrip = _fingerprint(HvacModelConfig.model_validate(cfg.model_dump(mode="json")),
+ c, HistoryPolicy.model_validate(p.model_dump(mode="json")), {})
+assert original == roundtrip
+print(original)
+"""
+    values = [
+        subprocess.check_output(
+            [sys.executable, "-c", source],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            text=True,
+        ).strip()
+        for seed in ("4", "7")
+    ]
+    assert values[0] == values[1]
 
 
 @pytest.fixture
