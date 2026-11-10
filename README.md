@@ -145,7 +145,19 @@ curtailment. `predict(dynamic_export_limits=...)` also accepts a dataframe with
 
 ---
 
-## HVAC evaluation inputs
+## Electrical HVAC forecasting and evaluation
+
+`kpower_forecast.hvac.KPowerHvacForecast` provides an electrical cycle forecast
+for supported fixed-speed equipment, with explicit energy-only fallbacks for
+unsupported or unidentifiable families. Energy-only forecasts do not invent run
+probabilities. `fit()` returns a candidate; callers explicitly `install()` it and
+optionally `save()` it. Importing this API does not load the optional heavy model
+backends.
+
+Forecasts retain all simulated minute paths in memory. `forecast.stats(grid)`
+recomputes statistics on the requested grid; representative paths are for display
+only. Full minute paths must not be serialized or replaced by display paths for
+planning or evaluation.
 
 `kpower_forecast.hvac.HvacEvaluationBundle` reads manifest-inventoried electrical
 HVAC observations independently of the model backends. It verifies file hashes,
@@ -166,8 +178,16 @@ The version-1 manifest records export/start/end times, controller/device identit
 site timezone and coordinates, EMS revision, optional measured ingestion lag,
 readiness and an inventory of SHA-256 hashes and formats. Each artifact is a
 local filename with format `parquet` or `json`; `minutes.parquet` and
-`capabilities.json` are required. This input API preserves source evidence and
-does not implement the electrical HVAC prediction model.
+`capabilities.json` are required. This input API preserves source evidence;
+`available_at(origin, include_inputs=True)` separates causal model inputs from
+qualified scoring outcomes.
+
+The `[cli]` extra provides `kpower-forecast hvac fit`, `backtest`, `plot` and
+`live-score`. Official energy metrics use the first 1, 6 and 24 hours from the
+actual forecast origin; later windows remain lead-labelled diagnostics. Published
+metadata can retain original `horizon_energy_kwh` means for those horizons when
+the output grid begins after the origin. Live scoring never reruns the model or
+fills missing forecast prefixes or actuals. Missing evidence remains unscorable.
 
 ## Passive thermal response model
 
