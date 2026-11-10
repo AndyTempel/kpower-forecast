@@ -88,7 +88,7 @@ def training():
         index=hours,
     )
     reference = json.loads(
-        (Path(__file__).parent / "fixtures/hvac_owner_policy.json").read_text()
+        (Path(__file__).parent / "fixtures/hvac_history_policy.json").read_text()
     )
     policy = HistoryPolicy(
         version=reference["version"],
@@ -137,7 +137,7 @@ def test_fit_install_save_load_are_separate_and_reject_incompatible_artifacts(
     model.install(candidate)
     assert not directory.exists()
     forecast = model.predict(request)
-    assert forecast.tier is InputTier.T0_ENERGY
+    assert forecast.tier is InputTier.ENERGY
     assert forecast.fallback_reason == "family_not_implemented:inverter"
     assert forecast.intervals.run_probability is None
     assert forecast.paths_w.shape == (0, len(request.grid))
@@ -192,7 +192,7 @@ def test_family_compatibility_never_invents_compressor_probabilities(training, f
     candidate = model.fit(data, as_of=origin)
     model.install(candidate)
     prediction = model.predict(request)
-    assert prediction.tier is InputTier.T0_ENERGY
+    assert prediction.tier is InputTier.ENERGY
     assert prediction.intervals.run_probability is None
     assert prediction.intervals.start_probability is None
     assert prediction.minute_paths.running is None
@@ -290,7 +290,7 @@ def test_fixed_speed_candidate_predicts_all_paths_and_recomputes_statistics(trai
     candidate = FitResult(
         origin,
         fingerprint(data, cfg),
-        InputTier.T1_POWER,
+        InputTier.POWER,
         HvacFamily.FIXED_SPEED,
         state.model_dump(mode="json"),
         {},
@@ -378,15 +378,13 @@ def test_fixed_speed_fit_to_prediction_uses_the_physical_model(training):
     model = KPowerHvacForecast(cfg)
     candidate = model.fit(data, as_of=origin)
     assert candidate.family is HvacFamily.FIXED_SPEED
-    assert candidate.tier is InputTier.T1_POWER and candidate.fallback_reason is None
+    assert candidate.tier is InputTier.POWER and candidate.fallback_reason is None
     assert candidate.parameters["cycle"] is not None
     model.install(candidate)
     forecast = model.predict(replace(request, recent=minutes))
     assert forecast.minute_paths.running is not None
     assert forecast.minute_paths.running.any()
-    assert (
-        forecast.diagnostics["reliable"] is False
-    )  # 3d never waives the owner 14d policy
+    assert forecast.diagnostics["reliable"] is False  # 3d never waives the 14d policy
     cold_recent = minutes.tail(360).copy()
     cold_recent["outdoor_env_c"] = -10.0
     cold_weather = request.weather_forecast.copy()

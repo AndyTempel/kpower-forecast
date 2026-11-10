@@ -1,4 +1,4 @@
-"""Independent numerical and censored-likelihood regression gates."""
+"""Independent numerical and censored-likelihood regression checks."""
 
 from threading import Event
 
@@ -9,11 +9,9 @@ from scipy.stats import norm
 from kpower_forecast.hvac._stats import (
     censored_lognormal_aft,
     huber_regression,
-    normal_cdf,
     normal_logsf,
     normal_ppf,
-    sample_crps,
-    weighted_quantile,
+    normal_sf,
 )
 from kpower_forecast.hvac.types import HvacCancelled, HvacTimeout
 
@@ -56,22 +54,18 @@ def test_aft_offset_ridge_and_nonconvergence_are_explicit(censored_process):
 
 def test_normal_probabilities_and_extreme_survival_match_independent_reference():
     z = np.linspace(-10, 10, 1001)
-    np.testing.assert_allclose(normal_cdf(z), norm.cdf(z), atol=7.5e-8, rtol=0)
+    np.testing.assert_allclose(normal_sf(-z), norm.cdf(z), atol=7.5e-8, rtol=0)
     p = np.r_[np.geomspace(1e-12, 0.01, 30), np.linspace(0.02, 0.98, 50), 1 - 1e-12]
     np.testing.assert_allclose(normal_ppf(p), norm.ppf(p), atol=1e-8, rtol=0)
     tail = np.array([0.0, 5.0, 10.0, 40.0])
     np.testing.assert_allclose(normal_logsf(tail), norm.logsf(tail), atol=2e-5, rtol=0)
 
 
-def test_robust_regression_weighted_quantiles_and_crps_have_independent_answers():
+def test_robust_regression_ignores_outliers():
     x = np.column_stack([np.ones(100), np.linspace(-1, 1, 100)])
     y = 2 + 3 * x[:, 1]
     y[::10] += 100
     np.testing.assert_allclose(huber_regression(x, y), [2, 3], atol=1e-6)
-    np.testing.assert_allclose(
-        weighted_quantile([1, 2, 1e9], [0, 0.5, 1], [1, 1, 0]), [1, 1.5, 2]
-    )
-    np.testing.assert_allclose(sample_crps([[0, 3], [2, 5]], [1, 4]), [0.5, 0.5])
 
 
 def test_invalid_evidence_and_cooperative_cancellation_fail_loudly():

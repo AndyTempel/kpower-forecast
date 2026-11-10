@@ -58,18 +58,6 @@ def normal_sf(z: ArrayLike) -> FloatArray:
     return np.asarray(np.where(x >= 0, tail, 1 - tail))
 
 
-def normal_cdf(z: ArrayLike) -> FloatArray:
-    """Return normal CDF values (A&S absolute error below 7.5e-8).
-
-    Args:
-        z: Standard normal variates.
-
-    Returns:
-        Array of lower-tail probabilities.
-    """
-    return normal_sf(-np.asarray(z, dtype=float))
-
-
 def normal_logsf(z: ArrayLike) -> FloatArray:
     """Evaluate log survival, retaining finite right-censored extreme tails.
 
@@ -351,69 +339,6 @@ def huber_regression(
             break
         beta = updated
     return np.asarray(beta)
-
-
-def weighted_quantile(
-    values: ArrayLike, probabilities: ArrayLike, weights: ArrayLike
-) -> FloatArray:
-    """Interpolate quantiles at the midpoints of positive empirical weight masses.
-
-    Args:
-        values: Finite one-dimensional sample values.
-        probabilities: Quantiles in the closed unit interval.
-        weights: Nonnegative finite sample weights with positive total mass.
-
-    Returns:
-        Quantiles with the probabilities' shape.
-
-    Raises:
-        ValueError: For invalid samples, weights or probabilities.
-    """
-    v, q, w = (
-        np.asarray(values, dtype=float),
-        np.asarray(probabilities, dtype=float),
-        np.asarray(weights, dtype=float),
-    )
-    if (
-        v.ndim != 1
-        or w.shape != v.shape
-        or not np.isfinite(v).all()
-        or not np.isfinite(w).all()
-        or (w < 0).any()
-        or w.sum() <= 0
-        or not np.isfinite(q).all()
-        or ((q < 0) | (q > 1)).any()
-    ):
-        raise HvacError("invalid weighted quantile inputs")
-    keep = w > 0
-    order = np.argsort(v[keep], kind="stable")
-    v, w = v[keep][order], w[keep][order]
-    positions = (np.cumsum(w) - 0.5 * w) / w.sum()
-    return np.asarray(np.interp(q, positions, v))
-
-
-def sample_crps(samples: ArrayLike, observed: ArrayLike) -> FloatArray:
-    """Compute empirical CRPS across axis zero in O(n log n) time.
-
-    Args:
-        samples: Finite ensemble, with paths along axis zero.
-        observed: Finite actual values, broadcastable over the other axes.
-
-    Returns:
-        CRPS for each output, with the same units as the samples.
-
-    Raises:
-        ValueError: For empty or nonfinite evidence.
-    """
-    x, y = np.asarray(samples, dtype=float), np.asarray(observed, dtype=float)
-    if x.ndim < 1 or not len(x) or not np.isfinite(x).all() or not np.isfinite(y).all():
-        raise HvacError("CRPS requires nonempty finite samples and actuals")
-    ordered = np.sort(x, axis=0)
-    n = len(x)
-    ranks = (2 * np.arange(1, n + 1) - n - 1).reshape((n,) + (1,) * (x.ndim - 1))
-    return np.asarray(
-        np.mean(np.abs(x - y), axis=0) - np.sum(ranks * ordered, axis=0) / n**2
-    )
 
 
 def conditional_lognormal(

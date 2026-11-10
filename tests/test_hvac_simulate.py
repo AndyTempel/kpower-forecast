@@ -117,6 +117,14 @@ def test_elapsed_idle_conditions_the_next_start(setup):
     assert first_old < 15 < first_fresh
 
 
+def test_reported_lockout_is_not_aged_twice(setup):
+    # A long idle would normally restart at once; the lockout left at the origin
+    # still holds for its full remaining time.
+    running = _run(setup, InitialState(False, 40.0, 15.0, 10.0)).paths.running
+    assert not running[:, :10].any()
+    assert running[:, 10:20].any(axis=1).mean() > 0.5
+
+
 def test_running_respects_minimum_run_and_ramps_power(setup):
     result = _run(setup, InitialState(True, 2.0, None))
     assert result.paths.running[:, :8].all()

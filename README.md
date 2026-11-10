@@ -145,7 +145,7 @@ curtailment. `predict(dynamic_export_limits=...)` also accepts a dataframe with
 
 ---
 
-## Electrical HVAC forecasting and evaluation
+## Electrical HVAC forecasting
 
 `kpower_forecast.hvac.KPowerHvacForecast` provides an electrical cycle forecast
 for supported fixed-speed equipment, with explicit energy-only fallbacks for
@@ -176,37 +176,7 @@ Missing values are never filled.
 Forecasts retain all simulated minute paths in memory. `forecast.stats(grid)`
 recomputes statistics on the requested grid; representative paths are for display
 only. Full minute paths must not be serialized or replaced by display paths for
-planning or evaluation.
-
-`kpower_forecast.hvac.HvacEvaluationBundle` reads manifest-inventoried electrical
-HVAC observations independently of the model backends. It verifies file hashes,
-local file paths and the UTC minute-index contract while preserving missing
-power and observation-quality columns. Loading source evidence does not qualify
-it for training or planning.
-
-```python
-from pathlib import Path
-from kpower_forecast.hvac import HvacEvaluationBundle
-
-bundle = HvacEvaluationBundle.load(Path("evaluation_bundle"))
-# Requires measured ingest_lag_min in manifest.json; never guesses a lag.
-history = bundle.available_at(origin)  # aware UTC datetime
-```
-
-The version-1 manifest records export/start/end times, controller/device identity,
-site timezone and coordinates, EMS revision, optional measured ingestion lag,
-readiness and an inventory of SHA-256 hashes and formats. Each artifact is a
-local filename with format `parquet` or `json`; `minutes.parquet` and
-`capabilities.json` are required. This input API preserves source evidence;
-`available_at(origin, include_inputs=True)` separates causal model inputs from
-qualified scoring outcomes.
-
-The `[cli]` extra provides `kpower-forecast hvac fit`, `backtest`, `plot` and
-`live-score`. Official energy metrics use the first 1, 6 and 24 hours from the
-actual forecast origin; later windows remain lead-labelled diagnostics. Published
-metadata can retain original `horizon_energy_kwh` means for those horizons when
-the output grid begins after the origin. Live scoring never reruns the model or
-fills missing forecast prefixes or actuals. Missing evidence remains unscorable.
+planning.
 
 ## Passive thermal response model
 

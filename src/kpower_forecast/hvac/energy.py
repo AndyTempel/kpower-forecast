@@ -1,11 +1,10 @@
-"""Equipment-family contract and explicit energy-only reserved-family fallbacks."""
+"""Energy-only fallback for equipment without an identifiable cycle model."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Event
-from typing import Protocol
 
 import numpy as np
 import pandas as pd
@@ -14,154 +13,10 @@ from numpy.typing import NDArray
 from ._stats import check_budget
 from .cycles import modes_at
 from .types import (
-    FitResult,
     HvacError,
-    HvacFamily,
-    HvacForecastRequest,
     HvacModelConfig,
-    HvacTrainingData,
     MinutePaths,
 )
-
-
-class EquipmentModel(Protocol):
-    """Family plug-in interface; fitting returns a candidate without installation."""
-
-    family: HvacFamily
-
-    def fit(
-        self,
-        data: HvacTrainingData,
-        cfg: HvacModelConfig,
-        *,
-        as_of: datetime,
-        cancel: Event | None = None,
-    ) -> FitResult:
-        """Return a candidate from inputs available at as_of."""
-        ...
-
-    def simulate(
-        self,
-        request: HvacForecastRequest,
-        fit: FitResult,
-        cfg: HvacModelConfig,
-        *,
-        cancel: Event | None = None,
-    ) -> MinutePaths:
-        """Return the full in-memory ensemble, without representative reduction."""
-        ...
-
-
-class FixedSpeedModel:
-    """Alternating physical log-normal idle/run process with explicit overload."""
-
-    family: HvacFamily = HvacFamily.FIXED_SPEED
-
-    def fit(
-        self,
-        data: HvacTrainingData,
-        cfg: HvacModelConfig,
-        *,
-        as_of: datetime,
-        cancel: Event | None = None,
-    ) -> FitResult:
-        """Fit a candidate without changing active state or disk.
-
-        Args:
-            data: Evidence snapshot.
-            cfg: Caller configuration.
-            as_of: Causal fit origin.
-            cancel: Cooperative cancellation.
-
-        Returns:
-            Candidate coefficients and quality diagnostics.
-        """
-        from .model import _fit_candidate
-
-        return _fit_candidate(data, cfg, as_of=as_of, cancel=cancel)
-
-    def simulate(
-        self,
-        request: HvacForecastRequest,
-        fit: FitResult,
-        cfg: HvacModelConfig,
-        *,
-        cancel: Event | None = None,
-    ) -> MinutePaths:
-        """Simulate a candidate without installing it.
-
-        Args:
-            request: Causal origin, weather and known schedule.
-            fit: Candidate coefficients.
-            cfg: Compatible caller configuration.
-            cancel: Cooperative cancellation.
-
-        Returns:
-            Full ensemble; state is unknown for energy-only fallbacks.
-        """
-        from .model import _predict_candidate
-
-        return _predict_candidate(request, fit, cfg, cancel=cancel).minute_paths
-
-
-class EnergyOnlyModel(FixedSpeedModel):
-    """T0 hourly ridge energy with unknown compressor state."""
-
-    family: HvacFamily = HvacFamily.UNKNOWN
-
-    def fit(
-        self,
-        data: HvacTrainingData,
-        cfg: HvacModelConfig,
-        *,
-        as_of: datetime,
-        cancel: Event | None = None,
-    ) -> FitResult:
-        """Fit T0 explicitly; its absence of compressor probabilities is preserved.
-
-        Args:
-            data: Evidence snapshot.
-            cfg: Caller configuration.
-            as_of: Causal fit origin.
-            cancel: Cooperative cancellation.
-
-        Returns:
-            Energy-only candidate.
-        """
-        from .model import _fit_candidate
-
-        return _fit_candidate(data, cfg, as_of=as_of, cancel=cancel, force_energy=True)
-
-
-class InverterModel(EnergyOnlyModel):
-    """Reserved inverter extension; v1 serves T0, flagged family_not_implemented.
-
-    Future continuous power is P=clip(Q(T)/COP(T), P_min, P_max). Below Cap_min,
-    cycle at P_min with the same demand shape and hysteresis sojourns. High run
-    probability can coexist with low power; energy and run probability are separate.
-    """
-
-    family: HvacFamily = HvacFamily.INVERTER
-
-
-class TwoStageModel(EnergyOnlyModel):
-    """Reserved two-stage extension; v1 serves explicitly flagged T0.
-
-    RUN has levels L1 and L2 with learned electrical powers. Stage-up/down are
-    demand-conditioned sojourns. A level change is not a compressor start.
-    """
-
-    family: HvacFamily = HvacFamily.TWO_STAGE
-
-
-class MultiStageModel(EnergyOnlyModel):
-    """Reserved multi-stage extension; v1 serves explicitly flagged T0.
-
-    RUN has levels L1...Ln with learned electrical powers. Stage-up/down are
-    demand-conditioned sojourns. A level change is not a compressor start.
-    """
-
-    family: HvacFamily = HvacFamily.MULTI_STAGE
 
 
 @dataclass(frozen=True)

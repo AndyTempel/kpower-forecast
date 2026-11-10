@@ -28,7 +28,7 @@ from ._stats import censored_lognormal_aft, check_budget
 from .aggregate import _integral, interval_stats, representatives
 from .cycle_model import CycleFit, fit_cycles
 from .cycles import clean_running, extract_cycles, modes_at
-from .families import EnergyFit, energy_paths, fit_energy
+from .energy import EnergyFit, energy_paths, fit_energy
 from .frames import (
     history_verdict,
     outdoor_frame,
@@ -112,7 +112,7 @@ def _fingerprint(
         "policy": policy_identity,
         "lineage": dict(lineage),
         "outdoor_precedence": ["unit", "environment", "weather"],
-        "tier_set": ["t0_energy", "t1_power"],
+        "tier_set": ["energy", "power"],
     }
     # These inputs are sets, not ordered statistical quantities. Their JSON
     # iteration order can change on a validation round-trip or another process.
@@ -276,7 +276,7 @@ def _fit_candidate(
     cycle = None
     power = None
     energy = None
-    tier = InputTier.T0_ENERGY
+    tier = InputTier.ENERGY
     outdoor = fit_outdoor(frame, weather, cfg.timezone)
     if fallback is None:
         extraction = extract_cycles(frame, events, cfg, control_events=control)
@@ -297,7 +297,7 @@ def _fit_candidate(
         diagnostic["dropped_left_edges"] = extraction.dropped_left_edges
         if cycle is not None:
             power = fit_power(frame, events, cfg, data.capabilities.metered_scope)
-            tier = InputTier.T1_POWER
+            tier = InputTier.POWER
             diagnostic.update(
                 {
                     "idle_sigma": cycle.idle_sigma,
@@ -368,7 +368,7 @@ def _validated_state(candidate: FitResult, cfg: HvacModelConfig) -> _State:
         cfg, state.capabilities, state.policy, state.lineage
     ):
         raise HvacError("incompatible HVAC configuration or fingerprint")
-    if (state.cycle is None) != (candidate.tier is InputTier.T0_ENERGY):
+    if (state.cycle is None) != (candidate.tier is InputTier.ENERGY):
         raise HvacError("candidate tier disagrees with coefficients")
     # CycleFit and PowerFit validate their own coefficients on construction.
     if state.cycle is not None and state.power is None:
@@ -413,7 +413,13 @@ def _predict_candidate(
     weather = _weather_at(request.weather_forecast, request.origin, history=False)
     if "ds" in weather:
         weather = weather.set_index("ds")
-    recent = prepare_minutes(request.recent, cfg, as_of=request.origin, training=False)
+    recent = prepare_minutes(
+        request.recent,
+        cfg,
+        as_of=request.origin,
+        policy=state.policy,
+        training=False,
+    )
     if recent.empty:
         recent = pd.DataFrame({"power_w": [np.nan]}, index=pd.DatetimeIndex([start]))
     recent = outdoor_frame(recent, weather, cfg)
@@ -424,14 +430,17 @@ def _predict_candidate(
         min_run_min=cfg.min_run_blip_min,
         max_gap_min=cfg.minute_gap_tolerance_min,
     )
-    valid_outdoor = recent.loc[
-        recent.outdoor_source.isin(["unit", "environment"]), "outdoor_c"
-    ].dropna()
+    # Anchor on a sensor only when it is the current source and its original
+    # reading (not the held copy) is within the hold window of the origin.
     observed = None
-    if len(valid_outdoor) and request.origin - valid_outdoor.index[
-        -1
-    ].to_pydatetime() <= timedelta(minutes=cfg.outdoor_hold_min):
-        observed = float(valid_outdoor.iloc[-1])
+    source = str(recent.outdoor_source.iloc[-1])
+    raw = {"unit": "outdoor_unit_c", "environment": "outdoor_env_c"}.get(source)
+    if raw is not None:
+        readings = recent[raw].dropna()
+        if len(readings) and request.origin - readings.index[
+            -1
+        ].to_pydatetime() <= timedelta(minutes=cfg.outdoor_hold_min):
+            observed = float(recent.outdoor_c.iloc[-1])
     temperatures = outdoor_paths(
         state.outdoor,
         weather,
@@ -472,7 +481,7 @@ def _predict_candidate(
         shown = np.empty((0, len(request.grid)), np.float32)
         shown.setflags(write=False)
         display = None
-        tier = InputTier.T0_ENERGY
+        tier = InputTier.ENERGY
     else:
         assert state.power is not None
         phase = (
@@ -481,7 +490,7 @@ def _predict_candidate(
             else initial_state(recent, request.origin, cfg)
         )
         if force_phase_unknown:
-            # Evaluator B4 hides phase evidence only; covariates stay identical.
+            # Phase ablation hides compressor-state evidence; covariates stay identical.
             diagnostic["phase_forced_unknown"] = True
         simulated = simulate(
             request,
@@ -499,7 +508,7 @@ def _predict_candidate(
         )
         paths = simulated.paths
         shown, display = representatives(paths, request.grid)
-        tier = InputTier.T1_POWER
+        tier = InputTier.POWER
         diagnostic.update({key: True for key in simulated.diagnostics})
         diagnostic["stationary_initial_state"] = phase.running is None
     intervals = interval_stats(paths, request.grid)

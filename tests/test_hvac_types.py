@@ -1,5 +1,8 @@
 """Input identity and full-ensemble boundaries remain explicit."""
 
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 
 import numpy as np
@@ -83,3 +86,15 @@ def test_minute_paths_copy_ensemble_and_keep_energy_only_state_unknown(origin):
     assert not paths.power_w.flags.writeable
     with pytest.raises(ValueError):
         MinutePaths(origin, power, np.zeros((16, 60), dtype=bool))
+
+
+def test_hvac_import_does_not_load_optional_forecast_backends() -> None:
+    """A fresh interpreter must not pay for optional model backends to use HVAC."""
+    source = """import sys
+import kpower_forecast.hvac
+assert not any(name in sys.modules for name in (
+ 'prophet', 'cmdstanpy', 'pvlib', 'kpower_forecast.core', 'kpower_forecast.ml'))
+from kpower_forecast import KPowerForecast
+assert KPowerForecast.__name__ == 'KPowerForecast'
+"""
+    subprocess.run([sys.executable, "-c", source], check=True, env=os.environ.copy())

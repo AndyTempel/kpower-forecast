@@ -1,6 +1,6 @@
 """Causal, evidence-preserving minute preparation and outdoor selection.
 
-The history policy is resolved by the owner and supplied with the data. Nothing
+The history policy is resolved by the caller and supplied with the data. Nothing
 here supplies alternative eligibility thresholds or reconstructs target values.
 """
 
@@ -50,7 +50,7 @@ def policy_number(policy: HistoryPolicy, name: str) -> float:
 
     Args:
         policy: Owner policy and version.
-        name: Exact owning setting name.
+        name: Exact setting name.
 
     Returns:
         Its finite numeric value, or seconds for a duration setting.
@@ -66,7 +66,7 @@ def policy_number(policy: HistoryPolicy, name: str) -> float:
         or not isinstance(value, int | float)
         or not np.isfinite(value)
     ):
-        raise HvacError(f"missing or invalid owner history-policy setting: {name}")
+        raise HvacError(f"missing or invalid history-policy setting: {name}")
     if policy.settings.get("_HISTORY_POLICY_VERSION") != policy.version:
         raise HvacError("history-policy version contradicts its settings")
     return float(value)
@@ -77,7 +77,7 @@ def history_window(frame: pd.DataFrame, policy: HistoryPolicy) -> pd.DataFrame:
 
     Args:
         frame: Regular UTC minutes with qualified target values.
-        policy: Resolved owning history policy.
+        policy: Resolved history policy.
 
     Returns:
         A copy of the eligible latest window; no value is filled.
@@ -87,7 +87,7 @@ def history_window(frame: pd.DataFrame, policy: HistoryPolicy) -> pd.DataFrame:
     """
     gap_s = policy_number(policy, "_MAX_TRAINING_GAP")
     if gap_s < 0:
-        raise HvacError("owner maximum training gap cannot be negative")
+        raise HvacError("maximum training gap cannot be negative")
     if frame.empty:
         return frame.copy()
     valid = frame.power_w.notna()
@@ -103,7 +103,7 @@ def history_window(frame: pd.DataFrame, policy: HistoryPolicy) -> pd.DataFrame:
 def history_verdict(
     frame: pd.DataFrame, policy: HistoryPolicy, *, as_of: datetime
 ) -> HistoryVerdict:
-    """Evaluate the owning span, density, change-age and applicable coverage rules.
+    """Evaluate the span, density, change-age and applicable coverage rules.
 
     Args:
         frame: Qualified latest history window at one-minute resolution.
@@ -199,9 +199,9 @@ def prepare_minutes(
         frame: Values and per-signal evidence on UTC minute-start labels.
         cfg: Gap, ingestion and training-window configuration.
         as_of: Fit/forecast origin.
-        policy: Required for selecting a training-history window.
+        policy: Quality policy; required for training.
         epoch_start: Optional lineage boundary.
-        training: Apply training-days and owner gap-window rules when True.
+        training: Apply training-days and gap-window rules when True.
 
     Returns:
         Regular minute grid with invalid/unknown or bridged observations as NaN;
@@ -220,7 +220,7 @@ def prepare_minutes(
             else utc(as_of) - timedelta(days=cfg.training_days)
         )
         if policy is None:
-            raise HvacError("training requires the resolved owner history policy")
+            raise HvacError("training requires the resolved history policy")
     selected = frame.loc[
         (frame.index <= cutoff) & (frame.index >= lower if lower else True)
     ].copy()
@@ -237,8 +237,8 @@ def prepare_minutes(
             raise HvacError(f"nonfinite {column}")
         # Only explicit invalidity rejects an observed value. Aggregated minutes
         # older than the raw-retention window carry no per-sample quality tag;
-        # treating "unknown" as invalid discarded most of the history (the EMS
-        # forecast models use those rows too). Missing values stay missing.
+        # treating "unknown" as invalid would discard most of the history.
+        # Missing values stay missing.
         flag = selected.get(
             column + "__measured_valid", pd.Series(pd.NA, index=selected.index)
         )
@@ -332,7 +332,7 @@ def _held_sensor(
     hold_min: int,
     grace_min: int,
 ) -> pd.Series:
-    """Vectorize the exact R1c read-age/first-invalidation semantics."""
+    """Hold sensor readings for a read age and stop at the first invalidation."""
     known = values.dropna().sort_index()
     output = np.full(len(index), np.nan)
     if known.empty:

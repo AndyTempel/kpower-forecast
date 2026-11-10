@@ -1,6 +1,5 @@
 """Electrical-HVAC contracts, isolated from optional forecasting backends."""
 
-from .bundle import BundleSnapshot, HvacEvaluationBundle
 from .model import KPowerHvacForecast, fingerprint
 from .settlement import (
     BlockSettlement,
@@ -37,7 +36,6 @@ __all__ = [
     "HVAC_CONTRACT_VERSION",
     "HVAC_ESTIMATOR_VERSION",
     "BlockSettlement",
-    "BundleSnapshot",
     "FitResult",
     "GridInterval",
     "HistoryPolicy",
@@ -45,7 +43,6 @@ __all__ = [
     "HvacCapabilities",
     "HvacError",
     "HvacFamily",
-    "HvacEvaluationBundle",
     "HvacForecast",
     "HvacForecastRequest",
     "HvacModelConfig",

@@ -66,10 +66,8 @@ class MeteredScope(str, Enum):
 class InputTier(str, Enum):
     """Evidence used by the forecast, independent of its reliability verdict."""
 
-    T3_CONTROLLER = "t3_controller"
-    T2_WATER = "t2_water"
-    T1_POWER = "t1_power"
-    T0_ENERGY = "t0_energy"
+    POWER = "power"
+    ENERGY = "energy"
 
 
 class HvacRegime(str, Enum):
@@ -184,10 +182,10 @@ class HvacModelConfig(_Input):
 
 
 class HistoryPolicy(_Input):
-    """Owning EMS settings passed intact, with no independent policy defaults.
+    """Caller-resolved history settings, with no independent policy defaults.
 
-    Settings retain their owning names/version. Library policy evaluation uses
-    these resolved values; a missing setting fails instead of relaxing eligibility.
+    Settings keep the caller's names and version. A missing setting fails instead
+    of relaxing eligibility.
     """
 
     version: int = Field(ge=1, strict=True)
@@ -266,7 +264,7 @@ def validate_minute_index(frame: pd.DataFrame) -> None:
 
 @dataclass(frozen=True)
 class HvacTrainingData:
-    """Snapshot of observations, operating history and the resolved owner policy."""
+    """Snapshot of observations, operating history and the resolved history policy."""
 
     capabilities: HvacCapabilities
     minutes: pd.DataFrame

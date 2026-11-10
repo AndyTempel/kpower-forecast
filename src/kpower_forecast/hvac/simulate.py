@@ -319,14 +319,21 @@ def simulate(
         mu = locate(running, temperature[:, 0], sun[0], codes[:, 0], prev_run)
         sigma = np.where(running, fit.run_sigma, fit.idle_sigma)
         remaining = conditional_lognormal(mu, sigma, elapsed, rng)
+        # Manufacturer minimums count from spell start; the reported lockout is
+        # already the time left at the origin.
         remaining = np.maximum(
             remaining,
-            np.where(running, min_run, max(min_off, initial.lockout_min)) - elapsed,
+            np.where(
+                running,
+                min_run - elapsed,
+                np.maximum(min_off - elapsed, initial.lockout_min),
+            ),
         )
     remaining = np.maximum(remaining - lead, 0.0)
     off = is_off_code[codes[:, 0]]
     running[off] = False
     remaining[off] = np.inf
+    elapsed[off] = 0.0
     initial_minute = np.where(running, elapsed, 0.0)
     state = np.empty((n, horizon), bool)
     change = np.zeros(horizon, bool)
@@ -351,8 +358,9 @@ def simulate(
                     prev_run[resumed],
                 )
                 sigma = np.where(running[resumed], fit.run_sigma, fit.idle_sigma)
-                remaining[resumed] = conditional_lognormal(
-                    mu, sigma, elapsed[resumed], rng
+                remaining[resumed] = np.maximum(
+                    conditional_lognormal(mu, sigma, elapsed[resumed], rng),
+                    np.where(running[resumed], min_run, min_off) - elapsed[resumed],
                 )
         state[:, j] = running
         elapsed += 1.0

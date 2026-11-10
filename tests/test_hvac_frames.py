@@ -110,9 +110,9 @@ def test_histogram_guard_and_unit_flag_do_not_turn_unknown_power_into_idle(minut
         "recent_change",
     ],
 )
-def test_owner_policy_parity_fixture(case_name, config):
+def test_history_policy_fixture(case_name, config):
     fixture = json.loads(
-        (Path(__file__).parent / "fixtures/hvac_owner_policy.json").read_text()
+        (Path(__file__).parent / "fixtures/hvac_history_policy.json").read_text()
     )
     case = fixture["cases"][case_name]
     index = pd.date_range(fixture["start"], periods=fixture["periods"], freq="min")

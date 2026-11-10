@@ -26,10 +26,6 @@
     "degraded",
     "good"
   ],
-  "owner_sources": {
-    "manager": "288e2331913174450ce4725e067966ba877ead9483cf610ac01b737dbb1450bd",
-    "history": "f20988a29eb6959d4bbd0b7cddd8cf28fe6c4e34f0850a0031b14171f145452a"
-  },
   "cases": {
     "good": {
       "missing_ranges": [],

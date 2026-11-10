@@ -1,4 +1,4 @@
-"""Pure directional all-path settlement need, shared by planning and evaluation.
+"""Pure directional all-path settlement need, for planning.
 
 There is no recharge credit inside a block: this deliberately conservative
 quantity sums each window's required discharge, independent of battery or price.
