@@ -337,7 +337,11 @@ def simulate(
                 np.maximum(min_off - elapsed, initial.lockout_min),
             ),
         )
-    remaining = np.maximum(remaining - lead, 0.0)
+    # Durations so far are relative to the origin; the grid starts ``lead``
+    # minutes earlier at the floored minute.
+    remaining = np.maximum(remaining, 0.0) + lead
+    elapsed = np.maximum(elapsed - lead, 0.0)
+    lockout_end = initial.lockout_min + lead if initial.running is False else 0.0
     off = is_off_code[codes[:, 0]]
     running[off] = False
     remaining[off] = np.inf
@@ -366,9 +370,13 @@ def simulate(
                     prev_run[resumed],
                 )
                 sigma = np.where(running[resumed], fit.run_sigma, fit.idle_sigma)
+                floor = np.where(running[resumed], min_run, min_off) - elapsed[resumed]
+                if j < lockout_end:
+                    floor = np.where(
+                        running[resumed], floor, np.maximum(floor, lockout_end - j)
+                    )
                 remaining[resumed] = np.maximum(
-                    conditional_lognormal(mu, sigma, elapsed[resumed], rng),
-                    np.where(running[resumed], min_run, min_off) - elapsed[resumed],
+                    conditional_lognormal(mu, sigma, elapsed[resumed], rng), floor
                 )
         state[:, j] = running
         elapsed += 1.0

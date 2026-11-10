@@ -191,7 +191,7 @@ def _comfort_lengths(
                 durations.setdefault(active[1], []).append((length, False))
             active = None
         if active is None and mode in cfg.off_modes:
-            active = when, f"{mode}|{row.source}"
+            active = when, f"{mode}|{getattr(row, 'source', 'other')}"
     if active is not None:
         length = (as_of - active[0]).total_seconds() / 60
         if length > 0:

@@ -123,6 +123,12 @@ def test_reported_lockout_is_not_aged_twice(setup):
     running = _run(setup, InitialState(False, 40.0, 15.0, 10.0)).paths.running
     assert not running[:, :10].any()
     assert running[:, 10:20].any(axis=1).mean() > 0.5
+    # A mode change inside the lockout resamples the idle but keeps the lockout.
+    cfg = setup[0]
+    modes = np.full((cfg.n_paths, 720), "NORMAL")
+    modes[:, 2:] = "ECO"
+    switched = _run(setup, InitialState(False, 40.0, 15.0, 10.0), modes=modes)
+    assert not switched.paths.running[:, :10].any()
 
 
 def test_running_respects_minimum_run_and_ramps_power(setup):
