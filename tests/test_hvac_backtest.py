@@ -92,7 +92,6 @@ def test_future_only_feature_spike_cannot_change_full_scoring_and_gaps_cannot_pa
         timezone="UTC",
         ingest_lag_min=2,
         n_paths=16,
-        n_parameter_sets=1,
     )
     original = backtest(bundle, cfg, [ORIGIN], phase_ablation=False)
     changed = bundle.tables["minutes.parquet"].copy()
@@ -127,7 +126,6 @@ def test_one_gateway_per_origin_and_six_hour_or_lineage_refit(bundle, monkeypatc
         timezone="UTC",
         ingest_lag_min=2,
         n_paths=16,
-        n_parameter_sets=1,
     )
     gateway_calls, fit_calls = [], []
     original_gateway = HvacEvaluationBundle.available_at

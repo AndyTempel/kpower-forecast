@@ -172,8 +172,9 @@ def _aft_objective(
     censored: NDArray[np.bool_],
     offset: FloatArray,
     ridge: FloatArray,
+    weights: FloatArray,
 ) -> tuple[float, FloatArray, FloatArray]:
-    """Compute penalized likelihood, score and Hessian analytically."""
+    """Compute weighted penalized likelihood, score and Hessian analytically."""
     beta, eta = theta[:-1], theta[-1]
     sigma = np.exp(eta)
     z = (y - offset - x @ beta) / sigma
@@ -184,11 +185,13 @@ def _aft_objective(
         lam[censored] = np.exp(-0.5 * z[censored] ** 2 - 0.5 * _LOG_2PI - survival)
         ll[censored] = survival
     prime = lam * (lam - z)
-    sb = np.where(censored, lam, z) / sigma
-    se = np.where(censored, lam * z, z**2 - 1)
-    hbb = -np.where(censored, prime, 1) / sigma**2
-    hbe = -np.where(censored, prime * z + lam, 2 * z) / sigma
-    hee = -np.where(censored, prime * z**2 + lam * z, 2 * z**2)
+    w = weights
+    ll = ll * w
+    sb = w * np.where(censored, lam, z) / sigma
+    se = w * np.where(censored, lam * z, z**2 - 1)
+    hbb = -w * np.where(censored, prime, 1) / sigma**2
+    hbe = -w * np.where(censored, prime * z + lam, 2 * z) / sigma
+    hee = -w * np.where(censored, prime * z**2 + lam * z, 2 * z**2)
     grad = np.r_[x.T @ sb - ridge * beta, se.sum()]
     hess = np.empty((len(theta), len(theta)))
     hess[:-1, :-1] = (x.T * hbb) @ x - np.diag(ridge)
@@ -204,6 +207,7 @@ def censored_lognormal_aft(
     *,
     offset: ArrayLike | None = None,
     ridge: ArrayLike | None = None,
+    weights: ArrayLike | None = None,
     max_iter: int = 100,
     tolerance: float = 1e-7,
     cancel: Event | None = None,
@@ -217,6 +221,7 @@ def censored_lognormal_aft(
         censored: Boolean vector; True contributes survival rather than density.
         offset: Optional known log-duration location per observation.
         ridge: Nonnegative per-coefficient penalties (none on sigma).
+        weights: Optional positive per-observation weights (e.g. recency).
         max_iter: Maximum damped Newton steps.
         tolerance: Relative score convergence tolerance.
         cancel: Caller cancellation flag.
@@ -251,6 +256,9 @@ def censored_lognormal_aft(
         )
     off = np.zeros_like(t) if offset is None else np.asarray(offset, dtype=float)
     penalty = np.zeros(x.shape[1]) if ridge is None else np.asarray(ridge, dtype=float)
+    wt = np.ones_like(t) if weights is None else np.asarray(weights, dtype=float)
+    if wt.shape != t.shape or not np.isfinite(wt).all() or (wt <= 0).any():
+        raise HvacError("AFT weights must be positive and finite per observation")
     if (
         off.shape != t.shape
         or penalty.shape != (x.shape[1],)
@@ -270,7 +278,7 @@ def censored_lognormal_aft(
     for _iteration in range(1, max_iter + 1):
         iteration = _iteration
         check_budget(cancel, deadline)
-        value, grad, hess = _aft_objective(theta, x, y, c, off, penalty)
+        value, grad, hess = _aft_objective(theta, x, y, c, off, penalty, wt)
         if np.max(np.abs(grad)) <= tolerance * (1 + len(t)):
             converged = True
             break
@@ -284,7 +292,7 @@ def censored_lognormal_aft(
             candidate = theta + delta * 0.5**half
             if not -12 < candidate[-1] < 5:
                 continue
-            new_value = _aft_objective(candidate, x, y, c, off, penalty)[0]
+            new_value = _aft_objective(candidate, x, y, c, off, penalty, wt)[0]
             if np.isfinite(
                 new_value
             ) and new_value >= value + 1e-4 * 0.5**half * np.dot(grad, delta):
@@ -292,7 +300,14 @@ def censored_lognormal_aft(
                 break
         if not accepted:
             break
-    value = _aft_objective(theta, x, y, c, off, penalty)[0]
+        # At the optimum, floating-point noise can keep the score just above
+        # the gradient tolerance; a negligible objective change is convergence.
+        if abs(new_value - value) <= 1e-12 * (1 + abs(value)) and np.max(
+            np.abs(grad)
+        ) <= 1e-3 * (1 + len(t)):
+            converged = True
+            break
+    value = _aft_objective(theta, x, y, c, off, penalty, wt)[0]
     coefficients = theta[:-1].copy()
     coefficients.setflags(write=False)
     return AftFit(coefficients, float(np.exp(theta[-1])), value, converged, iteration)

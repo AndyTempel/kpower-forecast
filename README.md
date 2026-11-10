@@ -154,6 +154,25 @@ probabilities. `fit()` returns a candidate; callers explicitly `install()` it an
 optionally `save()` it. Importing this API does not load the optional heavy model
 backends.
 
+**Fixed-speed model.** Minute electrical power is classified into run and idle
+(short in-run dips are merged, one- or two-minute blips are not runs). Each spell
+with a known start becomes a training row; a spell interrupted by a real mode
+change or control intervention, or ended at a gap, is right-censored. Idle and
+run lengths are recency-weighted (default half-life 3 days) censored log-normal
+regressions on outdoor temperature, radiation and mode; idle also depends on the
+length of the run before it. Run power is the measured mean profile by
+minute-in-run (it rises as the supply water warms) plus a robust outdoor
+temperature slope; idle and off standby are measured medians. Prediction conditions the current spell on its
+observed age, then simulates 256 paths minute by minute along MOS-corrected
+outdoor paths and the caller's mode schedule, including an uncertain release of
+an active comfort OFF. Run timing is predictable for roughly two to three cycles;
+beyond that the ensemble mean is flat by design and the information is in the
+distribution (quarter-hour peaks and settlement reserves).
+
+Untagged minutes (aggregated history older than the raw-retention window) are
+valid observations; only explicitly invalid or bridged values are discarded.
+Missing values are never filled.
+
 Forecasts retain all simulated minute paths in memory. `forecast.stats(grid)`
 recomputes statistics on the requested grid; representative paths are for display
 only. Full minute paths must not be serialized or replaced by display paths for

@@ -235,19 +235,18 @@ def prepare_minutes(
         values = pd.to_numeric(selected[column], errors="raise")
         if np.isinf(values.dropna().to_numpy(dtype=float)).any():
             raise HvacError(f"nonfinite {column}")
-        mask = (
-            selected.get(
-                column + "__measured_valid", pd.Series(False, index=selected.index)
-            )
-            .fillna(False)
-            .eq(True)
+        # Only explicit invalidity rejects an observed value. Aggregated minutes
+        # older than the raw-retention window carry no per-sample quality tag;
+        # treating "unknown" as invalid discarded most of the history (the EMS
+        # forecast models use those rows too). Missing values stay missing.
+        flag = selected.get(
+            column + "__measured_valid", pd.Series(pd.NA, index=selected.index)
         )
-        if column + "__quality" in selected:
-            accepted = policy.measured_valid_qualities if policy else frozenset()
-            # At prediction time the shared reader has already resolved validity;
-            # quality remains evidence rather than a second independently set policy.
-            if policy:
-                mask &= selected[column + "__quality"].isin(accepted)
+        mask = ~flag.eq(False).fillna(False).astype(bool)
+        if column + "__quality" in selected and policy:
+            quality = selected[column + "__quality"]
+            accepted = set(policy.measured_valid_qualities) | {"unknown"}
+            mask &= quality.isna() | quality.isin(accepted)
         bridged = (
             selected.get(column + "__bridged", pd.Series(False, index=selected.index))
             .fillna(False)
@@ -461,7 +460,11 @@ def running_states(
             return RunningClassification(
                 None, pd.Series(np.nan, index=frame.index), "not_cycling"
             )
-        threshold_w = float(np.clip(threshold_w, 200, 0.5 * upper.median()))
+        # The histogram valley is wide and flat between standby and full power;
+        # its first minimum sits just above standby, so partial start/stop
+        # minutes and pump tails would count as full-power run minutes. A
+        # quarter of the typical run power separates them robustly.
+        threshold_w = float(max(0.25 * upper.median(), 200.0))
     if not np.isfinite(threshold_w) or threshold_w <= 0:
         raise HvacError("running threshold must be positive finite watts")
     state = (frame.power_w > threshold_w).astype(float).where(frame.power_w.notna())

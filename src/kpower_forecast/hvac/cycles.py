@@ -1,36 +1,42 @@
-"""Extract observed sojourns without inventing transitions across missing targets."""
+"""Compressor spells from minute power, without inventing transitions across gaps.
+
+A spell is a maximal run of one observed state (running or idle). Its start is
+known only when the previous minute was observed in the other state. Its end is
+natural only when the next minute is observed in the other state and no command
+(mode change or control intervention) explains it; every other end is a right
+censoring. Short in-run dips (defrost, metering blips) are merged into the run
+and very short power blips are not runs.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import pairwise
-from typing import cast
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 
 from .types import HvacError, HvacModelConfig, SojournEnd
+
+SPELL_COLUMNS: tuple[str, ...] = (
+    "kind",
+    "start",
+    "minutes",
+    "end_cause",
+    "censored",
+    "mode",
+    "outdoor_c",
+    "sun",
+    "prev_run_min",
+)
 
 
 @dataclass(frozen=True)
 class CycleExtraction:
-    """Observed spells, mode-switch responses and explicitly dropped left edges."""
+    """Observed spells and the number dropped for an unknown start."""
 
     sojourns: pd.DataFrame
-    mode_switches: pd.DataFrame
     dropped_left_edges: int
-
-
-@dataclass
-class _Spell:
-    kind: str
-    start: pd.Timestamp
-    end: pd.Timestamp
-    positions: list[int]
-    known_start: bool
-    boundary: SojournEnd | None
-    interruptions: int = 0
-    interruption_minutes: float = 0.0
 
 
 def _events(frame: pd.DataFrame) -> pd.DataFrame:
@@ -65,7 +71,7 @@ def modes_at(
         reference_mode: Caller-declared mode when history has no previous command.
 
     Returns:
-        One categorical mode per timestamp; no future command is used early.
+        One mode label per timestamp; no future command is used early.
     """
     events = _events(mode_events)
     if events.empty:
@@ -82,6 +88,65 @@ def modes_at(
     return pd.Series(values, index=index, dtype=str)
 
 
+def _segments(values: NDArray[np.float64]) -> list[tuple[int, int, float]]:
+    """Maximal equal-value runs as (first, last, value); NaN runs included."""
+    if not len(values):
+        return []
+    nan = np.isnan(values)
+    same = (values[1:] == values[:-1]) | (nan[1:] & nan[:-1])
+    starts = np.r_[0, np.flatnonzero(~same) + 1]
+    ends = np.r_[starts[1:] - 1, len(values) - 1]
+    return [
+        (int(a), int(b), float(values[a])) for a, b in zip(starts, ends, strict=True)
+    ]
+
+
+def clean_running(
+    running: pd.Series,
+    *,
+    max_dip_min: int,
+    min_run_min: int,
+    max_gap_min: int = 0,
+) -> pd.Series:
+    """Bridge short gaps in one state, merge in-run dips, then drop run blips.
+
+    Args:
+        running: Nullable 0/1 state on a regular minute grid.
+        max_dip_min: Longest observed idle between two runs treated as part of a run.
+        min_run_min: Shortest observed run kept as a compressor run.
+        max_gap_min: Longest missing stretch bridged when the state is the same on
+            both sides (cycle continuity only; power values stay missing). Without
+            it, an invalid sample inside a long idle censors that idle, and
+            censoring that depends on spell length biases the fit.
+
+    Returns:
+        A cleaned copy. Longer gaps and gaps between different states stay
+        missing; dips/blips touching a gap are left unchanged.
+    """
+    values = running.to_numpy(dtype=float).copy()
+    if max_gap_min > 0:
+        segments = _segments(values)
+        for k in range(1, len(segments) - 1):
+            first, last, value = segments[k]
+            before, after = segments[k - 1][2], segments[k + 1][2]
+            if np.isnan(value) and last - first + 1 <= max_gap_min and before == after:
+                values[first : last + 1] = before
+    for target, other, limit in ((0.0, 1.0, max_dip_min), (1.0, 0.0, min_run_min - 1)):
+        if limit < 1:
+            continue
+        segments = _segments(values)
+        for k in range(1, len(segments) - 1):
+            first, last, value = segments[k]
+            if (
+                value == target
+                and last - first + 1 <= limit
+                and segments[k - 1][2] == other
+                and segments[k + 1][2] == other
+            ):
+                values[first : last + 1] = other
+    return pd.Series(values, index=running.index)
+
+
 def extract_cycles(
     frame: pd.DataFrame,
     mode_events: pd.DataFrame,
@@ -89,260 +154,104 @@ def extract_cycles(
     *,
     control_events: pd.DataFrame | None = None,
 ) -> CycleExtraction:
-    """Extract complete and right-censored spells, retaining command conditions.
+    """Extract complete and right-censored run/idle spells.
 
     Args:
-        frame: Qualified, outdoor-enriched minute frame with nullable running state.
-        mode_events: All known UTC mode commands, not just changes in target power.
-        cfg: Local gap, defrost and command-match durations.
-        control_events: Non-mode interventions, including experimental offsets.
+        frame: Regular minute frame with nullable ``running``, ``outdoor_c``
+            and ``sun``.
+        mode_events: All known UTC mode commands up to the fit time.
+        cfg: Gap and command-match tolerances, off modes and reference mode.
+        control_events: Optional non-mode interventions; they also censor spells.
 
     Returns:
-        Sojourn table and observed mode-switch responses. Spells starting at an
-        unknown left edge are dropped, never called complete or right-censored.
+        One row per spell with a known start. ``prev_run_min`` is the length of
+        the run immediately preceding an idle spell (NaN if unknown). Idle time
+        in an off mode is never a spell: it is controlled, not thermal.
 
     Raises:
-        ValueError: For missing required state/target or malformed command identity.
+        ValueError: If running state or covariates are absent.
     """
-    if not {"power_w", "running"} <= set(frame):
-        raise HvacError("cycle extraction requires qualified power and running state")
+    if not {"running", "outdoor_c", "sun"} <= set(frame):
+        raise HvacError("cycle extraction requires running state and covariates")
     events = _events(mode_events)
-    modes = modes_at(pd.DatetimeIndex(frame.index), events, cfg.reference_mode)
-    valid = frame.running.notna() & frame.power_w.notna()
-    positions = np.flatnonzero(valid.to_numpy())
-    columns = [
-        "kind",
-        "start",
-        "end",
-        "minutes",
-        "end_cause",
-        "censored",
-        "mode",
-        "mode_changed",
-        "outdoor_c",
-        "sun",
-        "hour_sin",
-        "hour_cos",
-        "defrost_interruptions",
-        "defrost_minutes",
-        "power_w",
-        "supply_c",
-        "control_setpoint_c",
-        "first_after_off",
-    ]
-    switch_columns = [
-        "time",
-        "from_mode",
-        "to_mode",
-        "state",
-        "elapsed_min",
-        "outcome_min",
-        "outcome_censored",
-    ]
-    if not len(positions):
-        return CycleExtraction(
-            pd.DataFrame(columns=columns), pd.DataFrame(columns=switch_columns), 0
-        )
-    observed = frame.iloc[positions]
-    observed_modes = modes.iloc[positions].to_numpy()
-    kinds = np.where(
-        np.isin(observed_modes, list(cfg.off_modes)),
-        "off",
-        np.where(observed.running.to_numpy() > 0, "run", "idle"),
-    )
-    stamps = observed.index
-    gaps = np.r_[
-        True,
-        (stamps[1:] - stamps[:-1]) > pd.Timedelta(minutes=cfg.minute_gap_tolerance_min),
-    ]
-    changes = np.r_[True, kinds[1:] != kinds[:-1]] | gaps
-    edges = np.r_[np.flatnonzero(changes), len(observed)]
-    spells = []
-    for a, b in pairwise(edges):
-        boundary = (
-            SojournEnd.GAP
-            if b < len(observed) and gaps[b]
-            else SojournEnd.WINDOW
-            if b == len(observed)
-            else None
-        )
-        end = stamps[b - 1] + pd.Timedelta(minutes=1) if boundary else stamps[b]
-        spells.append(
-            _Spell(
-                str(kinds[a]),
-                stamps[a],
-                end,
-                positions[a:b].tolist(),
-                not bool(gaps[a]),
-                boundary,
-            )
-        )
-    # Merge only a short observed idle, never OFF, across no command boundary.
-    merged = []
-    i = 0
-    while i < len(spells):
-        spell = spells[i]
-        while i + 2 < len(spells) and spell.kind == "run" and spell.boundary is None:
-            idle, nxt = spells[i + 1], spells[i + 2]
-            gap = (idle.end - idle.start).total_seconds() / 60
-            if (
-                idle.kind != "idle"
-                or nxt.kind != "run"
-                or idle.boundary is not None
-                or gap >= cfg.defrost_merge_min
-            ):
-                break
-            if ((events.time >= idle.start) & (events.time <= idle.end)).any():
-                break
-            gap_rows = frame.loc[(frame.index >= idle.start) & (frame.index < idle.end)]
-            if (
-                "defrost" in gap_rows
-                and gap_rows.defrost.notna().any()
-                and not gap_rows.defrost.eq(1).any()
-            ):
-                break
-            spell = _Spell(
-                "run",
-                spell.start,
-                nxt.end,
-                spell.positions + nxt.positions,
-                spell.known_start,
-                nxt.boundary,
-                spell.interruptions + 1 + nxt.interruptions,
-                spell.interruption_minutes + gap + nxt.interruption_minutes,
-            )
-            i += 2
-        merged.append(spell)
-        i += 1
-    command_times = list(events.time)
+    index = pd.DatetimeIndex(frame.index)
+    modes = modes_at(index, events, cfg.reference_mode).to_numpy()
+    state = frame.running.to_numpy(dtype=float)
+    # Only commands that change something interrupt a cycle: a re-sent identical
+    # mode does not. Mode commands mirrored in control_events are not counted twice.
+    command = np.r_[False, modes[1:] != modes[:-1]]
     if control_events is not None and len(control_events):
         if "time" not in control_events:
             raise HvacError("control interventions require UTC event times")
-        intervention_times = pd.DatetimeIndex(control_events.time)
-        if str(intervention_times.tz) != "UTC":
+        other = control_events
+        if "metric" in other:
+            other = other.loc[other.metric.ne("MODE_OF_OPERATION")]
+        times = pd.DatetimeIndex(other.time)
+        if len(times) and str(times.tz) != "UTC":
             raise HvacError("control intervention timestamps require UTC")
-        command_times.extend(intervention_times)
+        positions = index.get_indexer(times.floor("min"))
+        command[positions[positions >= 0]] = True
+    off = np.isin(modes, list(cfg.off_modes))
+    outdoor = frame.outdoor_c.to_numpy(dtype=float)
+    sun = frame.sun.to_numpy(dtype=float)
     rows = []
-    switches = []
     dropped = 0
-    waiting_after_off = False
-    for spell in merged:
-        if spell.kind == "off":
-            waiting_after_off = True
-        if not spell.known_start:
-            dropped += 1
-            if spell.kind == "run":
-                waiting_after_off = False
+    previous: tuple[float, int, int] | None = None
+    match = cfg.command_match_min
+    for first, last, value in _segments(state):
+        if np.isnan(value):
+            previous = None
             continue
-        mode = str(modes.loc[spell.start])
-        next_mode = modes_at(
-            pd.DatetimeIndex([spell.end]), events, cfg.reference_mode
-        ).iloc[0]
-        cause = spell.boundary
-        if cause is None:
-            cause = (
-                SojournEnd.OFF
-                if next_mode in cfg.off_modes and mode not in cfg.off_modes
-                else (
-                    SojournEnd.COMMAND
-                    if any(
-                        abs((at - spell.end).total_seconds())
-                        <= cfg.command_match_min * 60
-                        for at in command_times
-                    )
-                    else SojournEnd.NATURAL
-                )
-            )
-        changed = events.loc[(events.time > spell.start) & (events.time < spell.end)]
-        samples = frame.iloc[spell.positions]
-        power_samples = (
-            samples.loc[samples.index >= spell.start + pd.Timedelta(minutes=2)]
-            if spell.kind == "run"
-            else samples
+        known_start = first > 0 and not np.isnan(state[first - 1])
+        after = last + 1
+        end_observed = after < len(state) and not np.isnan(state[after])
+        length = last - first + 1
+        cause = (
+            SojournEnd.NATURAL
+            if end_observed
+            else (SojournEnd.WINDOW if after >= len(state) else SojournEnd.GAP)
         )
-
-        def mean(column: str, samples: pd.DataFrame = samples) -> float:
-            return (
-                float(samples[column].mean())
-                if column in samples and samples[column].notna().any()
-                else float("nan")
-            )
-
-        flag_interruptions = 0
-        flag_minutes = 0
-        if "defrost" in samples:
-            defrost_on = samples.defrost.eq(1)
-            # Merged idle positions are excluded from samples, so this counts
-            # only additional observed defrost while the compressor stayed on.
-            flag_interruptions = int(
-                (defrost_on & ~defrost_on.shift(fill_value=False)).sum()
-            )
-            flag_minutes = int(defrost_on.sum())
-            if "defrost" in power_samples:
-                power_samples = power_samples.loc[~power_samples.defrost.eq(1)]
-        local = spell.start.tz_convert(cfg.timezone)
-        angle = 2 * np.pi * (local.hour + local.minute / 60) / 24
+        # Commands are logged at or before the minute their effect shows, so
+        # one in [end - match, first minute after the spell] explains the end;
+        # an earlier one inside the spell truncates it (the rest has no known
+        # start). Either way the observed length is only a lower bound.
+        window = max(after - match, first + 1)
+        hits = np.flatnonzero(command[first + 1 : min(after + 1, len(state))])
+        if len(hits) and first + 1 + hits[0] < window:
+            length, cause = int(hits[0]) + 1, SojournEnd.COMMAND
+        elif len(hits) and cause is SojournEnd.NATURAL:
+            cause = SojournEnd.COMMAND
+        if (
+            cause is SojournEnd.NATURAL
+            and after < len(state)
+            and off[after] != off[first]
+        ):
+            cause = SojournEnd.OFF
+        prev_run = (
+            float(previous[1])
+            if previous is not None and previous[0] == 1.0 and previous[2] == first - 1
+            else np.nan
+        )
+        # A spell with an unknown start has an unknown length.
+        previous = (value, last - first + 1, last) if known_start else None
+        if not known_start:
+            dropped += 1
+            continue
+        if off[first] and value == 0.0:
+            continue
         rows.append(
-            dict(
-                kind=spell.kind,
-                start=spell.start,
-                end=spell.end,
-                minutes=(spell.end - spell.start).total_seconds() / 60,
-                end_cause=cause.value,
-                censored=cause is not SojournEnd.NATURAL,
-                mode=mode,
-                mode_changed=not changed.empty,
-                outdoor_c=mean("outdoor_c"),
-                sun=mean("sun"),
-                hour_sin=float(np.sin(angle)),
-                hour_cos=float(np.cos(angle)),
-                defrost_interruptions=spell.interruptions + flag_interruptions,
-                defrost_minutes=spell.interruption_minutes + flag_minutes,
-                power_w=(
-                    float(power_samples.power_w.median())
-                    if len(power_samples)
-                    else float("nan")
-                ),
-                supply_c=mean("supply_c"),
-                control_setpoint_c=mean("control_setpoint_c"),
-                first_after_off=spell.kind == "run" and waiting_after_off,
+            (
+                "run" if value == 1.0 else "idle",
+                index[first],
+                float(length),
+                cause.value,
+                cause is not SojournEnd.NATURAL,
+                str(modes[first]),
+                float(outdoor[first]),
+                float(sun[first]),
+                prev_run,
             )
         )
-        response_events = changed
-        if spell.kind == "idle":
-            previous_mode = modes_at(
-                pd.DatetimeIndex([spell.start - pd.Timedelta(1, unit="ns")]),
-                events,
-                cfg.reference_mode,
-            ).iloc[0]
-            if previous_mode in cfg.off_modes:
-                boundary_events = events.loc[events.time.eq(spell.start)]
-                response_events = pd.concat(
-                    [boundary_events, changed], ignore_index=True
-                )
-        for event in response_events.itertuples():
-            at = cast(pd.Timestamp, event.time)
-            before = modes_at(
-                pd.DatetimeIndex([at - pd.Timedelta(1, unit="ns")]),
-                events,
-                cfg.reference_mode,
-            ).iloc[0]
-            switches.append(
-                dict(
-                    time=at,
-                    from_mode=str(before),
-                    to_mode=str(event.mode),
-                    state=spell.kind,
-                    elapsed_min=(at - spell.start).total_seconds() / 60,
-                    outcome_min=(spell.end - at).total_seconds() / 60,
-                    outcome_censored=cause is not SojournEnd.NATURAL,
-                )
-            )
-        if spell.kind == "run":
-            waiting_after_off = False
-    result = pd.DataFrame(rows, columns=columns)
-    for c in ("start", "end"):
-        result[c] = pd.to_datetime(result[c], utc=True)
-    switches_frame = pd.DataFrame(switches, columns=switch_columns)
-    switches_frame["time"] = pd.to_datetime(switches_frame.time, utc=True)
-    return CycleExtraction(result, switches_frame, dropped)
+    result = pd.DataFrame(rows, columns=list(SPELL_COLUMNS))
+    result["start"] = pd.to_datetime(result.start, utc=True)
+    return CycleExtraction(result, dropped)

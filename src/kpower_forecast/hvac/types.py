@@ -28,7 +28,7 @@ from pydantic import (
 )
 
 HVAC_CONTRACT_VERSION: int = 1
-HVAC_ESTIMATOR_VERSION: str = "1"
+HVAC_ESTIMATOR_VERSION: str = "2"
 FloatArray = NDArray[np.float64]
 Diagnostic = Mapping[str, JsonValue]
 
@@ -157,19 +157,18 @@ class HvacModelConfig(_Input):
     off_modes: frozenset[str] = frozenset({"OFF"})
     training_days: int = Field(default=28, gt=0, strict=True)
     n_paths: int = Field(default=256, ge=16, strict=True)
-    n_parameter_sets: int = Field(default=8, gt=0, strict=True)
     representative_paths: Literal[16] = 16
     seed: int = Field(default=0, ge=0, strict=True)
     minute_gap_tolerance_min: int = Field(default=5, ge=1, strict=True)
-    defrost_merge_min: int = Field(default=15, ge=0, strict=True)
+    dip_merge_min: int = Field(default=3, ge=0, strict=True)
+    min_run_blip_min: int = Field(default=3, ge=1, strict=True)
     command_match_min: int = Field(default=2, ge=0, strict=True)
+    recency_half_life_days: float = Field(default=3.0, gt=0)
     outdoor_hold_min: int = Field(default=60, ge=0, strict=True)
     outdoor_invalid_grace_min: int = Field(default=15, ge=0, strict=True)
     state_max_age_min: int = Field(default=10, gt=0, strict=True)
     ingest_lag_min: int = Field(default=1, ge=0, strict=True)
     dispersion_inflation: float = Field(default=1.0, gt=0)
-    water_weight: float = Field(default=0.7, ge=0, le=1)
-    enable_t3: bool = False
 
     @field_validator("timezone")
     @classmethod

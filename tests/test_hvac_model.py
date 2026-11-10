@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from kpower_forecast.hvac.cycle_model import CycleFit, CycleParameters
+from kpower_forecast.hvac.cycle_model import CycleFit
 from kpower_forecast.hvac.model import (
     KPowerHvacForecast,
     _predict_candidate,
@@ -111,7 +111,6 @@ def training():
         model_id="fixture",
         timezone="UTC",
         n_paths=32,
-        n_parameter_sets=1,
         ingest_lag_min=2,
     )
     origin = (index[-1] + timedelta(minutes=3)).to_pydatetime()
@@ -266,34 +265,25 @@ def test_fixed_speed_candidate_predicts_all_paths_and_recomputes_statistics(trai
         ),
     )
     state = _State.model_validate(dict(energy_candidate.parameters))
-    p = CycleParameters(
-        20.0,
-        (),
-        (np.log(45 * 13), 0.0, 0.0, 0.0),
-        0.4,
-        1 / 45 + 1 / 15,
-        0.0,
-        (),
-        (),
-        0.2,
-    )
     state = state.model_copy(
         update={
             "capabilities": data.capabilities,
             "energy": None,
-            "cycle": CycleFit((p,), (), False, 0, ()),
+            "cycle": CycleFit(
+                (),
+                (np.log(45.0), 0.0, 0.0, 0.0),
+                0.3,
+                (np.log(15.0), 0.0, 0.0),
+                0.2,
+                15.0,
+                0.0,
+                10.0,
+                50,
+                50,
+            ),
             "threshold_w": 200.0,
             "power": PowerFit(
-                (4000.0, 0.0),
-                False,
-                0.0,
-                (1.0, 1.0, 1.0),
-                {},
-                100.0,
-                50.0,
-                None,
-                MeteredScope.WHOLE_UNIT,
-                (),
+                (4000.0,), 0.0, 0.0, 100.0, 50.0, MeteredScope.WHOLE_UNIT
             ),
         }
     )
@@ -354,9 +344,13 @@ def test_fixed_speed_fit_to_prediction_uses_the_physical_model(training):
     running = False
     while position < len(minutes):
         temperature = minutes.outdoor_env_c.iloc[position]
-        a = (20 - temperature) / (45 * 13)
-        median = 1 / (1 / 45 + 1 / 15 - a) if running else 1 / a
-        length = max(1, int(round(median * np.exp(0.3 * rng.normal()))))
+        # Colder: shorter idles, longer runs (log-linear in temperature).
+        median = (
+            15 * np.exp(-0.03 * (temperature - 7))
+            if running
+            else 45 * np.exp(0.06 * (temperature - 7))
+        )
+        length = max(3, int(round(median * np.exp(0.25 * rng.normal()))))
         power[position : position + length] = 4000.0 if running else 100.0
         position += length
         running = not running
@@ -402,74 +396,3 @@ def test_fixed_speed_fit_to_prediction_uses_the_physical_model(training):
     )
     assert cold.diagnostics["outdoor_extrapolated"] is True
     assert forecast.diagnostics["outdoor_extrapolated"] is False
-
-
-def test_t3_fit_learns_mode_conditioned_thresholds_from_command_history(training):
-    data, cfg, _, _ = training
-    index = pd.date_range("2026-10-01", periods=15 * 1440, freq="min", tz="UTC")
-    temperature = 7 + 3 * np.sin(2 * np.pi * np.arange(len(index)) / 1440)
-    eco = (np.arange(len(index)) >= 5 * 1440) & (np.arange(len(index)) < 10 * 1440)
-    setpoint = 40 + 0.5 * temperature + 5 * (~eco)
-    rng = np.random.default_rng(67)
-    power = np.empty(len(index))
-    position = 0
-    running = False
-    while position < len(index):
-        length = max(
-            3, int(round((20 if running else 50) * np.exp(0.2 * rng.normal())))
-        )
-        power[position : position + length] = 4600.0 if running else 100.0
-        position += length
-        running = not running
-    minutes = pd.DataFrame(
-        {
-            "power_w": power,
-            "outdoor_env_c": temperature,
-            "control_c": 42 + np.sin(2 * np.pi * np.arange(len(index)) / 90),
-            "control_setpoint_c": setpoint,
-            "control_hysteresis_c": 3.0,
-        },
-        index=index,
-    )
-    for name in list(minutes.columns):
-        minutes[name + "__measured_valid"] = True
-        minutes[name + "__quality"] = "good"
-    events = pd.DataFrame(
-        {
-            "time": [index[0], index[5 * 1440], index[10 * 1440]],
-            "mode": ["NORMAL", "ECO", "NORMAL"],
-            "source": "manual",
-        }
-    )
-    hours = pd.date_range(index[0], periods=15 * 24 + 2, freq="h")
-    weather = pd.DataFrame(
-        {
-            "temperature_2m": 7 + 3 * np.sin(2 * np.pi * np.arange(len(hours)) / 24),
-            "shortwave_radiation": 0.0,
-            "wind_speed_10m": 2.0,
-            "weather_source": "historical_forecast",
-        },
-        index=hours,
-    )
-    cap = data.capabilities.model_copy(
-        update={"family": HvacFamily.FIXED_SPEED, "run_threshold_w": 2000.0}
-    )
-    data = replace(
-        data,
-        minutes=minutes,
-        mode_events=events,
-        weather=weather,
-        capabilities=cap,
-        epoch_start=index[0].to_pydatetime(),
-    )
-    cfg = cfg.model_copy(update={"enable_t3": True})
-    candidate = KPowerHvacForecast(cfg).fit(
-        data, as_of=(index[-1] + timedelta(minutes=3)).to_pydatetime()
-    )
-    assert candidate.tier is InputTier.T3_CONTROLLER
-    controller = candidate.parameters["controller"]
-    assert controller["threshold_modes"] == ["ECO", "NORMAL"]
-    np.testing.assert_allclose(
-        controller["threshold_beta"], [40.0, 0.5, 5.0], atol=1e-6
-    )
-    assert candidate.parameters["power"]["temperature_source"] == "control_setpoint_c"

@@ -27,31 +27,18 @@ from kpower_forecast import __version__
 from ._stats import censored_lognormal_aft, check_budget
 from .aggregate import _integral, interval_stats, representatives
 from .cycle_model import CycleFit, fit_cycles
-from .cycles import extract_cycles, modes_at
+from .cycles import clean_running, extract_cycles, modes_at
 from .families import EnergyFit, energy_paths, fit_energy
 from .frames import (
     history_verdict,
     outdoor_frame,
-    policy_number,
     prepare_minutes,
     running_states,
     weather_minutes,
 )
-from .initial_state import (
-    OUTDOOR_COLUMN,
-    OUTDOOR_INVALID_COLUMN,
-    POWER_COLUMN,
-    RETURN_COLUMN,
-    SUPPLY_COLUMN,
-    ControllerFit,
-    WaterCycles,
-    fit_controller_state,
-    fit_water_cycles,
-    initial_distribution,
-)
 from .outdoor import OutdoorFit, fit_outdoor, outdoor_paths
 from .power import PowerFit, fit_power
-from .simulate import schedule_modes, simulate
+from .simulate import initial_state, schedule_modes, simulate
 from .types import (
     HVAC_CONTRACT_VERSION,
     HVAC_ESTIMATOR_VERSION,
@@ -83,8 +70,6 @@ class _State(BaseModel):
     cycle: CycleFit | None = None
     power: PowerFit | None = None
     energy: EnergyFit | None = None
-    water: WaterCycles | None = None
-    controller: ControllerFit | None = None
     threshold_w: float | None = None
     comfort_off: dict[str, tuple[float, float]]
     outdoor_low_c: float
@@ -127,8 +112,7 @@ def _fingerprint(
         "policy": policy_identity,
         "lineage": dict(lineage),
         "outdoor_precedence": ["unit", "environment", "weather"],
-        "tier_set": ["t0_energy", "t1_power", "t2_water"]
-        + (["t3_controller"] if cfg.enable_t3 else []),
+        "tier_set": ["t0_energy", "t1_power"],
     }
     # These inputs are sets, not ordered statistical quantities. Their JSON
     # iteration order can change on a validation round-trip or another process.
@@ -184,24 +168,6 @@ def _weather_at(
         if str(stamp.tz) != "UTC":
             raise HvacError("weather timestamps require aware UTC")
         result = cast(pd.DataFrame, result.loc[stamp <= pd.Timestamp(origin)])
-    return result
-
-
-def _water_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    result = frame.rename(
-        columns={
-            "power_w": POWER_COLUMN,
-            "return_c": RETURN_COLUMN,
-            "supply_c": SUPPLY_COLUMN,
-            "outdoor_c": OUTDOOR_COLUMN,
-            "outdoor_unit_invalid": OUTDOOR_INVALID_COLUMN,
-        }
-    ).copy()
-    # The legacy helper treats every non-null invalid marker as an event.
-    if OUTDOOR_INVALID_COLUMN in result:
-        result[OUTDOOR_INVALID_COLUMN] = result[OUTDOOR_INVALID_COLUMN].where(
-            result[OUTDOOR_INVALID_COLUMN].eq(1)
-        )
     return result
 
 
@@ -289,7 +255,12 @@ def _fit_candidate(
         )
         frame.loc[excluded, "power_w"] = np.nan
     classified = running_states(frame, data.capabilities.run_threshold_w)
-    frame["running"] = classified.running
+    frame["running"] = clean_running(
+        classified.running,
+        max_dip_min=cfg.dip_merge_min,
+        min_run_min=cfg.min_run_blip_min,
+        max_gap_min=cfg.minute_gap_tolerance_min,
+    )
     family = data.capabilities.family
     fallback: str | None = "energy_only_requested" if force_energy else None
     if family in (HvacFamily.TWO_STAGE, HvacFamily.MULTI_STAGE, HvacFamily.INVERTER):
@@ -305,82 +276,44 @@ def _fit_candidate(
     cycle = None
     power = None
     energy = None
-    water = None
-    controller = None
     tier = InputTier.T0_ENERGY
     outdoor = fit_outdoor(frame, weather, cfg.timezone)
     if fallback is None:
         extraction = extract_cycles(frame, events, cfg, control_events=control)
-        cycle, fallback = fit_cycles(
-            extraction.sojourns,
-            cfg,
-            data.capabilities,
-            cancel=cancel,
-            deadline=deadline,
-            mode_switches=extraction.mode_switches,
+        sojourns = extraction.sojourns
+        cycle, fallback, flags = fit_cycles(
+            sojourns, cfg, as_of=as_of, cancel=cancel, deadline=deadline
         )
-        diagnostic["cycles_used"] = int(extraction.sojourns.kind.eq("run").sum())
+        diagnostic.update(flags)
+        diagnostic["complete_runs"] = int(
+            (sojourns.kind.eq("run") & ~sojourns.censored).sum()
+        )
+        diagnostic["complete_idles"] = int(
+            (sojourns.kind.eq("idle") & ~sojourns.censored).sum()
+        )
         diagnostic["censored_share"] = (
-            float(extraction.sojourns.censored.mean())
-            if len(extraction.sojourns)
-            else 0.0
+            float(sojourns.censored.mean()) if len(sojourns) else 0.0
         )
         diagnostic["dropped_left_edges"] = extraction.dropped_left_edges
         if cycle is not None:
-            power = fit_power(
-                frame, extraction.sojourns, events, cfg, data.capabilities.metered_scope
-            )
-            commands = [
-                (
-                    cast(pd.Timestamp, row.time).to_pydatetime(),
-                    "OFF" if row.mode in cfg.off_modes else str(row.mode),
-                )
-                for row in events.itertuples()
-            ]
-            water, reason = fit_water_cycles(
-                _water_frame(frame),
-                commands,
-                threshold_w=cast(float, classified.threshold_w),
-                now=as_of,
-            )
-            diagnostic["water_fit_reason"] = reason
-            controller = fit_controller_state(
-                frame,
-                minimum_days=policy_number(data.history_policy, "_MIN_SPAN_DAYS"),
-                minimum_density=policy_number(data.history_policy, "_MIN_DENSITY"),
-            )
-            tier = (
-                InputTier.T3_CONTROLLER
-                if cfg.enable_t3 and controller
-                else InputTier.T2_WATER
-                if water
-                else InputTier.T1_POWER
-            )
-            p = cycle.parameter_sets[0]
+            power = fit_power(frame, events, cfg, data.capabilities.metered_scope)
+            tier = InputTier.T1_POWER
             diagnostic.update(
                 {
-                    "t_bal_c": p.t_bal_c,
-                    "t_bal_at_grid_edge": cycle.t_bal_at_grid_edge,
-                    "bootstrap_grid_edges": cycle.bootstrap_grid_edges,
-                    "overload_rows_in_fit": cycle.overload_rows_in_fit,
-                    "parameter_sets": len(cycle.parameter_sets),
-                    "run_power_w_at_7c": float(
-                        power.run_power(7.0, power.supply_reference_c)
-                    ),
+                    "idle_sigma": cycle.idle_sigma,
+                    "run_sigma": cycle.run_sigma,
+                    "run_power_w_at_7c_minute_10": float(power.run_power(10, 7.0)),
+                    "run_power_w_at_7c_minute_20": float(power.run_power(20, 7.0)),
+                    "idle_power_w": power.idle_w,
                 }
             )
-            for temperature in (-10, 0, 7, 15):
-                duty, _ = p.stationary(float(temperature), cfg.reference_mode)
-                diagnostic[f"duty_at_{temperature}c"] = float(duty)
-                mi, mr, _ = p.locations(float(temperature), cfg.reference_mode)
-                diagnostic[f"idle_median_min_at_{temperature}c"] = (
-                    float(np.exp(mi)) if np.isfinite(mi) else None
+            for temperature in (-15, -10, 0, 7, 15):
+                duty, idle_min, run_min = cycle.stationary(
+                    float(temperature), cfg.reference_mode
                 )
-                diagnostic[f"run_median_min_at_{temperature}c"] = (
-                    float(np.exp(mr)) if np.isfinite(mr) else None
-                )
-            for label in cycle.unidentified_modes:
-                diagnostic[f"mode_effect_unidentified:{label}"] = True
+                diagnostic[f"duty_at_{temperature}c"] = duty
+                diagnostic[f"idle_median_min_at_{temperature}c"] = idle_min
+                diagnostic[f"run_median_min_at_{temperature}c"] = run_min
     if cycle is None:
         energy = fit_energy(frame, events, cfg, cancel=cancel, deadline=deadline)
     off = _comfort_lengths(events, cfg, as_of, cancel, deadline)
@@ -396,8 +329,6 @@ def _fit_candidate(
         cycle=cycle,
         power=power,
         energy=energy,
-        water=water,
-        controller=controller,
         threshold_w=classified.threshold_w,
         comfort_off=off,
         outdoor_low_c=float(known.quantile(0.02)),
@@ -439,44 +370,11 @@ def _validated_state(candidate: FitResult, cfg: HvacModelConfig) -> _State:
         raise HvacError("incompatible HVAC configuration or fingerprint")
     if (state.cycle is None) != (candidate.tier is InputTier.T0_ENERGY):
         raise HvacError("candidate tier disagrees with coefficients")
-    if state.cycle is not None and (
-        state.power is None or not state.cycle.parameter_sets
-    ):
+    # CycleFit and PowerFit validate their own coefficients on construction.
+    if state.cycle is not None and state.power is None:
         raise HvacError("incomplete fixed-speed coefficients")
-    if state.cycle is not None:
-        if candidate.family is not HvacFamily.FIXED_SPEED:
-            raise HvacError("cycle coefficients require fixed-speed family")
-        for p in state.cycle.parameter_sets:
-            if (
-                len(p.idle_beta) != len(p.idle_modes) + 4
-                or len(p.run_beta) != len(p.run_modes)
-                or p.sigma_idle <= 0
-                or p.sigma_run <= 0
-                or p.rho <= 0
-                or p.recovery_multiplier <= 0
-            ):
-                raise HvacError("invalid cycle coefficient dimensions or rates")
-        if (
-            state.cycle.defrost_length_min < 0
-            or len(state.cycle.defrost_rate) != 3
-            or min(state.cycle.defrost_rate) < 0
-            or min(state.cycle.defrost_hourly_rate) < 0
-        ):
-            raise HvacError("invalid interruption coefficients")
-    if state.power is not None:
-        pwr = state.power
-        if (
-            len(pwr.coefficients) != (3 if pwr.uses_supply else 2)
-            or pwr.residual_sd_w < 0
-            or len(pwr.start_ramp) != 3
-            or min(pwr.start_ramp) < 0
-            or pwr.idle_default_w < 0
-            or pwr.off_w < 0
-            or not 0 <= pwr.defrost_running_share <= 1
-            or any(v < 0 for v in pwr.idle_by_mode.values())
-            or (pwr.defrost_w is not None and pwr.defrost_w < 0)
-        ):
-            raise HvacError("invalid electrical power coefficients")
+    if state.cycle is not None and candidate.family is not HvacFamily.FIXED_SPEED:
+        raise HvacError("cycle coefficients require fixed-speed family")
     if state.cycle is None and state.energy is None:
         raise HvacError("missing energy coefficients")
     if state.energy is not None:
@@ -520,7 +418,12 @@ def _predict_candidate(
         recent = pd.DataFrame({"power_w": [np.nan]}, index=pd.DatetimeIndex([start]))
     recent = outdoor_frame(recent, weather, cfg)
     classified = running_states(recent, state.threshold_w)
-    recent["running"] = classified.running
+    recent["running"] = clean_running(
+        classified.running,
+        max_dip_min=cfg.dip_merge_min,
+        min_run_min=cfg.min_run_blip_min,
+        max_gap_min=cfg.minute_gap_tolerance_min,
+    )
     valid_outdoor = recent.loc[
         recent.outdoor_source.isin(["unit", "environment"]), "outdoor_c"
     ].dropna()
@@ -561,7 +464,9 @@ def _predict_candidate(
     if state.cycle is None:
         assert state.energy is not None
         mean = state.energy.mean_power(
-            temperatures.astype(float), np.broadcast_to(sun, temperatures.shape), modes
+            temperatures.astype(float),
+            np.broadcast_to(sun, temperatures.shape),
+            modes.names(),
         )
         paths = energy_paths(state.energy, mean, rng, start)
         shown = np.empty((0, len(request.grid)), np.float32)
@@ -570,87 +475,33 @@ def _predict_candidate(
         tier = InputTier.T0_ENERGY
     else:
         assert state.power is not None
-        current_weather = weather_minutes(
-            weather, pd.DatetimeIndex([pd.Timestamp(request.origin)])
+        phase = (
+            initial_state(recent.iloc[:0], request.origin, cfg)
+            if force_phase_unknown
+            else initial_state(recent, request.origin, cfg)
         )
-        current_sun = float(current_weather.shortwave_radiation.iloc[0]) / 1000
-        current_temperature = float(
-            observed if observed is not None else np.mean(temperatures[:, 0])
-        )
-        off_elapsed = 0.0
-        if request.last_mode in cfg.off_modes:
-            active_off = next(
-                (
-                    span
-                    for span in request.schedule
-                    if span.start <= request.origin < span.end
-                    and span.mode in cfg.off_modes
-                ),
-                None,
-            )
-            if active_off is not None:
-                off_elapsed = max(
-                    active_off.elapsed_min
-                    + (request.origin - active_off.start).total_seconds() / 60,
-                    0.0,
-                )
-            else:
-                diagnostic["off_elapsed_unknown"] = True
-        phase_frame = _water_frame(recent)
         if force_phase_unknown:
-            # Evaluator B4 hides phase evidence only. Outdoor conditioning and
-            # the measured electrical-power covariate stay identical to cycle.
-            phase_frame = phase_frame.iloc[:0]
+            # Evaluator B4 hides phase evidence only; covariates stay identical.
             diagnostic["phase_forced_unknown"] = True
-        initial = initial_distribution(
-            phase_frame,
-            state.cycle.parameter_sets,
-            cfg,
-            origin=request.origin,
-            mode=request.last_mode or cfg.reference_mode,
-            outdoor_c=current_temperature,
-            sun=current_sun,
-            rng=rng,
-            water=state.water,
-            future_modes=modes[0].tolist(),
-            controller=state.controller,
-            uncertain_off=any(s.end_uncertain for s in request.schedule),
-            off_elapsed_min=off_elapsed,
-        )
-        temperature_source = state.power.temperature_source or "supply_c"
-        supply = (
-            recent[temperature_source].dropna()
-            if temperature_source in recent
-            else pd.Series(dtype=float)
-        )
-        diagnostic["power_temperature_source"] = state.power.temperature_source
-        supply_now = (
-            float(supply.iloc[-1])
-            if len(supply)
-            and request.origin - supply.index[-1].to_pydatetime()
-            <= timedelta(minutes=cfg.state_max_age_min)
-            else None
-        )
         simulated = simulate(
             request,
             state.cycle,
             state.power,
-            initial,
+            phase,
             cfg,
             state.capabilities,
             temperatures,
             sun,
             modes,
             rng,
-            supply_c=supply_now,
             cancel=cancel,
             deadline=deadline,
         )
         paths = simulated.paths
         shown, display = representatives(paths, request.grid)
-        tier = initial.tier
+        tier = InputTier.T1_POWER
         diagnostic.update({key: True for key in simulated.diagnostics})
-        diagnostic["stationary_initial_state"] = initial.stationary
+        diagnostic["stationary_initial_state"] = phase.running is None
     intervals = interval_stats(paths, request.grid)
     offset = (request.origin - paths.start).total_seconds() / 60
     horizons = [

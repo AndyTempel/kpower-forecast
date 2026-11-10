@@ -75,7 +75,7 @@ def backtest(
     config: HvacModelConfig,
     origins: Sequence[datetime],
     *,
-    schedule: Literal["s0", "s1", "s2"] = "s0",
+    schedule: Literal["s0", "s1", "s2", "s3"] = "s0",
     horizon_h: int = 72,
     phase_ablation: bool = True,
     progress: Callable[[datetime, str], None] | None = None,
@@ -104,7 +104,7 @@ def backtest(
     """
     if horizon_h not in (72, 120):
         raise HvacError("backtest requires the registered 72h or 120h pass")
-    if schedule not in ("s0", "s1", "s2"):
+    if schedule not in ("s0", "s1", "s2", "s3"):
         raise HvacError("unknown schedule variant")
     times = tuple(utc(origin) for origin in origins)
     if not times or any(

@@ -51,7 +51,11 @@ def test_availability_unknown_quality_and_bridged_power_are_never_filled(
     minutes.loc[minutes.index[3], "power_w__bridged"] = True
     result = prepare_minutes(minutes, config, as_of=origin, training=False)
     assert result.index[-1] == minutes.index[17]
-    assert result.power_w.iloc[0] == 60 and result.power_w.iloc[1:4].isna().all()
+    # Explicitly invalid and bridged minutes are missing; an untagged (unknown)
+    # minute keeps its observed value, as aggregated history has no tags.
+    assert result.power_w.iloc[0] == 60
+    assert np.isnan(result.power_w.iloc[1]) and np.isnan(result.power_w.iloc[3])
+    assert result.power_w.iloc[2] == minutes.power_w.iloc[2]
     clean = prepare_minutes(minutes.iloc[:18], config, as_of=origin, training=False)
     pd.testing.assert_frame_equal(result, clean)
 

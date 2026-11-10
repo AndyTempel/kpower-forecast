@@ -1,131 +1,92 @@
-"""Exact censoring, gap, defrost and intervention semantics on hand-built traces."""
+"""Spell extraction: cleaning, command censoring and unknown edges."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from kpower_forecast.hvac.cycles import extract_cycles
+from kpower_forecast.hvac.cycles import clean_running, extract_cycles
 from kpower_forecast.hvac.types import HvacModelConfig
+
+START = pd.Timestamp("2026-11-09T00:00Z")
 
 
 @pytest.fixture
 def config():
-    return HvacModelConfig(model_id="test", timezone="UTC")
+    return HvacModelConfig(model_id="t", timezone="UTC")
 
 
-@pytest.fixture
-def trace():
-    index = pd.date_range("2026-11-09T00:00Z", periods=100, freq="min")
-    running = np.zeros(100)
-    running[:5] = 1
-    running[25:35] = 1
-    running[40:50] = 1
-    running[70:80] = 1
-    frame = pd.DataFrame(
-        {
-            "running": running,
-            "power_w": np.where(running > 0, 4500.0, 60.0),
-            "outdoor_c": 5.0,
-            "sun": 0.0,
-            "supply_c": 35.0,
-            "defrost": 0.0,
-        },
+def frame(states):
+    index = pd.date_range(START, periods=len(states), freq="min")
+    return pd.DataFrame(
+        {"running": np.asarray(states, float), "outdoor_c": 5.0, "sun": 0.0},
         index=index,
     )
-    frame.loc[index[35:40], "defrost"] = 1.0
-    events = pd.DataFrame(
-        {
-            "time": [index[0], index[79]],
-            "mode": ["NORMAL", "BOOST"],
-            "source": ["plan", "manual"],
-        }
+
+
+def events(*rows):
+    return pd.DataFrame(
+        [(START + pd.Timedelta(minutes=m), mode, "plan") for m, mode in rows],
+        columns=["time", "mode", "source"],
     )
-    return frame, events
 
 
-def test_defrost_merge_censoring_switches_and_unknown_window_left_edge(config, trace):
-    frame, events = trace
-    result = extract_cycles(frame, events, config)
-    spells = result.sojourns
-    assert result.dropped_left_edges == 1
-    assert spells.kind.tolist() == ["idle", "run", "idle", "run", "idle"]
-    assert spells.minutes.tolist() == [20.0, 25.0, 20.0, 10.0, 20.0]
-    assert spells.end_cause.tolist() == [
-        "natural",
-        "natural",
-        "natural",
-        "command",
-        "window",
-    ]
-    merged = spells.iloc[1]
-    assert merged.defrost_interruptions == 1 and merged.defrost_minutes == 5
-    assert merged.power_w == 4500
-    switch = result.mode_switches.iloc[0]
-    assert (
-        switch.from_mode,
-        switch.to_mode,
-        switch.elapsed_min,
-        switch.outcome_min,
-    ) == ("NORMAL", "BOOST", 9, 1)
-    assert switch.outcome_censored
+def test_clean_merges_short_dips_and_drops_blips_but_not_at_gaps():
+    nan = np.nan
+    raw = pd.Series([0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, nan, 1, 0, 0])
+    cleaned = clean_running(raw, max_dip_min=3, min_run_min=3).to_numpy()
+    assert list(cleaned[1:6]) == [1, 1, 1, 1, 1]  # one-minute dip merged
+    assert cleaned[10] == 0  # one-minute blip between idles removed
+    assert cleaned[15] == 1 and np.isnan(cleaned[16])  # touching a gap: unknown
+    assert cleaned[17] == 1  # blip right after a gap is left alone
 
 
-@pytest.mark.parametrize("gap_minutes,expected_gap", [(5, False), (6, True)])
-def test_gap_tolerance_never_fills_missing_states(
-    config, trace, gap_minutes, expected_gap
-):
-    frame, events = trace
-    frame = frame.drop(frame.index[28 : 28 + gap_minutes - 1])
-    result = extract_cycles(frame, events, config)
-    assert result.sojourns.end_cause.eq("gap").any() == expected_gap
-    assert result.dropped_left_edges == 1 + int(expected_gap)
+def test_short_gap_inside_one_state_is_bridged_but_not_between_states():
+    nan = np.nan
+    raw = pd.Series([1, 0, 0, nan, nan, 0, 0, 1, nan, 0, 0, nan] + [nan] * 6 + [0])
+    cleaned = clean_running(raw, max_dip_min=0, min_run_min=1, max_gap_min=5)
+    v = cleaned.to_numpy()
+    assert list(v[1:7]) == [0, 0, 0, 0, 0, 0]  # idle continues through 2 min
+    assert np.isnan(v[8])  # run -> idle boundary unknown: not bridged
+    assert np.isnan(v[11:18]).all()  # seven missing minutes exceed the tolerance
 
 
-def test_mode_command_in_defrost_gap_prevents_merge_and_offset_end_is_censored(
-    config, trace
-):
-    frame, events = trace
-    extra = pd.DataFrame(
-        {"time": [frame.index[37]], "mode": ["NORMAL"], "source": ["protection"]}
-    )
-    events = pd.concat([events, extra], ignore_index=True)
-    controls = pd.DataFrame(
-        {"time": [frame.index[50]], "metric": ["RETURN_TEMPERATURE_OFFSET"]}
-    )
-    result = extract_cycles(frame, events, config, control_events=controls)
-    runs = result.sojourns.loc[result.sojourns.kind.eq("run")]
-    assert runs.minutes.tolist() == [10.0, 10.0, 10.0]
-    assert runs.end_cause.tolist() == ["command", "command", "command"]
-    assert runs.censored.all()
+def test_natural_spells_previous_run_and_unknown_left_edge(config):
+    states = [1] * 5 + [0] * 40 + [1] * 15 + [0] * 45 + [1] * 3
+    s = extract_cycles(frame(states), events((0, "NORMAL")), config).sojourns
+    # The first run starts at the window edge: its true start is unknown.
+    assert list(s.kind) == ["idle", "run", "idle", "run"]
+    assert list(s.minutes) == [40, 15, 45, 3]
+    assert list(s.censored) == [False, False, False, True]
+    assert s.prev_run_min.iloc[2] == 15
+    assert np.isnan(s.prev_run_min.iloc[0])  # preceding run had an unknown start
+    assert s.end_cause.iloc[-1] == "window"
 
 
-def test_first_recovery_run_remains_marked_after_intervening_idle(config):
-    index = pd.date_range("2026-11-09T00:00Z", periods=30, freq="min")
-    state = np.r_[np.zeros(10), np.ones(10), np.zeros(10)]
-    frame = pd.DataFrame(
-        {"running": state, "power_w": np.where(state > 0, 4500.0, 60.0)}, index=index
-    )
-    events = pd.DataFrame({"time": [index[0], index[5]], "mode": ["OFF", "NORMAL"]})
-    result = extract_cycles(frame, events, config)
-    assert result.sojourns.loc[
-        result.sojourns.kind.eq("run"), "first_after_off"
-    ].tolist() == [True]
-
-    switch = result.mode_switches.iloc[0]
-    assert (
-        switch.from_mode,
-        switch.to_mode,
-        switch.state,
-        switch.elapsed_min,
-        switch.outcome_min,
-    ) == ("OFF", "NORMAL", "idle", 0.0, 5.0)
+def test_real_mode_change_censors_but_identical_resend_does_not(config):
+    states = [0] * 10 + [1] * 20 + [0] * 50 + [1] * 10
+    ev = events((0, "NORMAL"), (15, "NORMAL"), (40, "ECO"), (79, "NORMAL"))
+    s = extract_cycles(frame(states), ev, config).sojourns.set_index("start")
+    run = s.loc[START + pd.Timedelta(minutes=10)]
+    assert not run.censored and run.minutes == 20  # resend at minute 15 ignored
+    idle = s.loc[START + pd.Timedelta(minutes=30)]
+    # ECO at minute 40 truncates the idle there; the rest has no known start.
+    assert idle.censored and idle.minutes == 10 and idle.end_cause == "command"
+    assert len(s) == 3
 
 
-def test_compressor_on_defrost_is_excluded_from_steady_run_power(config, trace):
-    frame, events = trace
-    frame.loc[frame.index[72:75], "defrost"] = 1.0
-    frame.loc[frame.index[72:75], "power_w"] = 9000.0
-    result = extract_cycles(frame, events, config)
-    run = result.sojourns.loc[result.sojourns.start.eq(frame.index[70])].iloc[0]
-    assert run.defrost_interruptions == 1 and run.defrost_minutes == 3
-    assert run.power_w == 4500.0
+def test_command_just_before_a_stop_censors_the_spell(config):
+    states = [0] * 10 + [1] * 12 + [0] * 30 + [1] * 5
+    ev = events((0, "NORMAL"), (21, "ECO"))
+    s = extract_cycles(frame(states), ev, config).sojourns
+    run = s.loc[s.kind == "run"].iloc[0]
+    assert run.censored and run.minutes == 12 and run.end_cause == "command"
+
+
+def test_gaps_censor_and_off_idle_is_not_a_thermal_spell(config):
+    states = [0] * 5 + [1] * 10 + [np.nan] * 3 + [1] * 5 + [0] * 30 + [1] * 5
+    s = extract_cycles(frame(states), events((0, "NORMAL")), config).sojourns
+    assert s.iloc[0].kind == "run" and s.iloc[0].censored
+    assert s.iloc[0].end_cause == "gap"
+    off = [0] * 5 + [1] * 10 + [0] * 60 + [1] * 10
+    s = extract_cycles(frame(off), events((0, "NORMAL"), (15, "OFF")), config).sojourns
+    assert not ((s.kind == "idle") & (s["mode"] == "OFF")).any()

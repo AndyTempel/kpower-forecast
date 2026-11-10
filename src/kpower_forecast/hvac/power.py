@@ -1,9 +1,21 @@
-"""Meter-scope electrical power, observed standby and interruption dynamics."""
+"""Measured electrical power while running, idle and off.
+
+A fixed-speed compressor's electrical input rises through a run as the supply
+water warms (observed: about 4.0 kW at start to 4.8 kW after ~15 minutes, with
+a partial first minute). A flat level underestimates quarter-hour peaks, and a
+straight line overstates long runs, so run power is the measured profile
+by minute-in-run (mean) plus a linear outdoor-temperature term:
+
+    P(k, T) = profile[min(k, K)] + c * (T - 7)
+
+``profile`` is the mean over runs with known starts (including each run's
+partial stop minute, so energy is preserved), up to the last minute observed in
+enough runs; later minutes hold the last value.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Mapping, cast
 
 import numpy as np
 import pandas as pd
@@ -13,141 +25,115 @@ from ._stats import huber_regression
 from .cycles import modes_at
 from .types import HvacError, HvacModelConfig, MeteredScope
 
+MIN_RUN_MINUTES_FOR_FIT: int = 30
+MIN_RUNS_PER_PROFILE_MINUTE: int = 15
+MAX_PROFILE_MINUTES: int = 90
+
 
 @dataclass(frozen=True)
 class PowerFit:
-    """One run-level power regression and measured low-power states."""
+    """Run-power profile, temperature slope and measured low-power states."""
 
-    coefficients: tuple[float, ...]
-    uses_supply: bool
+    profile_w: tuple[float, ...]
+    per_c_w: float
     residual_sd_w: float
-    start_ramp: tuple[float, float, float]
-    idle_by_mode: Mapping[str, float]
-    idle_default_w: float
+    idle_w: float
     off_w: float
-    defrost_w: float | None
     metered_scope: MeteredScope
-    diagnostics: tuple[str, ...]
-    supply_reference_c: float = 35.0
-    defrost_running_share: float = 0.0
-    temperature_source: Literal["supply_c", "control_setpoint_c"] | None = None
 
-    def run_power(
-        self, outdoor_c: ArrayLike, supply_c: ArrayLike = 35.0
-    ) -> NDArray[np.float64]:
-        """Evaluate mean measured run power, never a thermal heat-output estimate.
+    def __post_init__(self) -> None:
+        if (
+            not self.profile_w
+            or not np.isfinite([*self.profile_w, self.per_c_w]).all()
+            or min(self.profile_w) < 0
+            or min(self.idle_w, self.off_w, self.residual_sd_w) < 0
+        ):
+            raise HvacError("invalid electrical power coefficients")
+
+    def run_power(self, minute: ArrayLike, outdoor_c: ArrayLike) -> NDArray[np.float64]:
+        """Mean electrical power at a minute of a run.
 
         Args:
-            outdoor_c: Outdoor temperatures.
-            supply_c: The recorded supply or control-setpoint covariate when
-                fitted, otherwise unused. The caller must preserve its source.
+            minute: Minutes since the run started (0 is the first minute).
+            outdoor_c: Outdoor temperature.
 
         Returns:
-            Nonnegative run electrical watts, in the declared meter scope.
+            Nonnegative watts in the declared meter scope.
         """
-        t, s = np.broadcast_arrays(
-            np.asarray(outdoor_c, dtype=float), np.asarray(supply_c, dtype=float)
-        )
-        value = self.coefficients[0] + self.coefficients[1] * (t - 7)
-        if self.uses_supply:
-            value = value + self.coefficients[2] * (s - 35)
+        profile = np.asarray(self.profile_w)
+        k = np.clip(np.asarray(minute), 0, len(profile) - 1).astype(np.int64)
+        value = profile[k] + self.per_c_w * (np.asarray(outdoor_c, dtype=float) - 7)
         return np.asarray(np.maximum(value, 0.0))
 
 
 def fit_power(
     frame: pd.DataFrame,
-    sojourns: pd.DataFrame,
     mode_events: pd.DataFrame,
     cfg: HvacModelConfig,
     scope: MeteredScope,
 ) -> PowerFit:
-    """Fit run power and observed ramps/standby/defrost without zero-filling.
+    """Fit the run-power profile and temperature slope, plus idle/off power.
 
     Args:
-        frame: Qualified minute observations and running state.
-        sojourns: Extracted runs, idles and OFF spells.
-        mode_events: Causal command history.
-        cfg: Caller mode configuration.
+        frame: Regular minute frame with ``power_w``, cleaned ``running``
+            and ``outdoor_c``.
+        mode_events: Causal command history (for off-mode standby).
+        cfg: Mode configuration.
         scope: Components measured by the meter.
 
     Returns:
-        Regression and state powers, with fallback evidence for unobserved OFF/ramp.
+        The fitted power model.
 
     Raises:
-        ValueError: If required run or idle power cannot be estimated.
+        ValueError: If running or idle power cannot be estimated.
     """
-    runs = (
-        sojourns.loc[sojourns.kind.eq("run")]
-        .dropna(subset=["power_w", "outdoor_c"])
-        .copy()
+    running = frame.running
+    segment = running.ne(running.shift()).cumsum()
+    minute = running.groupby(segment).cumcount().to_numpy()
+    # A run whose start is a gap has an unknown minute index; exclude it.
+    known_start = running.shift().notna().groupby(segment).transform("first").to_numpy()
+    use = (
+        running.eq(1).to_numpy()
+        & known_start
+        & frame.power_w.notna().to_numpy()
+        & np.isfinite(frame.outdoor_c.to_numpy(dtype=float))
     )
-    if len(runs) < 3:
+    if use.sum() < MIN_RUN_MINUTES_FOR_FIT:
         raise HvacError("insufficient_run_power")
-    temperature_source: Literal["supply_c", "control_setpoint_c"] | None = None
-    if "supply_c" in runs and runs.supply_c.notna().sum() >= 3:
-        temperature_source = "supply_c"
-    elif "control_setpoint_c" in runs and runs.control_setpoint_c.notna().sum() >= 3:
-        temperature_source = "control_setpoint_c"
-    use_supply = temperature_source is not None
-    if use_supply:
-        runs = runs.dropna(subset=[cast(str, temperature_source)])
-    columns = [np.ones(len(runs)), runs.outdoor_c.to_numpy() - 7]
-    if use_supply:
-        columns.append(runs[cast(str, temperature_source)].to_numpy() - 35)
-    design = np.column_stack(columns)
-    coefficients = huber_regression(design, runs.power_w.to_numpy())
-    residual = runs.power_w.to_numpy() - design @ coefficients
-    state = modes_at(pd.DatetimeIndex(frame.index), mode_events, cfg.reference_mode)
-    idles = frame.loc[
-        frame.running.eq(0) & ~state.isin(cfg.off_modes) & frame.power_w.notna()
-    ]
-    if idles.empty:
+    k = minute[use]
+    p = frame.power_w.to_numpy(dtype=float)[use]
+    # Winsorize metering spikes so a single bad sample cannot move a mean.
+    p = np.minimum(p, 1.5 * float(np.median(p)))
+    t = frame.outdoor_c.to_numpy(dtype=float)[use] - 7
+    counts = np.bincount(np.minimum(k, MAX_PROFILE_MINUTES))
+    supported = np.flatnonzero(counts >= MIN_RUNS_PER_PROFILE_MINUTE)
+    last = int(supported.max()) if len(supported) else 0
+    k = np.minimum(k, last)
+    # Temperature slope within minute-in-run cells (demeaned by minute).
+    centred_p = p - pd.Series(p).groupby(k).transform("median").to_numpy()
+    centred_t = t - pd.Series(t).groupby(k).transform("mean").to_numpy()
+    slope = float(huber_regression(centred_t[:, None], centred_p)[0])
+    adjusted = p - slope * t
+    # Means, not medians: every run ends in a partial minute, and only the mean
+    # profile reproduces measured run energy (medians overstate it by ~5 %).
+    profile = pd.Series(adjusted).groupby(k).mean().reindex(range(last + 1))
+    profile = profile.interpolate(limit_direction="both")
+    residual = adjusted - profile.to_numpy()[k]
+    modes = modes_at(pd.DatetimeIndex(frame.index), mode_events, cfg.reference_mode)
+    off = modes.isin(cfg.off_modes).to_numpy()
+    standby = frame.power_w.to_numpy(dtype=float)
+    idle = standby[running.eq(0).to_numpy() & ~off]
+    idle = idle[np.isfinite(idle)]
+    if not len(idle):
         raise HvacError("no_measured_idle_power")
-    default = float(idles.power_w.median())
-    by_mode = {
-        str(m): float(idles.loc[state.loc[idles.index].eq(m), "power_w"].median())
-        for m in state.loc[idles.index].unique()
-    }
-    off = frame.loc[state.isin(cfg.off_modes), "power_w"].dropna()
-    diagnostics = []
-    if off.empty:
-        diagnostics.append("off_power_from_idle")
-    ramps: list[list[float]] = [[], [], []]
-    defrost = []
-    defrost_on: list[float] = []
-    for row in runs.itertuples():
-        start = cast(pd.Timestamp, row.start)
-        end = cast(pd.Timestamp, row.end)
-        level = float(cast(float, row.power_w))
-        if not bool(row.censored) and level > 0:
-            for i in range(3):
-                at = start + pd.Timedelta(minutes=i)
-                if at in frame.index and pd.notna(frame.loc[at, "power_w"]):
-                    ramps[i].append(
-                        float(cast(float, frame.loc[at, "power_w"])) / level
-                    )
-        inside = frame.loc[(frame.index >= start) & (frame.index < end)]
-        mask = inside.running.eq(0)
-        if "defrost" in inside:
-            mask |= inside.defrost.eq(1)
-        defrost.extend(inside.loc[mask, "power_w"].dropna().tolist())
-        defrost_on.extend(inside.loc[mask, "running"].dropna().tolist())
-    for i, values in enumerate(ramps):
-        if not values:
-            diagnostics.append(f"start_ramp_unidentified:{i}")
-    ramp = tuple(float(np.mean(values)) if values else 1.0 for values in ramps)
+    off_power = standby[running.eq(0).to_numpy() & off]
+    off_power = off_power[np.isfinite(off_power)]
+    idle_w = float(np.median(idle))
     return PowerFit(
-        tuple(float(x) for x in coefficients),
-        use_supply,
-        float(np.std(residual, ddof=1)),
-        (ramp[0], ramp[1], ramp[2]),
-        by_mode,
-        default,
-        float(off.median()) if len(off) else default,
-        float(np.median(defrost)) if defrost else None,
+        tuple(float(v) for v in profile),
+        slope,
+        float(np.std(residual, ddof=1)) if len(residual) > 1 else 0.0,
+        idle_w,
+        float(np.median(off_power)) if len(off_power) else idle_w,
         scope,
-        tuple(diagnostics),
-        float(runs[cast(str, temperature_source)].mean()) if use_supply else 35.0,
-        float(np.mean(defrost_on)) if defrost_on else 0.0,
-        temperature_source,
     )

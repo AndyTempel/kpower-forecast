@@ -479,7 +479,7 @@ class BundleSnapshot:
 
     def spans(
         self,
-        variant: Literal["s0", "s1", "s2"],
+        variant: Literal["s0", "s1", "s2", "s3"],
         *,
         device_id: str,
         horizon_end: datetime,
@@ -488,7 +488,10 @@ class BundleSnapshot:
 
         Args:
             variant: S0 holds current mode; S1 uses actual future commands; S2
-                uses only the archived version available at this origin.
+                uses only the archived version available at this origin; S3 is
+                the development proxy for the EMS plan: future ``plan`` commands
+                only, and an active comfort/automation OFF released at an
+                uncertain time into the latest planned mode (EMS policy E4.2).
             device_id: Selected heat pump for S2.
             horizon_end: Requested output horizon.
 
@@ -509,11 +512,13 @@ class BundleSnapshot:
                 self.last_mode_event,
                 horizon_end=horizon_end,
             )
-        if variant != "s1":
+        if variant not in ("s1", "s3"):
             raise ValueError("unknown schedule variant")
         events = self.outcomes.get("mode_events.parquet", pd.DataFrame())
         if events.empty:
             return ()
+        if variant == "s3":
+            return self._plan_proxy_spans(events, horizon_end)
         future = events.loc[
             (events.time > self.origin) & (events.time < horizon_end)
         ].sort_values("time", kind="stable")
@@ -530,6 +535,52 @@ class BundleSnapshot:
                     end=end,
                     mode=str(row.mode),
                     source=cast(ModeSource, str(row.source)),
+                )
+            )
+        return tuple(spans)
+
+    def _plan_proxy_spans(
+        self, events: pd.DataFrame, horizon_end: datetime
+    ) -> tuple[ModeSpan, ...]:
+        past = events.loc[events.time <= self.origin].sort_values("time", kind="stable")
+        future = events.loc[
+            (events.time > self.origin)
+            & (events.time < horizon_end)
+            & events.source.eq("plan")
+        ].sort_values("time", kind="stable")
+        plan_past = past.loc[past.source.eq("plan") & ~past["mode"].eq("OFF")]
+        planned = str(plan_past["mode"].iloc[-1]) if len(plan_past) else None
+        spans: list[ModeSpan] = []
+        boundaries = [cast(pd.Timestamp, t).to_pydatetime() for t in future.time]
+        first_end = boundaries[0] if boundaries else horizon_end
+        if len(past):
+            last = past.iloc[-1]
+            if (
+                str(last["mode"]) == "OFF"
+                and str(last.source) in ("thermostat", "automation")
+                and planned is not None
+            ):
+                started = cast(pd.Timestamp, last.time).to_pydatetime()
+                spans.append(
+                    ModeSpan(
+                        start=self.origin,
+                        end=first_end,
+                        mode="OFF",
+                        source=cast(ModeSource, str(last.source)),
+                        end_uncertain=True,
+                        release_mode=planned,
+                        # Age of the latch at span start (the origin).
+                        elapsed_min=(self.origin - started).total_seconds() / 60,
+                    )
+                )
+        for i, row in enumerate(future.itertuples()):
+            end = boundaries[i + 1] if i + 1 < len(boundaries) else horizon_end
+            spans.append(
+                ModeSpan(
+                    start=boundaries[i],
+                    end=end,
+                    mode=str(row.mode),
+                    source="plan",
                 )
             )
         return tuple(spans)

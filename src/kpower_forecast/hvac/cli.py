@@ -75,7 +75,7 @@ def backtest_command(
     hours: Annotated[int, typer.Option(help="72 standard; 120 separate M6 pass.")] = 72,
 ) -> None:
     """Run registered rolling origins and write metrics, gate table and Parquet."""
-    if schedule not in ("s0", "s1", "s2") or hours not in (72, 120):
+    if schedule not in ("s0", "s1", "s2", "s3") or hours not in (72, 120):
         raise typer.BadParameter("schedule must be s0/s1/s2; hours must be 72/120")
     first, stop = _time(start), _time(end)
     if first >= stop:
@@ -94,7 +94,7 @@ def backtest_command(
         source,
         _config(source, config),
         origins,
-        schedule=cast(Literal["s0", "s1", "s2"], schedule),
+        schedule=cast(Literal["s0", "s1", "s2", "s3"], schedule),
         horizon_h=hours,
         progress=lambda origin, stage: logger.info(
             "HVAC %s %s", origin.isoformat(), stage
@@ -140,7 +140,7 @@ def plot_command(
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    if schedule not in ("s0", "s1", "s2"):
+    if schedule not in ("s0", "s1", "s2", "s3"):
         raise typer.BadParameter("schedule must be s0/s1/s2")
     directory = out or Path.cwd() / f"hvac-plot-{datetime.now(UTC):%Y%m%dT%H%M%S}.html"
     if directory.exists():
@@ -160,7 +160,7 @@ def plot_command(
                 >= pd.Timestamp(view.origin) - pd.Timedelta(hours=6)
             ],
             view.spans(
-                cast(Literal["s0", "s1", "s2"], schedule),
+                cast(Literal["s0", "s1", "s2", "s3"], schedule),
                 device_id=source.manifest.device_id,
                 horizon_end=view.origin + timedelta(hours=hours),
             ),
