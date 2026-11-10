@@ -238,16 +238,28 @@ def simulate(
     ):
         raise HvacError("defrost rate has no measured interruption power")
     actual_mode = request.last_mode or cfg.reference_mode
-    labels = np.union1d(np.unique(modes), [actual_mode])
-    mode = np.asarray(np.searchsorted(labels, modes), dtype=np.int64)
-    is_off = np.isin(labels, list(cfg.off_modes))
-    # Next schedule boundary per path; no Python per-minute scan.
-    boundary = np.concatenate(
-        [mode[:, 1:] != mode[:, :-1], np.zeros((n, 1), bool)], axis=1
-    )
-    next_mode = np.minimum.accumulate(
-        np.where(boundary, np.arange(horizon) + 1, horizon)[:, ::-1], axis=1
-    )[:, ::-1]
+    uniform_mode = bool(np.all(modes == modes[0, 0]))
+    if uniform_mode:
+        labels = np.unique([modes[0, 0], actual_mode])
+        constant_mode_id = int(np.searchsorted(labels, modes[0, 0]))
+        mode = np.broadcast_to(
+            np.full((n, 1), constant_mode_id, dtype=np.int64), (n, horizon)
+        )
+        next_mode = np.broadcast_to(
+            np.full((n, 1), horizon, dtype=np.int64), (n, horizon)
+        )
+        is_off = np.isin(labels, list(cfg.off_modes))
+    else:
+        labels = np.union1d(np.unique(modes), [actual_mode])
+        mode = np.asarray(np.searchsorted(labels, modes), dtype=np.int64)
+        is_off = np.isin(labels, list(cfg.off_modes))
+        # Next schedule boundary per path; no Python per-minute scan.
+        boundary = np.concatenate(
+            [mode[:, 1:] != mode[:, :-1], np.zeros((n, 1), bool)], axis=1
+        )
+        next_mode = np.minimum.accumulate(
+            np.where(boundary, np.arange(horizon) + 1, horizon)[:, ::-1], axis=1
+        )[:, ::-1]
     rates = _Rates(fit, cfg, labels)
     index = pd.date_range(start, periods=horizon, freq="min")
     local = index.tz_convert(cfg.timezone)
@@ -274,7 +286,7 @@ def simulate(
         all_ids,
         current_mode,
         outdoor_c[:, 0].astype(float),
-        np.broadcast_to(cov[0], (n, 3)),
+        cov[0],
     )
     natural[state & overloaded] = np.inf
     level = np.maximum(
@@ -324,6 +336,10 @@ def simulate(
         # One short loop per run cohort member, never per simulated minute.
         for j, path in enumerate(ids):
             count = int(counts[j]) if np.isfinite(active[j]) else 0
+            if count == 0:
+                defrost_start[path] = np.empty(0)
+                defrost_on[path] = np.empty(0, bool)
+                continue
             positions = np.sort(rng.uniform(0, active[j], count))
             defrost_start[path] = (
                 at[j] + positions + np.arange(count) * fit.defrost_length_min
@@ -368,6 +384,9 @@ def simulate(
         outdoor_c[current_run, 0].astype(float),
     )
     draw_overload_defrost(all_ids[state & overloaded], offset)
+    natural_index = np.full(n, horizon, dtype=np.int64)
+    finite = np.isfinite(natural) & (natural < horizon)
+    natural_index[finite] = np.ceil(natural[finite]).astype(np.int64)
     while np.any(filled < horizon):
         check_budget(cancel, deadline)
         position = np.minimum(filled, horizon - 1)
@@ -375,61 +394,104 @@ def simulate(
         # Overload and an infinite zero-demand idle need hourly regime checks.
         hour = ((filled // 60) + 1) * 60
         hourly = np.where((state & overloaded) | no_demand_idle, hour, horizon)
-        natural_index = np.full(n, horizon, dtype=np.int64)
-        finite = np.isfinite(natural) & (natural < horizon)
-        natural_index[finite] = np.ceil(natural[finite]).astype(np.int64)
-        event = np.minimum.reduce(
-            [
-                natural_index,
-                next_mode[all_ids, position],
-                hourly,
-                np.full(n, horizon),
-                np.where(current_mode != mode[all_ids, position], filled, horizon),
-            ]
-        )
+        if uniform_mode:
+            event = np.minimum(natural_index, hourly)
+            # A uniform future mode can differ from the actual origin mode.
+            # That common first boundary is still processed at minute zero.
+            if current_mode[0] != constant_mode_id:
+                event = np.minimum(event, filled)
+        else:
+            event = np.minimum.reduce(
+                [
+                    natural_index,
+                    next_mode[all_ids, position],
+                    hourly,
+                    np.where(current_mode != mode[all_ids, position], filled, horizon),
+                ]
+            )
         event = np.maximum(event, filled)
         active = filled < horizon
         earliest = int(event[active].min())
         ids = all_ids[active & (event == earliest)]
-        # Equal-event cohort can have different previous event positions.
-        left = int(filled[ids].min())
-        t = np.arange(left, earliest)
-        mask = t[None, :] >= filled[ids, None]
-        m = mode[ids[:, None], t[None, :]]
-        values = np.broadcast_to(level[ids, None], m.shape).copy()
-        age = t[None, :] - began[ids, None]
-        ramp = np.clip(np.floor(age), 0, 2).astype(int)
-        values *= np.where(
-            (age >= 0) & (age < 3), np.asarray(power.start_ramp)[ramp], 1.0
-        )
-        values = np.where(state[ids, None], values, idle_power[m])
-        values = np.where(is_off[m], power.off_w, values)
-        on = np.broadcast_to(state[ids, None], m.shape).copy()
-        if (
+        backup_possible = (
             capabilities.backup_heater_kw is not None
             and capabilities.backup_heater_max_outdoor_c is not None
-        ):
-            backup = (state[ids] & overloaded[ids])[:, None] & (
-                outdoor_c[ids[:, None], t] <= capabilities.backup_heater_max_outdoor_c
-            )
-            values += (
-                backup
-                * (capabilities.backup_heater_kw * 1000 * np.clip(depth[ids], 0, 1))[
-                    :, None
-                ]
-            )
-            if backup.any():
-                diagnostics.add("backup_heater_assumed")
-        for j, path in enumerate(ids):
-            for d, on_defrost in zip(
-                defrost_start[path], defrost_on[path], strict=True
+            and np.any(state[ids] & overloaded[ids])
+        )
+        if not backup_possible:
+            # Each event-bounded path segment has one mode and run level. Write
+            # its contiguous slice, then at most three ramp samples and recorded
+            # defrost slices; there is no Python loop over the minute horizon.
+            for path in ids:
+                left = int(filled[path])
+                if is_off[current_mode[path]]:
+                    watts[path, left:earliest] = power.off_w
+                    running[path, left:earliest] = False
+                elif not state[path]:
+                    watts[path, left:earliest] = idle_power[current_mode[path]]
+                    running[path, left:earliest] = False
+                else:
+                    watts[path, left:earliest] = level[path]
+                    running[path, left:earliest] = True
+                    ramp_end = min(earliest, int(np.ceil(began[path] + 3)))
+                    for minute in range(left, ramp_end):
+                        age = minute - began[path]
+                        if 0 <= age < 3:
+                            watts[path, minute] = (
+                                level[path] * power.start_ramp[int(age)]
+                            )
+                    for d, on_defrost in zip(
+                        defrost_start[path], defrost_on[path], strict=True
+                    ):
+                        first = max(left, int(np.ceil(d)))
+                        last = min(earliest, int(np.ceil(d + fit.defrost_length_min)))
+                        if first < last:
+                            watts[path, first:last] = power.defrost_w
+                            running[path, first:last] = on_defrost
+        else:
+            # Equal-event cohort can have different previous event positions.
+            left = int(filled[ids].min())
+            t = np.arange(left, earliest)
+            mask = t[None, :] >= filled[ids, None]
+            # A cohort ends at its next mode boundary, so every written minute has
+            # its current mode. Masked prefixes need no historical mode expansion.
+            m = current_mode[ids, None]
+            values = np.broadcast_to(level[ids, None], mask.shape).copy()
+            if np.any(state[ids] & (filled[ids] - began[ids] < 3)):
+                age = t[None, :] - began[ids, None]
+                ramp = np.clip(np.floor(age), 0, 2).astype(int)
+                values *= np.where(
+                    (age >= 0) & (age < 3), np.asarray(power.start_ramp)[ramp], 1.0
+                )
+            values = np.where(state[ids, None], values, idle_power[m])
+            values = np.where(is_off[m], power.off_w, values)
+            on = np.broadcast_to(state[ids, None], mask.shape).copy()
+            if (
+                capabilities.backup_heater_kw is not None
+                and capabilities.backup_heater_max_outdoor_c is not None
             ):
-                use = (t >= d) & (t < d + fit.defrost_length_min) & state[path]
-                values[j, use] = power.defrost_w
-                on[j, use] = on_defrost
-        rows, cols = np.broadcast_arrays(ids[:, None], t[None, :])
-        watts[rows[mask], cols[mask]] = values[mask]
-        running[rows[mask], cols[mask]] = on[mask]
+                backup = (state[ids] & overloaded[ids])[:, None] & (
+                    outdoor_c[ids[:, None], t]
+                    <= capabilities.backup_heater_max_outdoor_c
+                )
+                values += (
+                    backup
+                    * (
+                        capabilities.backup_heater_kw * 1000 * np.clip(depth[ids], 0, 1)
+                    )[:, None]
+                )
+                if backup.any():
+                    diagnostics.add("backup_heater_assumed")
+            for j, path in enumerate(ids):
+                for d, on_defrost in zip(
+                    defrost_start[path], defrost_on[path], strict=True
+                ):
+                    use = (t >= d) & (t < d + fit.defrost_length_min) & state[path]
+                    values[j, use] = power.defrost_w
+                    on[j, use] = on_defrost
+            rows, cols = np.broadcast_arrays(ids[:, None], t[None, :])
+            watts[rows[mask], cols[mask]] = values[mask]
+            running[rows[mask], cols[mask]] = on[mask]
         previous = mode_here[ids]
         filled[ids] = earliest
         if earliest >= horizon:
@@ -440,61 +502,58 @@ def simulate(
         old_state = state[ids].copy()
         old_over = overloaded[ids].copy()
         temp = outdoor_c[ids, earliest].astype(float)
-        mi_new, mr_new, over_new, depth_new = rates.at(
-            ids, new, temp, np.broadcast_to(cov[earliest], (len(ids), 3))
-        )
-        mi_old, mr_old, _, _ = rates.at(
-            ids, previous, temp, np.broadcast_to(cov[earliest], (len(ids), 3))
-        )
-        # A schedule command takes precedence over a simultaneous natural event.
-        into_off = changed & is_off[new]
-        out_off = changed & is_off[previous] & ~is_off[new]
-        state[ids[into_off]] = False
-        off_started[ids[into_off]] = earliest
-        pending_recovery[ids[into_off]] = True
-        natural[ids[into_off]] = np.inf
-        began[ids[into_off & old_state]] = earliest
-        for off_index in np.flatnonzero(into_off):
-            defrost_start[ids[off_index]] = np.empty(0)
-            defrost_on[ids[off_index]] = np.empty(0, bool)
-        if out_off.any():
-            out_ids = ids[out_off]
-            age_off = np.maximum(earliest - off_started[out_ids], 0)
-            natural[out_ids] = earliest + conditional_lognormal(
-                mi_new[out_off], rates.si[out_ids], age_off, rng
-            )
-            water_ids = out_ids[water[out_ids]]
-            natural[water_ids] = np.maximum(water_start[water_ids], earliest)
-            # Keep the physical off clock, including an idle before the command.
-        rescale = changed & ~into_off & ~out_off & ~water[ids]
-        for on_state in (False, True):
-            use = rescale & (old_state == on_state)
-            old_mu, new_mu = (mr_old, mr_new) if on_state else (mi_old, mi_new)
-            finite_pair = use & np.isfinite(old_mu) & np.isfinite(new_mu)
-            natural[ids[finite_pair]] = earliest + np.maximum(
-                natural[ids[finite_pair]] - earliest, 0
-            ) * np.exp(new_mu[finite_pair] - old_mu[finite_pair])
-        # Learned outcomes replace generic scaling, including OFF release.
-        for effect in fit.switch_effects:
-            use = (
-                changed
-                & ~water[ids]
-                & (labels[previous] == effect.from_mode)
-                & (labels[new] == effect.to_mode)
-                & ~is_off[new]
-                & (
-                    ("run" if effect.state == "run" else "idle")
-                    == np.where(state[ids], "run", "idle")
+        mi_new, mr_new, over_new, depth_new = rates.at(ids, new, temp, cov[earliest])
+        if changed.any():
+            mi_old, mr_old, _, _ = rates.at(ids, previous, temp, cov[earliest])
+            # A schedule command takes precedence over a simultaneous natural event.
+            into_off = changed & is_off[new]
+            out_off = changed & is_off[previous] & ~is_off[new]
+            state[ids[into_off]] = False
+            off_started[ids[into_off]] = earliest
+            pending_recovery[ids[into_off]] = True
+            natural[ids[into_off]] = np.inf
+            began[ids[into_off & old_state]] = earliest
+            for off_index in np.flatnonzero(into_off):
+                defrost_start[ids[off_index]] = np.empty(0)
+                defrost_on[ids[off_index]] = np.empty(0, bool)
+            if out_off.any():
+                out_ids = ids[out_off]
+                age_off = np.maximum(earliest - off_started[out_ids], 0)
+                natural[out_ids] = earliest + conditional_lognormal(
+                    mi_new[out_off], rates.si[out_ids], age_off, rng
                 )
-            )
-            if use.any():
-                chosen = ids[use]
-                natural[chosen] = earliest + rng.lognormal(
-                    effect.mu, effect.sigma * cfg.dispersion_inflation, len(chosen)
+                water_ids = out_ids[water[out_ids]]
+                natural[water_ids] = np.maximum(water_start[water_ids], earliest)
+                # Keep the physical off clock, including an idle before the command.
+            rescale = changed & ~into_off & ~out_off & ~water[ids]
+            for on_state in (False, True):
+                use = rescale & (old_state == on_state)
+                old_mu, new_mu = (mr_old, mr_new) if on_state else (mi_old, mi_new)
+                finite_pair = use & np.isfinite(old_mu) & np.isfinite(new_mu)
+                natural[ids[finite_pair]] = earliest + np.maximum(
+                    natural[ids[finite_pair]] - earliest, 0
+                ) * np.exp(new_mu[finite_pair] - old_mu[finite_pair])
+            # Learned outcomes replace generic scaling, including OFF release.
+            for effect in fit.switch_effects:
+                use = (
+                    changed
+                    & ~water[ids]
+                    & (labels[previous] == effect.from_mode)
+                    & (labels[new] == effect.to_mode)
+                    & ~is_off[new]
+                    & (
+                        ("run" if effect.state == "run" else "idle")
+                        == np.where(state[ids], "run", "idle")
+                    )
                 )
-                diagnostics.add(
-                    f"switch_effect_learned:{effect.from_mode}->{effect.to_mode}:{effect.state}"
-                )
+                if use.any():
+                    chosen = ids[use]
+                    natural[chosen] = earliest + rng.lognormal(
+                        effect.mu, effect.sigma * cfg.dispersion_inflation, len(chosen)
+                    )
+                    diagnostics.add(
+                        f"switch_effect_learned:{effect.from_mode}->{effect.to_mode}:{effect.state}"
+                    )
         # Overload is a regime, not a very small run rate.
         entering = state[ids] & over_new & ~is_off[new]
         natural[ids[entering]] = np.inf
@@ -567,6 +626,11 @@ def simulate(
         # A zero-residual learned/conditional event is processed at the next sample.
         natural[ids[eligible]] = np.maximum(natural[ids[eligible]], earliest + 1e-6)
         draw_overload_defrost(ids[state[ids] & overloaded[ids]], float(earliest))
+        # Only this cohort changed its natural clock. Other paths retain their
+        # cached sample boundary, including censored/infinite clocks.
+        natural_index[ids] = horizon
+        finite = np.isfinite(natural[ids]) & (natural[ids] < horizon)
+        natural_index[ids[finite]] = np.ceil(natural[ids[finite]]).astype(np.int64)
     return SimulationResult(
         MinutePaths(start, watts, running, starts), tuple(sorted(diagnostics))
     )
