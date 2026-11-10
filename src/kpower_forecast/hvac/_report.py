@@ -188,7 +188,8 @@ def summarize(
         pairs = _pairs(
             source,
             "B3",
-            ["origin", "block_start", "block_end", "block_id"],
+            ["origin", "block_start", "block_end", "block_id"]
+            + [key for key in ("generated_at", "plan") if key in source],
             "pinball_q90",
         )
         coverage = float(eligible.q90_covered.mean()) if len(eligible) else None
@@ -336,9 +337,10 @@ def summarize(
     )
     peak_summary: dict[str, object] = {"eligible": 0, "peak_crps_kwh": None}
     if not blocks.empty:
+        peak_rows = blocks.loc[blocks.model.eq("cycle")]
         peak_summary = {
-            "eligible": int(blocks.peak_crps_kwh.notna().sum()),
-            "peak_crps_kwh": float(blocks.peak_crps_kwh.mean()),
+            "eligible": int(peak_rows.peak_crps_kwh.notna().sum()),
+            "peak_crps_kwh": float(peak_rows.peak_crps_kwh.mean()),
         }
     summaries["M4"] = peak_summary
     runtime = tables.get("runtime", pd.DataFrame())

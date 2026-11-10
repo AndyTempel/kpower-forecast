@@ -24,6 +24,32 @@ logger = logging.getLogger(__name__)
 console = Console()
 
 
+@app.command("live-score")
+def live_score_command(
+    bundle: Annotated[Path, typer.Option(exists=True, file_okay=False)],
+    deploy: Annotated[
+        str, typer.Option(help="Deployment time; a fix restarts the window.")
+    ],
+    until: Annotated[str | None, typer.Option(help="Exclusive origin cutoff.")] = None,
+    out: Annotated[Path | None, typer.Option(help="New report directory.")] = None,
+) -> None:
+    """Score archived published forecasts and reserves without running a model."""
+    from ._live import live_score
+
+    directory = out or Path.cwd() / f"hvac-live-{datetime.now(UTC):%Y%m%dT%H%M%S}"
+    if directory.exists():
+        raise typer.BadParameter("output directory already exists")
+    source = HvacEvaluationBundle.load(bundle)
+    result = live_score(
+        source,
+        _config(source),
+        deploy=_time(deploy),
+        until=_time(until) if until else None,
+    )
+    write_report(result, directory, scope="published_live")
+    console.print(f"Report: {directory / 'report.md'}")
+
+
 def _time(value: str) -> datetime:
     return utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
 
