@@ -293,6 +293,29 @@ class NixtlaHybridBackend:
         future = self._aligned_future(future_features, horizon)
         return self._predict_irradiance_direct(future, physics_only=True)
 
+    def extend_training_cutoff(self, cutoff: pd.Timestamp) -> None:
+        """Move the cutoff past trailing rows held out of the fit.
+
+        Only the direct structures allow it: they are not rolled forward from
+        the last fitted row, so rows left out of the fit (snow-covered PV) may
+        end the history without moving the first forecast slot back.
+
+        Args:
+            cutoff: Last history row, at or after the last fitted row.
+
+        Raises:
+            ValueError: For a recursive structure, before fitting, or for a
+                cutoff before the last fitted row.
+        """
+        if not (self._profile_direct or self._irradiance_direct):
+            raise ValueError("only direct structures can extend the training cutoff")
+        if self._last_train_ds is None:
+            raise ValueError("backend has not been fitted")
+        cutoff = pd.Timestamp(cutoff)
+        if cutoff < self._last_train_ds:
+            raise ValueError("training cutoff cannot move before the last fitted row")
+        self._last_train_ds = cutoff
+
     def _aligned_future(
         self, future_features: pd.DataFrame, horizon: int
     ) -> pd.DataFrame:

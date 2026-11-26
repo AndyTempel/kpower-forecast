@@ -24,7 +24,7 @@ from kpower_forecast.ml.forecast import (
     bridge_short_target_gaps,
 )
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
-from kpower_forecast.weather_client import WeatherConfig
+from kpower_forecast.weather_client import WEATHER_ACCUMULATION_UNITS, WeatherConfig
 
 
 def test_ml_constructor_preserves_legacy_positional_argument_order(tmp_path) -> None:
@@ -786,6 +786,7 @@ def test_ml_forecast_permits_forced_retrain_of_legacy_manifest(
         {
             "timezone": "UTC",
             "history_policy_version": HISTORY_POLICY_VERSION,
+            "weather_accumulation_units": WEATHER_ACCUMULATION_UNITS,
             "preserve_gaps": False,
             "sanitized_conformal_state_version": SANITIZED_CONFORMAL_STATE_VERSION,
         },
@@ -838,6 +839,7 @@ def test_ml_forecast_rejects_incompatible_gap_preservation_mode(
     metadata = {
         "timezone": "UTC",
         "history_policy_version": HISTORY_POLICY_VERSION,
+        "weather_accumulation_units": WEATHER_ACCUMULATION_UNITS,
         "sanitized_conformal_state_version": SANITIZED_CONFORMAL_STATE_VERSION,
     }
     if stored_mode is not None:
@@ -894,6 +896,7 @@ def test_ml_forecast_retrains_a_model_from_another_training_weather_source(
             metadata={
                 "timezone": "UTC",
                 "history_policy_version": HISTORY_POLICY_VERSION,
+                "weather_accumulation_units": WEATHER_ACCUMULATION_UNITS,
                 "preserve_gaps": False,
                 "sanitized_conformal_state_version": (
                     SANITIZED_CONFORMAL_STATE_VERSION
@@ -1151,6 +1154,8 @@ def test_archive_fallback_is_only_for_sites_without_a_usable_model(tmp_path) -> 
                 ),
                 "timezone": forecast.config.timezone,
                 "history_policy_version": HISTORY_POLICY_VERSION,
+                "weather_accumulation_units": WEATHER_ACCUMULATION_UNITS,
+                "snow_cover": {"parameters": forecast.config.snow_cover.model_dump()},
                 "preserve_gaps": forecast.config.preserve_gaps,
                 "max_bridged_gap_intervals": 0,
             },

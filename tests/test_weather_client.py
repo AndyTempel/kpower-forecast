@@ -541,6 +541,30 @@ def test_process_response_prefers_minutely_15_payload() -> None:
     assert df["temperature_2m"].tolist() == [20.0, 21.0]
 
 
+def test_process_response_reports_15_minute_amounts_as_hourly_rates() -> None:
+    """A quarter-hour amount means the same as an hourly amount four times larger."""
+    client = WeatherClient(lat=46.0, lon=14.0)
+    data = {
+        "timezone": "UTC",
+        "utc_offset_seconds": 0,
+        "minutely_15": {
+            "time": ["2026-01-10T09:00", "2026-01-10T09:15"],
+            "temperature_2m": [-2.0, -2.0],
+            "cloud_cover": [100.0, 100.0],
+            "shortwave_radiation": [20.0, 30.0],
+            "snow_depth": [0.1, 0.1],
+            "snowfall": [0.3, 0.0],
+            "precipitation": [0.25, 0.0],
+        },
+    }
+
+    df = client._process_response(data)
+
+    assert df["snowfall"].tolist() == pytest.approx([1.2, 0.0])
+    assert df["precipitation"].tolist() == pytest.approx([1.0, 0.0])
+    assert df["snow_depth"].tolist() == [0.1, 0.1]
+
+
 def test_process_response_includes_available_optional_fields() -> None:
     client = WeatherClient(lat=46.0, lon=14.0)
     data = {

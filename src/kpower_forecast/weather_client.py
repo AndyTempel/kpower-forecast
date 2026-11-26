@@ -59,6 +59,20 @@ PHYSICAL_LOWER_BOUNDED_COLUMNS: tuple[str, ...] = (
     "snowfall_height",
 )
 ZERO_FILLED_REQUIRED_COLUMNS: frozenset[str] = frozenset({"snow_depth", "snowfall"})
+# Open-Meteo reports these as the amount over the preceding row: 15 minutes in
+# a ``minutely_15`` response, an hour in an ``hourly`` one. Parsed frames carry
+# them as per-hour rates so both resolutions mean the same after resampling.
+ACCUMULATED_COLUMNS: tuple[str, ...] = (
+    "snowfall",
+    "precipitation",
+    "rain",
+    "showers",
+    "snowfall_water_equivalent",
+    "snowfall_convective_water_equivalent",
+)
+# Unit of ACCUMULATED_COLUMNS in parsed frames. Models trained on another unit
+# must be retrained.
+WEATHER_ACCUMULATION_UNITS = "per_hour"
 
 
 class TrainingWeatherSource(str, Enum):
@@ -1169,6 +1183,10 @@ class WeatherClient:
         # stores as object dtype; interpolate() refuses object columns.
         numeric_cols = [c for c in df.columns if c != "ds"]
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        if isinstance(data.get(MINUTELY_15), dict):
+            # Amounts per 15 minutes become per-hour rates, like hourly rows.
+            accumulated = [c for c in ACCUMULATED_COLUMNS if c in df.columns]
+            df[accumulated] = df[accumulated] * FORECAST_INTERVALS_PER_HOUR
 
         if not interpolate:
             return self._clip_physical_bounds(df)

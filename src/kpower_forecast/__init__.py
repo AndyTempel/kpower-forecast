@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from .core import KPowerForecast
 
 __all__ = ["KPowerForecast"]
-__version__ = "2026.11.3"
+__version__ = "2026.11.4"
 
 
 def __getattr__(name: str) -> object:

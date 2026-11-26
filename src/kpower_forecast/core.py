@@ -8,6 +8,7 @@ from prophet import Prophet
 from prophet.diagnostics import cross_validation, performance_metrics
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .snow_cover import SnowCoverParameters, step_snow_load
 from .storage import ModelStorage
 from .utils import calculate_solar_elevation, get_clear_sky_ghi
 from .weather_client import WeatherClient, WeatherConfig
@@ -1034,6 +1035,16 @@ class KPowerForecast:
                 # Apply Snow Constraints
                 forecast.loc[snow_mask_soft.values, col] *= 0.5
                 forecast.loc[snow_mask_hard.values, col] = 0.0
+
+            # B. Snow on the panels (kpower_forecast.snow_cover). This path
+            # has no training-weather spin-up, so the load starts clear at the
+            # first forecast row and the ground-depth mask above stays as a floor.
+            panel_factor = step_snow_load(
+                future, self.config.interval_minutes, SnowCoverParameters()
+            ).factor
+            for col in ["yhat", "yhat_upper"]:
+                forecast[col] = forecast[col].to_numpy() * panel_factor
+            forecast.loc[panel_factor < 1.0, "yhat_lower"] = 0.0
 
             # C. Efficiency Cap
             energy_limit = self._energy_limit_from_efficiency(future)

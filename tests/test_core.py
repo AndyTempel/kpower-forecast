@@ -311,3 +311,41 @@ def test_predict_applies_optional_static_curtailment(monkeypatch, tmp_path) -> N
     assert forecast.loc[0, "curtailed_kwh"] == pytest.approx(8.75)
     assert forecast.loc[0, "curtailment_active"]
     assert forecast.loc[0, "yhat"] == pytest.approx(1.25)
+
+
+def test_predict_zeroes_output_once_forecast_snow_covers_the_panels(
+    monkeypatch, tmp_path
+) -> None:
+    kp = KPowerForecast(
+        model_id="test_panel_snow",
+        latitude=46.0,
+        longitude=14.5,
+        storage_path=str(tmp_path),
+        forecast_type="solar",
+        interval_minutes=15,
+    )
+    kp._model = cast(Prophet, DummyForecastModel())
+    ds = pd.date_range("2026-01-10 09:00", "2026-01-10 14:00", freq="15min", tz="UTC")
+    snowing = (ds >= "2026-01-10 10:00") & (ds < "2026-01-10 12:00")
+    weather_df = pd.DataFrame(
+        {
+            "ds": ds,
+            "temperature_2m": -2.0,
+            "cloud_cover": 0.0,
+            "shortwave_radiation": 300.0,
+            # No snow on the ground: only the panel load can zero the output.
+            "snow_depth": 0.0,
+            "snowfall": [3.0 if flag else 0.0 for flag in snowing],
+        }
+    )
+    monkeypatch.setattr(kp.weather_client, "fetch_forecast", lambda days: weather_df)
+    monkeypatch.setattr(
+        kp.weather_client, "resample_weather", lambda df, interval_minutes: df
+    )
+
+    forecast = kp.predict(days=1)
+
+    before = forecast["ds"] < pd.Timestamp("2026-01-10 10:00")
+    after = forecast["ds"] >= pd.Timestamp("2026-01-10 11:00")
+    assert forecast.loc[before, "yhat"].min() > 0.0
+    assert forecast.loc[after, ["yhat", "yhat_lower", "yhat_upper"]].max().max() == 0.0
