@@ -14,6 +14,7 @@ from kpower_forecast.ml.selection import (
     SOLAR_PHYSICS_CANDIDATE,
     SOLAR_SELECTION_CANDIDATES,
 )
+from kpower_forecast.snow_cover import SnowCoverParameters
 
 
 class MLForecastType(str, Enum):
@@ -116,6 +117,10 @@ class KPowerMLConfig(BaseModel):
     # mode). Required in training history and, for every model-grid row, in
     # ``known_future`` at prediction.
     known_covariates: list[str] = Field(default_factory=list)
+    # Solar only: zero the forecast while snow lies on the panels and keep
+    # snow-covered rows out of training (kpower_forecast.snow_cover).
+    snow_cover_gate: bool = True
+    snow_cover: SnowCoverParameters = Field(default_factory=SnowCoverParameters)
 
     @field_validator("interval_minutes")
     @classmethod

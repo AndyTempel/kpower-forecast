@@ -44,8 +44,20 @@ from kpower_forecast.ml.selection import (
     select_candidate,
 )
 from kpower_forecast.ml.storage import MLModelManifest, MLModelStorage
+from kpower_forecast.snow_cover import (
+    SnowCoverSource,
+    SnowCoverStatus,
+    SnowLoadState,
+    SnowLoadTrajectory,
+    cover_status,
+    energy_per_irradiance,
+    observed_cover,
+    pessimistic_parameters,
+    step_snow_load,
+)
 from kpower_forecast.utils import calculate_solar_elevation, normalize_to_instant_kwh
 from kpower_forecast.weather_client import (
+    WEATHER_ACCUMULATION_UNITS,
     TrainingWeatherSource,
     WeatherClient,
     WeatherConfig,
@@ -72,6 +84,8 @@ HISTORY_POLICY_VERSION: int = 2
 # Without a backtest, bands calibrate on the contiguous tail; below this it is too
 # short after a recent gap, so training stays pending. Three hours of 15-min rows.
 MIN_GAP_TOLERANT_CALIBRATION_ROWS: int = 12
+# Yield estimate from rows of unknown snow cover (see _exclude_snow_covered).
+UNKNOWN_COVER_YIELD_QUANTILE: float = 0.9
 # A stored model older than this is retrained on the archive if it must be.
 ARCHIVE_FALLBACK_MODEL_AGE: pd.Timedelta = pd.Timedelta(days=3)
 # Limits of the recent-bias factor: a few unusual days must not rescale a forecast.
@@ -171,6 +185,10 @@ class KPowerMLForecast:
         self._regression: Optional[DegreeHourRegression] = None
         self._blend_weight: Optional[float] = None
         self._recent_bias_ratio: float = 1.0
+        self._snow_state: SnowLoadState | None = None
+        self._snow_trajectory: pd.DataFrame | None = None
+        self.snow_excluded_rows: int = 0
+        self.snow_cover: dict[str, Any] | None = None
         self._restore_existing_manifest()
 
     def _weather_config_with_default_cache(
@@ -232,16 +250,30 @@ class KPowerMLForecast:
         bridged_times = set(
             pd.to_datetime(bridged_history.loc[bridged_mask, "ds"], utc=True)
         )
+        bridged_history, snow_held_out = self._exclude_snow_covered(bridged_history)
         complete_features = self.feature_builder.build(bridged_history)
         prepared, prepared_features, train_frame, calibration_frame = (
             self._gap_safe_training_split(
-                bridged_history, complete_features, bridged=bridged_mask
+                bridged_history,
+                complete_features,
+                bridged=bridged_mask,
+                held_out=snow_held_out if snow_held_out.any() else None,
             )
         )
         train_features = self.feature_builder.build(train_frame)
         calibration_features = self.feature_builder.build(calibration_frame)
         full_features = prepared_features
         self._training_end = pd.to_datetime(prepared["ds"], utc=True).max()
+        if snow_held_out.any():
+            # Snow-covered rows are left out of the fit, not out of the
+            # history: the cutoff stays at the last measured row. The direct
+            # structures do not roll forward from it.
+            measured = bridged_history["y"].notna() | snow_held_out
+            last_measured = pd.to_datetime(
+                bridged_history.loc[measured, "ds"], utc=True
+            ).max()
+            self._training_end = max(self._training_end, last_measured)
+        self._snow_state = self._snow_state_at(self._training_end)
 
         # Bridged rows keep the structural series contiguous, but only measured
         # rows may calibrate weather bias or prediction intervals.
@@ -293,6 +325,12 @@ class KPowerMLForecast:
         self.conformal.fit(actual=conformal_actual, predicted=conformal_predicted)
         self.training_bridged_rows = int(bridged_mask.sum())
         self.backend.fit(prepared, full_features, calibration_frame)
+        if self._training_end > pd.to_datetime(prepared["ds"], utc=True).max():
+            # Only gap-tolerant (direct) backends had rows held out.
+            extend = getattr(self.backend, "extend_training_cutoff", None)
+            if extend is None:
+                raise ValueError("backend cannot serve past rows held out of its fit")
+            extend(self._training_end)
         if self._regression is not None:
             prepared_measured = ~pd.to_datetime(prepared["ds"], utc=True).isin(
                 bridged_times
@@ -312,7 +350,7 @@ class KPowerMLForecast:
             conformal_bands=self.conformal.to_dict(),
             weather_bias_source=self.bias_corrector.source,
             training_start=pd.Timestamp(prepared["ds"].min()).isoformat(),
-            training_end=pd.Timestamp(prepared["ds"].max()).isoformat(),
+            training_end=self._training_end.isoformat(),
             package_version=__version__,
             metadata={
                 "weather_bias": self.bias_corrector.to_dict(),
@@ -333,6 +371,8 @@ class KPowerMLForecast:
                     self.weather_client.config.training_weather_source.value
                 ),
                 "bridged_rows": self.training_bridged_rows,
+                "weather_accumulation_units": WEATHER_ACCUMULATION_UNITS,
+                "snow_cover": self._snow_metadata(),
                 "candidate_selection": {
                     **_selection_settings(self.config),
                     "metric": SELECTION_METRIC,
@@ -462,6 +502,7 @@ class KPowerMLForecast:
         forecast = self._sanitize_point_forecast(forecast)
         forecast["yhat"] = forecast["yhat"] * self._recent_bias_ratio
         forecast = self.conformal.apply(forecast)
+        forecast = self._apply_snow_cover(forecast, aligned_weather, skipped_steps)
         forecast = forecast.iloc[
             skipped_steps : skipped_steps + returned_horizon
         ].reset_index(drop=True)
@@ -494,6 +535,203 @@ class KPowerMLForecast:
                 f"backend {self.config.backend.value} has no physical solar baseline"
             )
         return cast(pd.DataFrame, predict_physics(features, horizon=horizon))
+
+    @property
+    def _snow_gate_active(self) -> bool:
+        """Whether this model applies the snow-cover gate."""
+        return (
+            self.config.forecast_type == MLForecastType.SOLAR
+            and self.config.snow_cover_gate
+        )
+
+    def _exclude_snow_covered(
+        self, history: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        """Leave snow-covered daylight rows out of training.
+
+        Steps the panel snow load through the training history, with measured
+        output overriding the weather, and keeps the resulting trajectory for
+        the end-of-training state. Covered and partly covered daylight rows
+        become target gaps, so the fit, the selection backtest and the bands
+        never learn that light can give no output.
+
+        Args:
+            history: Training rows with ``ds``, ``y`` and weather columns.
+
+        Returns:
+            The history with covered targets removed (the input itself when
+            nothing is removed), and a mask on its index of the removed rows.
+        """
+        self._snow_trajectory = None
+        self.snow_excluded_rows = 0
+        none_held_out = pd.Series(False, index=history.index)
+        if not self._snow_gate_active or history.empty:
+            return history, none_held_out
+        parameters = self.config.snow_cover
+        interval = self.config.interval_minutes
+        frame = history.reset_index(drop=True)
+        weather_only = step_snow_load(frame, interval, parameters)
+        ghi = pd.to_numeric(
+            frame.get("shortwave_radiation", pd.Series(0.0, index=frame.index)),
+            errors="coerce",
+        ).fillna(0.0)
+        target = pd.to_numeric(frame["y"], errors="coerce")
+        clear = pd.Series(weather_only.factor >= 1.0, index=frame.index)
+        ratio = energy_per_irradiance(
+            target.where(clear), ghi.to_numpy(dtype=float), interval
+        )
+        if ratio is None:
+            # The weather never sheds the load inside the window (it starts
+            # under snow), yet measured output can still prove the panels
+            # clear. Rows of unknown cover estimate the yield from their best
+            # output, not their median.
+            ratio = energy_per_irradiance(
+                target,
+                ghi.to_numpy(dtype=float),
+                interval,
+                quantile=UNKNOWN_COVER_YIELD_QUANTILE,
+            )
+        observation = None
+        if ratio is not None:
+            expected = ratio * ghi.to_numpy(dtype=float) * interval / 60.0 / 1000.0
+            temperature = pd.to_numeric(
+                frame.get("temperature_2m", pd.Series(0.0, index=frame.index)),
+                errors="coerce",
+            ).fillna(0.0)
+            observation = observed_cover(
+                target,
+                expected,
+                temperature.to_numpy(dtype=float),
+                interval,
+                parameters,
+            )
+        trajectory = step_snow_load(
+            frame, interval, parameters, observation=observation
+        )
+        self._snow_trajectory = pd.DataFrame(
+            {
+                "ds": trajectory.ds,
+                "load_cm": trajectory.load_cm,
+                "source": [source.value for source in trajectory.source],
+            }
+        )
+        covered = (trajectory.factor < 1.0) & (ghi.to_numpy(dtype=float) > 0.0)
+        if observation is not None:
+            covered |= observation > 0
+        covered &= target.notna().to_numpy()
+        if not covered.any():
+            return history, none_held_out
+        if not getattr(self.backend, "gap_tolerant", False):
+            logger.warning(
+                "%s: %d snow-covered rows stay in training; the %s structure "
+                "needs a contiguous target",
+                self.config.model_id,
+                int(covered.sum()),
+                self.config.hybrid_structure.value,
+            )
+            return history, none_held_out
+        output = history.copy()
+        output.loc[output.index[covered], "y"] = np.nan
+        self.snow_excluded_rows = int(covered.sum())
+        logger.info(
+            "%s: %d snow-covered rows left out of training",
+            self.config.model_id,
+            self.snow_excluded_rows,
+        )
+        return output, pd.Series(covered, index=history.index)
+
+    def _snow_state_at(self, timestamp: pd.Timestamp) -> SnowLoadState | None:
+        """Snow load after the training row at ``timestamp``, if stepped."""
+        trajectory = self._snow_trajectory
+        if trajectory is None:
+            return None
+        rows = trajectory.loc[trajectory["ds"] <= timestamp]
+        if rows.empty:
+            return None
+        last = rows.iloc[-1]
+        return SnowLoadState(
+            load_cm=float(last["load_cm"]),
+            source=SnowCoverSource(last["source"]),
+            at=pd.Timestamp(last["ds"]),
+        )
+
+    def _snow_metadata(self) -> dict[str, Any] | None:
+        """Snow-cover settings and end-of-training state for the manifest."""
+        if not self._snow_gate_active:
+            return None
+        return {
+            "parameters": self.config.snow_cover.model_dump(),
+            "state": None if self._snow_state is None else self._snow_state.to_dict(),
+            "excluded_rows": self.snow_excluded_rows,
+        }
+
+    def _apply_snow_cover(
+        self, forecast: pd.DataFrame, weather: pd.DataFrame, first_row: int
+    ) -> pd.DataFrame:
+        """Scale a solar forecast by the panel snow cover.
+
+        The load continues from the end-of-training state through the forecast
+        weather. The point forecast and the upper edges are multiplied by the
+        cover factor; a lower edge is zero wherever the expected or a
+        pessimistic trajectory (more snow, slower shedding) has any cover.
+
+        Args:
+            forecast: Model-grid forecast starting at the first post-training
+                slot, with ``yhat`` and band columns.
+            weather: Model-grid weather aligned with ``forecast``.
+            first_row: Row of the first returned interval, for the status.
+
+        Returns:
+            The scaled forecast. ``snow_cover`` is updated with the status at
+            ``first_row``.
+        """
+        if not self._snow_gate_active:
+            self.snow_cover = None
+            return forecast
+        parameters = self.config.snow_cover
+        interval = self.config.interval_minutes
+        initial = self._snow_state
+        if initial is None:
+            logger.warning(
+                "%s: no snow-cover state at the training cutoff; assuming clear panels",
+                self.config.model_id,
+            )
+        expected = step_snow_load(weather, interval, parameters, initial=initial)
+        pessimistic = step_snow_load(
+            weather, interval, pessimistic_parameters(parameters), initial=initial
+        )
+        output = forecast.copy()
+        factor = expected.factor
+        uncertain = (factor < 1.0) | (pessimistic.factor < 1.0)
+        for column in output.columns:
+            if not column.startswith("yhat"):
+                continue
+            values = output[column].to_numpy(dtype=float) * factor
+            if column.startswith("yhat_lower"):
+                values = np.where(uncertain, 0.0, values)
+            output[column] = values
+        self.snow_cover = self._snow_status(expected, first_row)
+        return output
+
+    def _snow_status(self, trajectory: SnowLoadTrajectory, row: int) -> dict[str, Any]:
+        """Snow-cover status at ``row`` of a forecast trajectory."""
+        parameters = self.config.snow_cover
+        row = min(max(row, 0), len(trajectory.load_cm) - 1)
+        load = float(trajectory.load_cm[row])
+        status = cover_status(load, parameters.full_cm)
+        clear_at: str | None = None
+        if status != SnowCoverStatus.CLEAR:
+            later = np.flatnonzero(trajectory.factor[row:] >= 1.0)
+            if later.size:
+                clear_at = pd.Timestamp(
+                    trajectory.ds.iloc[row + int(later[0])]
+                ).isoformat()
+        return {
+            "status": status.value,
+            "source": trajectory.source[row].value,
+            "load_cm": round(load, 3),
+            "expected_clear_at": clear_at,
+        }
 
     def _history_covariates(self, history_df: pd.DataFrame) -> pd.DataFrame | None:
         """Return known covariates averaged onto the model grid, or ``None``.
@@ -755,6 +993,10 @@ class KPowerMLForecast:
             return
         if not self._weather_source_matches(manifest):
             return
+        if not _weather_units_match(manifest) or not _snow_settings_match(
+            manifest, self.config
+        ):
+            return
         if manifest.contract_version != FORECAST_CONTRACT_VERSION:
             return
         if (
@@ -823,6 +1065,14 @@ class KPowerMLForecast:
             raise ForecastAlignmentError(
                 "stored model training weather source requires a full retrain"
             )
+        if not _weather_units_match(manifest):
+            raise ForecastAlignmentError(
+                "stored model weather accumulation units require a full retrain"
+            )
+        if not _snow_settings_match(manifest, self.config):
+            raise ForecastAlignmentError(
+                "stored model snow-cover settings require a full retrain"
+            )
         if manifest.backend_type != self.config.backend.value:
             raise ValueError(
                 "stored ML backend does not match configured backend: "
@@ -855,6 +1105,11 @@ class KPowerMLForecast:
         weather_bias = manifest.metadata.get("weather_bias")
         if isinstance(weather_bias, dict):
             self.bias_corrector.load_dict(weather_bias)
+        self._snow_state = _stored_snow_state(manifest)
+        snow = manifest.metadata.get("snow_cover")
+        self.snow_excluded_rows = (
+            int(snow.get("excluded_rows", 0)) if isinstance(snow, dict) else 0
+        )
 
     def _weather_source_matches(self, manifest: MLModelManifest) -> bool:
         """Whether a stored artifact was trained on this weather source.
@@ -1518,6 +1773,7 @@ class KPowerMLForecast:
         prepared: pd.DataFrame,
         features: pd.DataFrame,
         bridged: pd.Series | None = None,
+        held_out: pd.Series | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Keep all observations while reserving a contiguous calibration tail.
 
@@ -1525,6 +1781,24 @@ class KPowerMLForecast:
         moved forward until both the first calibration row and the row before
         it are measured, so no bridge interpolates across the split and
         calibration targets cannot leak into training rows.
+
+        Args:
+            prepared: Training rows on a regular grid; gaps have a NaN ``y``.
+            features: Features aligned with ``prepared``.
+            bridged: Mask of rows whose target was interpolated.
+            held_out: Mask of measured rows whose target was removed from the
+                fit (snow-covered PV). They do not break the latest contiguous
+                segment and stay in the calibration tail with a NaN target, so
+                a history that ends on them still has a calibration window
+                that starts right after the training rows.
+
+        Returns:
+            The observed rows, their features, the training rows and the
+            calibration tail.
+
+        Raises:
+            ValueError: When the history is too short to reserve calibration
+                rows behind enough training rows.
         """
         valid = pd.to_numeric(prepared["y"], errors="coerce").notna()
         if not valid.any():
@@ -1534,8 +1808,15 @@ class KPowerMLForecast:
         if len(observed) < 4:
             raise ValueError("at least four rows are required for ML training")
 
-        groups = (~valid).cumsum()
+        held = (
+            held_out.reindex(prepared.index, fill_value=False).astype(bool)
+            if held_out is not None
+            else pd.Series(False, index=prepared.index)
+        )
+        segment = valid | held
+        groups = (~segment).cumsum()
         latest_group = groups.loc[valid].iloc[-1]
+        latest_rows = prepared.index[segment & groups.eq(latest_group)]
         latest_indices = prepared.index[valid & groups.eq(latest_group)]
         minimum_training_rows = max(
             1,
@@ -1563,19 +1844,24 @@ class KPowerMLForecast:
         calibration_size = min(
             calibration_size, len(latest_indices) - minimum_training_rows, spare_rows
         )
-        calibration_indices = latest_indices[-calibration_size:]
-        if bridged is not None:
-            first = 0
-            while first < len(calibration_indices) and (
-                bool(bridged.loc[calibration_indices[first]])
-                or bool(bridged.get(calibration_indices[first] - 1, False))
-            ):
-                first += 1
-            if first == len(calibration_indices):
-                raise ValueError(
-                    "calibration tail has no measured boundary outside bridged gaps"
-                )
-            calibration_indices = calibration_indices[first:]
+        # The tail is a contiguous grid from its first measured row to the end
+        # of the segment, held-out rows included.
+        tail_start = latest_indices[-calibration_size]
+        calibration_indices = latest_rows[latest_rows >= tail_start]
+        blocked = held if bridged is None else (held | bridged.astype(bool))
+        first = 0
+        while first < len(calibration_indices) and (
+            bool(blocked.loc[calibration_indices[first]])
+            or bool(blocked.get(calibration_indices[first] - 1, False))
+        ):
+            first += 1
+        if first == len(calibration_indices) or not bool(
+            valid.loc[calibration_indices[first:]].any()
+        ):
+            raise ValueError(
+                "calibration tail has no measured boundary outside bridged gaps"
+            )
+        calibration_indices = calibration_indices[first:]
         calibration_start = calibration_indices[0]
         train_mask = valid & (prepared.index < calibration_start)
         return (
@@ -1765,3 +2051,40 @@ def _covariates_match(manifest: MLModelManifest, config: KPowerMLConfig) -> bool
     return bool(
         manifest.metadata.get("known_covariates", []) == list(config.known_covariates)
     )
+
+
+def _weather_units_match(manifest: MLModelManifest) -> bool:
+    """Whether a stored model was trained on per-hour accumulated weather."""
+    return bool(
+        manifest.metadata.get("weather_accumulation_units")
+        == WEATHER_ACCUMULATION_UNITS
+    )
+
+
+def _snow_settings_match(manifest: MLModelManifest, config: KPowerMLConfig) -> bool:
+    """Whether a stored model was trained with this snow-cover gate setting.
+
+    The gate decides which rows train the model, so its parameters are part
+    of the artifact.
+    """
+    stored = manifest.metadata.get("snow_cover")
+    gate = config.forecast_type == MLForecastType.SOLAR and config.snow_cover_gate
+    if not gate:
+        return stored is None
+    return (
+        isinstance(stored, dict)
+        and stored.get("parameters") == config.snow_cover.model_dump()
+    )
+
+
+def _stored_snow_state(manifest: MLModelManifest) -> SnowLoadState | None:
+    """End-of-training snow load stored with a model, if valid."""
+    snow = manifest.metadata.get("snow_cover")
+    state = snow.get("state") if isinstance(snow, dict) else None
+    if not isinstance(state, dict):
+        return None
+    try:
+        return SnowLoadState.from_dict(state)
+    except ValueError:
+        logger.warning("stored snow-cover state is invalid; assuming clear panels")
+        return None

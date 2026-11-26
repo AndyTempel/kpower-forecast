@@ -454,6 +454,43 @@ Backtesting refits the ML backend once per origin, so training costs about
 `selection_backtest_days` extra ML fits. As history grows, the ML model improves and wins the
 backtest without configuration changes.
 
+### Snow on the panels (`snow_cover_gate`)
+
+Fresh snow covers a PV array completely: it produces nothing until the snow sheds, and the
+panels stay covered longer than the snow on the ground suggests. Solar ML models therefore
+track the snow load on the panels (`kpower_forecast.snow_cover`, on by default,
+`snow_cover_gate=False` disables it):
+
+- snowfall adds to the load while the air is at or below 1.5 °C;
+- it sheds at 0.1 cm per degree-hour above 0 °C plus 1 cm per kWh/m² of horizontal irradiance;
+- output falls linearly from the full forecast at no load to zero at 1 cm.
+
+Measured output overrides the weather: an hour of output at or below 3 % of the expected under
+at least 0.3 kW of expected output, at or below 3 °C, marks the panels covered; half an hour at
+50 % or more marks them clear. The expected output is the median yield per unit of irradiance
+on rows the weather calls clear; when a history starts under snow that the weather never sheds,
+it is the 90th percentile over all productive rows instead. Ground snow depth is not used.
+
+Training steps the load through the whole history, so the stored model carries the load at its
+cutoff and prediction continues from it through the forecast weather. No past forecast weather
+is needed. Covered and partly covered daylight rows are left out of the fit, the selection
+backtest and the bands; the cutoff stays at the last measured row. The point forecast and both
+band edges are multiplied by the cover factor, and a lower edge is zero wherever a pessimistic
+trajectory (more snow, half the shedding, cover at 0.5 cm) has any cover. After `predict()`,
+`snow_cover` holds `status` (`clear`, `partial`, `covered`), `source` (`weather`, `observed`),
+`load_cm` and `expected_clear_at` at the first returned interval.
+
+The defaults (`snow_cover`, `SnowCoverParameters`) were fitted on one winter of measured daily
+output from a low-tilt residential array. Over 4 months they cut the absolute daily energy error on productive days
+from 532 to 340 kWh with no snow-free day called covered. They are part of artifact
+compatibility. The legacy Prophet solar model applies the same load model without the history
+spin-up, and keeps its ground-depth mask as a floor.
+
+Accumulated weather variables (`snowfall`, `precipitation`, `rain`, `showers`, the snowfall
+water equivalents) are per-hour rates in every parsed weather frame: a `minutely_15` response's
+amounts per 15 minutes are multiplied by four. Artifacts trained before that
+(`weather_accumulation_units` missing) need a full retrain.
+
 ### Known covariates
 
 `known_covariates` names numeric columns that the caller knows in advance, such as a scheduled

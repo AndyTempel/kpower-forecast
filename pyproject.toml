@@ -1,6 +1,6 @@
 [project]
 name = "kpower-forecast"
-version = "2026.11.3"
+version = "2026.11.4"
 description = "Solar production and power consumption forecasting package."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -96,3 +96,11 @@ target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
+
+[tool.pytest.ini_options]
+# Deprecations fail the suite, so a pandas or Nixtla upgrade that changes
+# behaviour shows up here first.
+filterwarnings = [
+    "error::DeprecationWarning",
+    "error::FutureWarning",
+]
