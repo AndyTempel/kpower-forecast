@@ -84,6 +84,8 @@ HISTORY_POLICY_VERSION: int = 2
 # Without a backtest, bands calibrate on the contiguous tail; below this it is too
 # short after a recent gap, so training stays pending. Three hours of 15-min rows.
 MIN_GAP_TOLERANT_CALIBRATION_ROWS: int = 12
+# Yield estimate from rows of unknown snow cover (see _exclude_snow_covered).
+UNKNOWN_COVER_YIELD_QUANTILE: float = 0.9
 # A stored model older than this is retrained on the archive if it must be.
 ARCHIVE_FALLBACK_MODEL_AGE: pd.Timedelta = pd.Timedelta(days=3)
 # Limits of the recent-bias factor: a few unusual days must not rescale a forecast.
@@ -578,6 +580,17 @@ class KPowerMLForecast:
         ratio = energy_per_irradiance(
             target.where(clear), ghi.to_numpy(dtype=float), interval
         )
+        if ratio is None:
+            # The weather never sheds the load inside the window (it starts
+            # under snow), yet measured output can still prove the panels
+            # clear. Rows of unknown cover estimate the yield from their best
+            # output, not their median.
+            ratio = energy_per_irradiance(
+                target,
+                ghi.to_numpy(dtype=float),
+                interval,
+                quantile=UNKNOWN_COVER_YIELD_QUANTILE,
+            )
         observation = None
         if ratio is not None:
             expected = ratio * ghi.to_numpy(dtype=float) * interval / 60.0 / 1000.0

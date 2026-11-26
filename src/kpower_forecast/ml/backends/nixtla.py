@@ -2,6 +2,7 @@
 
 import json
 import math
+import warnings
 from pathlib import Path
 from typing import Any, cast
 
@@ -768,11 +769,22 @@ class NixtlaHybridBackend:
                 )
 
         try:
-            forecast = self._residual_model.predict(
-                h=horizon,
-                X_df=self._build_exogenous_frame(future_features),
-                ids=[self.config.model_id],
-            )
+            with warnings.catch_warnings():
+                # utilsforecast still passes rename(copy=False), deprecated
+                # in pandas 3 (Copy-on-Write); it is harmless until pandas 4
+                # removes the keyword, which the recursive predict tests
+                # would then fail on.
+                warnings.filterwarnings(
+                    "ignore",
+                    message="The copy keyword is deprecated",
+                    category=DeprecationWarning,
+                    module=r"utilsforecast\.processing",
+                )
+                forecast = self._residual_model.predict(
+                    h=horizon,
+                    X_df=self._build_exogenous_frame(future_features),
+                    ids=[self.config.model_id],
+                )
         except ValueError as exc:
             raise ForecastAlignmentError(
                 "residual forecast rejected the aligned exogenous grid"

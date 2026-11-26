@@ -319,16 +319,27 @@ def pessimistic_parameters(parameters: SnowCoverParameters) -> SnowCoverParamete
 
 
 def energy_per_irradiance(
-    actual_kwh: pd.Series, ghi_w_m2: np.ndarray, interval_minutes: int
+    actual_kwh: pd.Series,
+    ghi_w_m2: np.ndarray,
+    interval_minutes: int,
+    quantile: float = 0.5,
 ) -> float | None:
-    """Median measured kWh per kWh/m² of horizontal irradiance.
+    """Measured kWh per kWh/m² of horizontal irradiance.
 
     A crude expected output for :func:`observed_cover`; a covered row's
     measured output is a few percent of any working array's, so the sun-angle
     dependence it ignores does not matter there.
 
+    Args:
+        actual_kwh: Measured interval energy.
+        ghi_w_m2: Horizontal irradiance per row.
+        interval_minutes: Row length.
+        quantile: Quantile of the per-row ratios. The median suits rows known
+            to be clear; a high quantile keeps rows of unknown cover from
+            pulling the estimate down to a covered array's trickle.
+
     Returns:
-        The median over rows with at least 100 W/m² and output, or ``None``
+        The quantile over rows with at least 100 W/m² and output, or ``None``
         without such rows.
     """
     actual = pd.to_numeric(actual_kwh, errors="coerce").to_numpy(dtype=float)
@@ -337,4 +348,4 @@ def energy_per_irradiance(
     if not usable.any():
         return None
     irradiance_kwh = ghi[usable] * interval_minutes / 60.0 / 1000.0
-    return float(np.median(actual[usable] / irradiance_kwh))
+    return float(np.quantile(actual[usable] / irradiance_kwh, quantile))

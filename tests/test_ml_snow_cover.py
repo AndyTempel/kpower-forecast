@@ -150,3 +150,43 @@ def test_snow_in_the_forecast_weather_zeroes_output_after_it_falls(
     assert covered.any() and (~covered).any()
     assert forecast.loc[~covered, "yhat"].max() > 0.5
     assert forecast.loc[covered].filter(like="yhat").to_numpy().max() == 0.0
+
+
+def test_measured_output_clears_a_window_that_starts_under_snow(
+    tmp_path, monkeypatch
+) -> None:
+    history_end = _history_end()
+    history_start = history_end - pd.Timedelta(days=3)
+    weather = _weather(history_end)
+    # 40 cm at the start of the window: the weather alone sheds none of it
+    # in three days, so no row is clear by the weather.
+    _snow_from(weather, history_start)
+    weather.loc[
+        (weather["ds"] >= history_start)
+        & (weather["ds"] < history_start + pd.Timedelta(hours=4)),
+        "snowfall",
+    ] = 10.0
+    cleared = history_start + pd.Timedelta(days=1)
+    y = (weather["shortwave_radiation"] * _KWH_PER_W_M2).where(
+        weather["ds"] >= cleared, 0.0
+    )
+    history = pd.DataFrame({"ds": weather["ds"], "y": y}).loc[
+        lambda f: (f["ds"] >= history_start) & (f["ds"] <= history_end)
+    ]
+
+    trained = _site(tmp_path, monkeypatch, weather, history_end)
+    trained.train(history, force=True)
+    forecast = trained.predict(
+        days=1, origin=(history_end + pd.Timedelta(minutes=15)).to_pydatetime()
+    )
+
+    # Only the covered first day is held out, plus up to an hour of output
+    # it takes to see the panels clear; the produced days then prove them
+    # clear and the forecast follows them.
+    covered_daylight = history["ds"].lt(cleared) & weather.loc[history.index][
+        "shortwave_radiation"
+    ].gt(0)
+    assert 0 < trained.snow_excluded_rows <= int(covered_daylight.sum()) + 4
+    assert trained.snow_cover is not None
+    assert trained.snow_cover["status"] == "clear"
+    assert forecast["yhat"].max() > 0.5

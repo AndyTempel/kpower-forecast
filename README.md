@@ -467,7 +467,9 @@ track the snow load on the panels (`kpower_forecast.snow_cover`, on by default,
 
 Measured output overrides the weather: an hour of output at or below 3 % of the expected under
 at least 0.3 kW of expected output, at or below 3 °C, marks the panels covered; half an hour at
-50 % or more marks them clear. Ground snow depth is not used.
+50 % or more marks them clear. The expected output is the median yield per unit of irradiance
+on rows the weather calls clear; when a history starts under snow that the weather never sheds,
+it is the 90th percentile over all productive rows instead. Ground snow depth is not used.
 
 Training steps the load through the whole history, so the stored model carries the load at its
 cutoff and prediction continues from it through the forecast weather. No past forecast weather

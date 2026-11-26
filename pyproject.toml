@@ -96,3 +96,11 @@ target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
+
+[tool.pytest.ini_options]
+# Deprecations fail the suite, so a pandas or Nixtla upgrade that changes
+# behaviour shows up here first.
+filterwarnings = [
+    "error::DeprecationWarning",
+    "error::FutureWarning",
+]
